@@ -1,510 +1,308 @@
-
+import 'package:cloud_firestore/cloud_firestore.dart';
+import 'package:firebase_auth/firebase_auth.dart';
+import 'package:firebase_core/firebase_core.dart';
 import 'package:flutter/material.dart';
 
-void main() => runApp(const MeowApp());
+const ink = Color(0xFF111218);
+const surface = Color(0xFF1C1D28);
+const accent = Color(0xFF8B5CF6);
+const subtle = Color(0xFFAAAABC);
 
-const bg = Color(0xFF111218);
-const panel = Color(0xFF191A23);
-const panel2 = Color(0xFF222431);
-const purple = Color(0xFF8B5CF6);
-const muted = Color(0xFF9A9BAD);
+Future<void> main() async {
+  WidgetsFlutterBinding.ensureInitialized();
+  const apiKey = String.fromEnvironment('FB_API_KEY');
+  const appId = String.fromEnvironment('FB_APP_ID');
+  const senderId = String.fromEnvironment('FB_SENDER_ID');
+  const projectId = String.fromEnvironment('FB_PROJECT_ID');
+  if ([apiKey, appId, senderId, projectId].any((v) => v.isEmpty)) {
+    runApp(const MaterialApp(home: SetupPage()));
+    return;
+  }
+  try {
+    await Firebase.initializeApp(options: const FirebaseOptions(
+      apiKey: apiKey, appId: appId, messagingSenderId: senderId, projectId: projectId,
+    ));
+    runApp(const MeowApp());
+  } catch (e) {
+    runApp(MaterialApp(home: Scaffold(body: Center(child: Padding(
+      padding: const EdgeInsets.all(24), child: Text('Falha ao conectar Firebase: $e'),
+    )))));
+  }
+}
+
+class SetupPage extends StatelessWidget {
+  const SetupPage({super.key});
+  @override Widget build(BuildContext context) => const Scaffold(
+    backgroundColor: ink,
+    body: SafeArea(child: Center(child: Padding(
+      padding: EdgeInsets.all(28), child: Column(mainAxisSize: MainAxisSize.min, children: [
+        Icon(Icons.pets, size: 68, color: accent), SizedBox(height: 16),
+        Text('Meow Social', style: TextStyle(fontSize: 28, fontWeight: FontWeight.bold, color: Colors.white)),
+        SizedBox(height: 12), Text('Falta configurar o Firebase no GitHub Actions. Consulte o README do projeto.', textAlign: TextAlign.center, style: TextStyle(color: Colors.white70)),
+      ]),
+    ))),
+  );
+}
 
 class MeowApp extends StatelessWidget {
   const MeowApp({super.key});
-
-  @override
-  Widget build(BuildContext context) {
-    return MaterialApp(
-      title: 'Meow',
-      debugShowCheckedModeBanner: false,
-      theme: ThemeData(
-        brightness: Brightness.dark,
-        scaffoldBackgroundColor: bg,
-        colorScheme: ColorScheme.fromSeed(
-          seedColor: purple,
-          brightness: Brightness.dark,
-          surface: panel,
-        ),
-        useMaterial3: true,
+  @override Widget build(BuildContext context) => MaterialApp(
+    title: 'Meow', debugShowCheckedModeBanner: false,
+    theme: ThemeData.dark(useMaterial3: true).copyWith(
+      scaffoldBackgroundColor: ink,
+      colorScheme: ColorScheme.fromSeed(seedColor: accent, brightness: Brightness.dark),
+      appBarTheme: const AppBarTheme(backgroundColor: surface),
+      inputDecorationTheme: InputDecorationTheme(
+        filled: true, fillColor: surface, border: OutlineInputBorder(borderRadius: BorderRadius.circular(14)),
       ),
-      home: const MeowHome(),
-    );
-  }
+    ),
+    home: StreamBuilder<User?>(
+      stream: FirebaseAuth.instance.authStateChanges(),
+      builder: (context, snapshot) {
+        if (snapshot.connectionState == ConnectionState.waiting) return const Scaffold(body: Center(child: CircularProgressIndicator()));
+        return snapshot.data == null ? const LoginPage() : const SocialHome();
+      },
+    ),
+  );
 }
 
-class MeowHome extends StatefulWidget {
-  const MeowHome({super.key});
+String normalized(String name) => name.trim().toLowerCase();
+String authEmail(String name) => '${normalized(name)}@users.meow.invalid';
 
-  @override
-  State<MeowHome> createState() => _MeowHomeState();
+class LoginPage extends StatefulWidget {
+  const LoginPage({super.key});
+  @override State<LoginPage> createState() => _LoginPageState();
+}
+class _LoginPageState extends State<LoginPage> {
+  final name = TextEditingController();
+  final password = TextEditingController();
+  bool register = false, busy = false;
+  String? error;
+  Future<void> submit() async {
+    final username = normalized(name.text);
+    if (!RegExp(r'^[a-z0-9_]{3,20}$').hasMatch(username)) {
+      setState(() => error = 'Use 3 a 20 caracteres: letras minúsculas, números ou _.'); return;
+    }
+    if (password.text.length < 8) { setState(() => error = 'Use uma senha com pelo menos 8 caracteres.'); return; }
+    setState(() { busy = true; error = null; });
+    try {
+      if (register) {
+        final cred = await FirebaseAuth.instance.createUserWithEmailAndPassword(email: authEmail(username), password: password.text);
+        await FirebaseFirestore.instance.collection('users').doc(cred.user!.uid).set({
+          'username': username, 'createdAt': FieldValue.serverTimestamp(),
+        });
+      } else {
+        await FirebaseAuth.instance.signInWithEmailAndPassword(email: authEmail(username), password: password.text);
+      }
+    } on FirebaseAuthException catch (e) {
+      setState(() => error = switch(e.code) {
+        'email-already-in-use' => 'Este usuário já existe.',
+        'invalid-credential' => 'Usuário ou senha incorretos.',
+        'weak-password' => 'Escolha uma senha mais forte.',
+        _ => 'Não foi possível entrar: ${e.code}',
+      });
+    } catch (e) { setState(() => error = 'Erro: $e'); }
+    if (mounted) setState(() => busy = false);
+  }
+  @override Widget build(BuildContext context) => Scaffold(body: SafeArea(child: Center(child: SingleChildScrollView(
+    padding: const EdgeInsets.all(28), child: ConstrainedBox(constraints: const BoxConstraints(maxWidth: 420), child: Column(
+      mainAxisSize: MainAxisSize.min, children: [
+        const Icon(Icons.pets, color: accent, size: 64), const SizedBox(height: 10),
+        Text(register ? 'Criar conta Meow' : 'Entrar no Meow', style: const TextStyle(fontSize: 26, fontWeight: FontWeight.bold)),
+        const SizedBox(height: 24), TextField(controller: name, autocorrect: false, decoration: const InputDecoration(labelText: 'Nome de usuário')),
+        const SizedBox(height: 12), TextField(controller: password, obscureText: true, decoration: const InputDecoration(labelText: 'Senha')),
+        if (error != null) Padding(padding: const EdgeInsets.only(top: 12), child: Text(error!, style: const TextStyle(color: Colors.redAccent))),
+        const SizedBox(height: 16), FilledButton(onPressed: busy ? null : submit, child: Text(busy ? 'Aguarde...' : register ? 'Criar conta' : 'Entrar')),
+        TextButton(onPressed: busy ? null : () => setState(() { register = !register; error = null; }),
+          child: Text(register ? 'Já tenho conta' : 'Criar uma conta')),
+        const Text('Versão inicial: convites e recuperação administrativa serão adicionados depois.', textAlign: TextAlign.center, style: TextStyle(color: subtle, fontSize: 12)),
+      ],
+    ))),
+  ))));
 }
 
-class _MeowHomeState extends State<MeowHome> {
-  int selectedServer = 0;
-  int selectedTab = 0;
-  int selectedChannel = 0;
-
-  final channels = const [
-    ('geral', Icons.tag),
-    ('avisos', Icons.campaign_outlined),
-    ('bate-papo', Icons.tag),
-    ('Sala de voz', Icons.volume_up_outlined),
-  ];
-
-  @override
-  Widget build(BuildContext context) {
-    return Scaffold(
-      body: SafeArea(
-        child: Row(
-          children: [
-            _serverRail(),
-            Expanded(
-              child: Column(
-                children: [
-                  _topBar(),
-                  Expanded(
-                    child: selectedTab == 1
-                        ? _friendsPage()
-                        : selectedTab == 2
-                            ? _profilePage()
-                            : _chatPage(),
-                  ),
-                  _bottomNav(),
-                ],
-              ),
-            ),
-          ],
-        ),
-      ),
-    );
+class SocialHome extends StatefulWidget {
+  const SocialHome({super.key});
+  @override State<SocialHome> createState() => _SocialHomeState();
+}
+class _SocialHomeState extends State<SocialHome> {
+  String? serverId, channelId;
+  int tab = 0;
+  final db = FirebaseFirestore.instance;
+  String get uid => FirebaseAuth.instance.currentUser!.uid;
+  Future<String?> ask(String title, String hint) async {
+    final c = TextEditingController();
+    return showDialog<String>(context: context, builder: (context) => AlertDialog(
+      title: Text(title), content: TextField(controller: c, autofocus: true, maxLength: 40, decoration: InputDecoration(hintText: hint)),
+      actions: [TextButton(onPressed: () => Navigator.pop(context), child: const Text('Cancelar')),
+        FilledButton(onPressed: () => Navigator.pop(context, c.text.trim()), child: const Text('Salvar'))],
+    ));
   }
-
-  Widget _serverRail() {
-    return Container(
-      width: 66,
-      color: const Color(0xFF0C0D12),
-      child: Column(
-        children: [
-          const SizedBox(height: 12),
-          _serverButton('M', 0, isHome: true),
-          const Padding(
-            padding: EdgeInsets.symmetric(vertical: 9),
-            child: SizedBox(width: 28, child: Divider(color: panel2)),
-          ),
-          _serverButton('G', 1),
-          _serverButton('F', 2),
-          const Spacer(),
-          _serverButton('+', 3, isAdd: true),
-          const SizedBox(height: 14),
-        ],
-      ),
-    );
+  void snack(String msg) { if (mounted) ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(msg))); }
+  Future<void> createServer() async {
+    final name = await ask('Novo servidor', 'Nome do servidor');
+    if (name == null || name.isEmpty) return;
+    try {
+      final doc = await db.collection('servers').add({'name': name, 'ownerId': uid, 'members': [uid], 'createdAt': FieldValue.serverTimestamp()});
+      await doc.collection('channels').add({'name': 'geral', 'createdAt': FieldValue.serverTimestamp()});
+      setState(() { serverId = doc.id; channelId = null; tab = 0; });
+    } catch (e) { snack('Não foi possível criar servidor: $e'); }
   }
-
-  Widget _serverButton(String label, int index,
-      {bool isHome = false, bool isAdd = false}) {
-    final selected = selectedServer == index;
-    return Padding(
-      padding: const EdgeInsets.symmetric(vertical: 5),
-      child: InkWell(
-        borderRadius: BorderRadius.circular(18),
-        onTap: () => setState(() {
-          selectedServer = index;
-          selectedTab = 0;
-        }),
-        child: AnimatedContainer(
-          duration: const Duration(milliseconds: 160),
-          width: 46,
-          height: 46,
-          decoration: BoxDecoration(
-            color: selected ? purple : (isAdd ? panel2 : panel),
-            borderRadius: BorderRadius.circular(selected ? 15 : 23),
-            border: selected
-                ? Border.all(color: Colors.white.withOpacity(.18))
-                : null,
-          ),
-          alignment: Alignment.center,
-          child: Text(
-            label,
-            style: TextStyle(
-              fontWeight: FontWeight.bold,
-              fontSize: 18,
-              color: isAdd && !selected ? const Color(0xFF6EE7B7) : Colors.white,
-            ),
-          ),
-        ),
-      ),
-    );
+  Future<void> joinServer() async {
+    final code = await ask('Entrar em servidor', 'Cole o ID do servidor');
+    if (code == null || code.isEmpty) return;
+    try {
+      final doc = db.collection('servers').doc(code);
+      await doc.update({'members': FieldValue.arrayUnion([uid])});
+      setState(() { serverId = code; channelId = null; tab = 0; });
+    } catch (e) { snack('Não foi possível entrar: $e'); }
   }
-
-  Widget _topBar() {
-    final title = selectedTab == 1
-        ? 'Amigos'
-        : selectedTab == 2
-            ? 'Meu perfil'
-            : selectedServer == 0
-                ? 'Meow'
-                : selectedServer == 1
-                    ? 'Game Zone'
-                    : selectedServer == 2
-                        ? 'Amigos'
-                        : 'Novo servidor';
-    return Container(
-      height: 62,
-      padding: const EdgeInsets.symmetric(horizontal: 16),
-      decoration: const BoxDecoration(
-        color: panel,
-        border: Border(bottom: BorderSide(color: Color(0xFF292B38))),
-      ),
-      child: Row(
-        children: [
-          Expanded(
-            child: Text(title,
-                style:
-                    const TextStyle(fontSize: 18, fontWeight: FontWeight.w800)),
-          ),
-          IconButton(
-            tooltip: 'Pesquisar',
-            onPressed: () => _notice('A pesquisa será adicionada futuramente.'),
-            icon: const Icon(Icons.search, color: muted),
-          ),
-          const CircleAvatar(
-            radius: 16,
-            backgroundColor: purple,
-            child: Text('M',
-                style: TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
-          ),
-        ],
-      ),
-    );
+  Future<void> createChannel() async {
+    if (serverId == null) return;
+    final name = await ask('Novo canal', 'Nome do canal');
+    if (name == null || name.isEmpty) return;
+    try { await db.collection('servers').doc(serverId).collection('channels').add({'name': name, 'createdAt': FieldValue.serverTimestamp()}); }
+    catch (e) { snack('Erro ao criar canal: $e'); }
   }
+  @override Widget build(BuildContext context) => Scaffold(
+    appBar: AppBar(title: const Text('🐱 Meow'), actions: [IconButton(tooltip: 'Sair', onPressed: () => FirebaseAuth.instance.signOut(), icon: const Icon(Icons.logout))]),
+    body: Column(children: [
+      Expanded(child: tab == 1 ? FriendsPage(uid: uid) : tab == 2 ? ProfilePage(uid: uid) : Row(children: [
+        SizedBox(width: 76, child: ColoredBox(color: const Color(0xFF0B0C11), child: Column(children: [
+          IconButton(tooltip: 'Criar servidor', onPressed: createServer, icon: const Icon(Icons.add_circle, color: accent)),
+          IconButton(tooltip: 'Entrar com ID', onPressed: joinServer, icon: const Icon(Icons.group_add)),
+          Expanded(child: StreamBuilder<QuerySnapshot<Map<String, dynamic>>>(
+            stream: db.collection('servers').where('members', arrayContains: uid).snapshots(),
+            builder: (context, snap) => ListView(children: [for (final doc in snap.data?.docs ?? [])
+              Padding(padding: const EdgeInsets.symmetric(vertical: 4), child: CircleAvatar(
+                backgroundColor: serverId == doc.id ? accent : surface,
+                child: IconButton(tooltip: doc.data()['name']?.toString() ?? 'Servidor', onPressed: () => setState(() { serverId = doc.id; channelId = null; }),
+                  icon: Text((doc.data()['name']?.toString() ?? 'S').substring(0, 1).toUpperCase(), style: const TextStyle(color: Colors.white))),
+              ))]),
+          )),
+        ]))),
+        Expanded(child: serverId == null ? const Center(child: Text('Crie ou entre em um servidor!')) : Column(children: [
+          Container(color: surface, padding: const EdgeInsets.all(10), child: Row(children: [
+            const Expanded(child: Text('Canais', style: TextStyle(fontWeight: FontWeight.bold))),
+            IconButton(onPressed: createChannel, icon: const Icon(Icons.add)),
+            IconButton(tooltip: 'Copiar ID do servidor', onPressed: () => showDialog<void>(context: context, builder: (ctx) => AlertDialog(
+              title: const Text('Convide seus amigos'), content: SelectableText(serverId!),
+              actions: [TextButton(onPressed: () => Navigator.pop(ctx), child: const Text('Fechar'))],
+            )), icon: const Icon(Icons.share)),
+          ])),
+          SizedBox(height: 58, child: StreamBuilder<QuerySnapshot<Map<String, dynamic>>>(
+            stream: db.collection('servers').doc(serverId).collection('channels').snapshots(),
+            builder: (context, snap) {
+              final docs = snap.data?.docs ?? [];
+              final active = docs.any((d) => d.id == channelId) ? channelId : (docs.isNotEmpty ? docs.first.id : null);
+              if (active != channelId) WidgetsBinding.instance.addPostFrameCallback((_) { if (mounted && channelId != active) setState(() => channelId = active); });
+              return ListView(scrollDirection: Axis.horizontal, children: [for (final doc in docs)
+                Padding(padding: const EdgeInsets.all(5), child: ChoiceChip(label: Text('# ${doc.data()['name']}'), selected: active == doc.id,
+                  onSelected: (_) => setState(() => channelId = doc.id)))],);
+            },
+          )),
+          Expanded(child: channelId == null ? const Center(child: Text('Escolha um canal')) : ChatPage(key: ValueKey('$serverId/$channelId'), serverId: serverId!, channelId: channelId!, uid: uid)),
+        ])),
+      ])),
+      NavigationBar(height: 70, selectedIndex: tab, onDestinationSelected: (i) => setState(() => tab = i), destinations: const [
+        NavigationDestination(icon: Icon(Icons.tag), label: 'Canais'),
+        NavigationDestination(icon: Icon(Icons.people), label: 'Amigos'),
+        NavigationDestination(icon: Icon(Icons.person), label: 'Perfil'),
+      ]),
+    ]),
+  );
+}
 
-  Widget _chatPage() {
-    return Column(
-      children: [
-        Container(
-          width: double.infinity,
-          padding: const EdgeInsets.fromLTRB(16, 18, 16, 12),
-          color: panel,
-          child: const Column(
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: [
-              Text('CANAIS DE TEXTO',
-                  style: TextStyle(
-                      color: muted,
-                      fontSize: 10,
-                      letterSpacing: 1.2,
-                      fontWeight: FontWeight.bold)),
-              SizedBox(height: 8),
-            ],
-          ),
-        ),
-        Container(
-          color: panel,
-          child: Column(
-            children: List.generate(channels.length, (i) {
-              final item = channels[i];
-              final active = selectedChannel == i;
-              return ListTile(
-                dense: true,
-                selected: active,
-                selectedTileColor: purple.withOpacity(.16),
-                contentPadding: const EdgeInsets.symmetric(horizontal: 16),
-                leading: Icon(item.$2,
-                    size: 19, color: active ? Colors.white : muted),
-                title: Text(item.$1,
-                    style: TextStyle(
-                        color: active ? Colors.white : muted,
-                        fontWeight:
-                            active ? FontWeight.w700 : FontWeight.w500)),
-                onTap: () {
-                  setState(() => selectedChannel = i);
-                  if (i == 3) _openVoiceRoom();
-                },
-              );
-            }),
-          ),
-        ),
-        Expanded(
-          child: selectedChannel == 3
-              ? _voicePlaceholder()
-              : _messagesPlaceholder(),
-        ),
-        if (selectedChannel != 3) _messageComposer(),
-      ],
-    );
+class ChatPage extends StatefulWidget {
+  final String serverId, channelId, uid;
+  const ChatPage({super.key, required this.serverId, required this.channelId, required this.uid});
+  @override State<ChatPage> createState() => _ChatPageState();
+}
+class _ChatPageState extends State<ChatPage> {
+  final input = TextEditingController();
+  bool sending = false;
+  CollectionReference<Map<String, dynamic>> get messages => FirebaseFirestore.instance.collection('servers').doc(widget.serverId)
+    .collection('channels').doc(widget.channelId).collection('messages');
+  Future<void> send() async {
+    final text = input.text.trim(); if (text.isEmpty || sending) return;
+    setState(() => sending = true);
+    try {
+      final user = await FirebaseFirestore.instance.collection('users').doc(widget.uid).get();
+      await messages.add({'text': text, 'authorId': widget.uid, 'author': user.data()?['username'] ?? 'Usuário', 'createdAt': FieldValue.serverTimestamp()});
+      input.clear();
+    } catch (e) { if (mounted) ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('Erro ao enviar: $e'))); }
+    if (mounted) setState(() => sending = false);
   }
+  @override Widget build(BuildContext context) => Column(children: [
+    Expanded(child: StreamBuilder<QuerySnapshot<Map<String, dynamic>>>(
+      stream: messages.orderBy('createdAt', descending: true).limit(100).snapshots(),
+      builder: (context, snap) {
+        if (snap.hasError) return Center(child: Text('Erro ao carregar mensagens: ${snap.error}'));
+        if (!snap.hasData) return const Center(child: CircularProgressIndicator());
+        if (snap.data!.docs.isEmpty) return const Center(child: Text('Diga oi! 👋'));
+        return ListView.builder(reverse: true, padding: const EdgeInsets.all(12), itemCount: snap.data!.docs.length, itemBuilder: (context, i) {
+          final data = snap.data!.docs[i].data();
+          return ListTile(contentPadding: const EdgeInsets.symmetric(vertical: 2, horizontal: 4),
+            leading: CircleAvatar(backgroundColor: accent, child: Text((data['author']?.toString() ?? '?').substring(0, 1).toUpperCase())),
+            title: Text(data['author']?.toString() ?? 'Usuário', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
+            subtitle: Text(data['text']?.toString() ?? '', style: const TextStyle(fontSize: 15, color: Colors.white)),
+          );
+        });
+      },
+    )),
+    SafeArea(top: false, child: Padding(padding: const EdgeInsets.all(8), child: Row(children: [
+      Expanded(child: TextField(controller: input, minLines: 1, maxLines: 4, maxLength: 2000,
+        decoration: const InputDecoration(hintText: 'Mensagem', counterText: ''), onSubmitted: (_) => send())),
+      IconButton(onPressed: sending ? null : send, icon: const Icon(Icons.send, color: accent)),
+    ]))),
+  ]);
+}
 
-  Widget _messagesPlaceholder() {
-    return ListView(
-      padding: const EdgeInsets.all(18),
-      children: [
-        const SizedBox(height: 22),
-        const Center(
-          child: CircleAvatar(
-            radius: 30,
-            backgroundColor: purple,
-            child: Icon(Icons.tag, size: 30, color: Colors.white),
-          ),
-        ),
-        const SizedBox(height: 14),
-        const Center(
-          child: Text('Bem-vindo ao #geral',
-              style: TextStyle(fontSize: 20, fontWeight: FontWeight.bold)),
-        ),
-        const SizedBox(height: 7),
-        const Center(
-          child: Text('Este é o começo da sua comunidade.',
-              style: TextStyle(color: muted)),
-        ),
-        const SizedBox(height: 30),
-        _message('Meow', 'Seu espaço para conversar começa aqui.', true),
-        _message('Sistema',
-            'As mensagens reais serão conectadas ao servidor na próxima etapa.',
-            false),
-      ],
-    );
+class FriendsPage extends StatefulWidget {
+  final String uid;
+  const FriendsPage({super.key, required this.uid});
+  @override State<FriendsPage> createState() => _FriendsPageState();
+}
+class _FriendsPageState extends State<FriendsPage> {
+  final username = TextEditingController();
+  String? message;
+  Future<void> addFriend() async {
+    final name = normalized(username.text);
+    if (name.isEmpty) return;
+    try {
+      final found = await FirebaseFirestore.instance.collection('users').where('username', isEqualTo: name).limit(1).get();
+      if (found.docs.isEmpty) throw Exception('Usuário não encontrado');
+      final friend = found.docs.first;
+      if (friend.id == widget.uid) throw Exception('Você não pode adicionar a si mesmo');
+      await FirebaseFirestore.instance.collection('users').doc(widget.uid).collection('friends').doc(friend.id).set({'username': name, 'createdAt': FieldValue.serverTimestamp()});
+      if (mounted) setState(() { message = 'Amigo adicionado à sua lista'; username.clear(); });
+    } catch (e) { if (mounted) setState(() => message = e.toString()); }
   }
+  @override Widget build(BuildContext context) => Padding(padding: const EdgeInsets.all(16), child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+    const Text('Amigos', style: TextStyle(fontSize: 24, fontWeight: FontWeight.bold)), const SizedBox(height: 14),
+    Row(children: [Expanded(child: TextField(controller: username, decoration: const InputDecoration(hintText: 'Nome de usuário'))),
+      IconButton(onPressed: addFriend, icon: const Icon(Icons.person_add, color: accent))]),
+    if (message != null) Padding(padding: const EdgeInsets.all(8), child: Text(message!)),
+    const SizedBox(height: 8),
+    Expanded(child: StreamBuilder<QuerySnapshot<Map<String, dynamic>>>(
+      stream: FirebaseFirestore.instance.collection('users').doc(widget.uid).collection('friends').snapshots(),
+      builder: (context, snap) => ListView(children: [for (final doc in snap.data?.docs ?? [])
+        ListTile(leading: const Icon(Icons.person, color: accent), title: Text(doc.data()['username']?.toString() ?? '?'))]),
+    )),
+    const Text('Lista pessoal de amigos. Solicitações e mensagens diretas virão na próxima atualização.', style: TextStyle(color: subtle, fontSize: 12)),
+  ]));
+}
 
-  Widget _message(String name, String content, bool owner) {
-    return Padding(
-      padding: const EdgeInsets.only(bottom: 18),
-      child: Row(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          CircleAvatar(
-            radius: 18,
-            backgroundColor: owner ? purple : panel2,
-            child: Icon(owner ? Icons.pets : Icons.smart_toy_outlined, size: 18),
-          ),
-          const SizedBox(width: 10),
-          Expanded(
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                Text(name,
-                    style: const TextStyle(fontWeight: FontWeight.bold)),
-                const SizedBox(height: 4),
-                Text(content, style: const TextStyle(color: muted)),
-              ],
-            ),
-          ),
-        ],
-      ),
-    );
-  }
-
-  Widget _messageComposer() {
-    return Container(
-      padding: const EdgeInsets.fromLTRB(12, 8, 12, 10),
-      color: bg,
-      child: Row(
-        children: [
-          IconButton(
-            onPressed: () => _notice('Anexos serão adicionados futuramente.'),
-            icon: const Icon(Icons.add_circle_outline, color: muted),
-          ),
-          const Expanded(
-            child: TextField(
-              enabled: false,
-              decoration: InputDecoration(
-                hintText: 'Mensagens serão ativadas na próxima etapa',
-                filled: true,
-                fillColor: panel,
-                border: OutlineInputBorder(
-                  borderSide: BorderSide.none,
-                  borderRadius: BorderRadius.all(Radius.circular(14)),
-                ),
-                contentPadding:
-                    EdgeInsets.symmetric(horizontal: 14, vertical: 12),
-              ),
-            ),
-          ),
-          IconButton(
-            onPressed: () =>
-                _notice('O envio de mensagens será conectado ao backend.'),
-            icon: const Icon(Icons.send_rounded, color: purple),
-          ),
-        ],
-      ),
-    );
-  }
-
-  Widget _voicePlaceholder() {
-    return Center(
-      child: Padding(
-        padding: const EdgeInsets.all(24),
-        child: Column(
-          mainAxisAlignment: MainAxisAlignment.center,
-          children: [
-            const Icon(Icons.graphic_eq, size: 54, color: purple),
-            const SizedBox(height: 16),
-            const Text('Sala de voz',
-                style: TextStyle(fontSize: 22, fontWeight: FontWeight.bold)),
-            const SizedBox(height: 8),
-            const Text(
-              'A interface está pronta. Áudio ao vivo e transmissão de tela serão integrados depois.',
-              textAlign: TextAlign.center,
-              style: TextStyle(color: muted, height: 1.5),
-            ),
-            const SizedBox(height: 20),
-            FilledButton.icon(
-              onPressed: _openVoiceRoom,
-              icon: const Icon(Icons.call),
-              label: const Text('Ver sala de voz'),
-              style: FilledButton.styleFrom(backgroundColor: purple),
-            ),
-          ],
-        ),
-      ),
-    );
-  }
-
-  Widget _friendsPage() {
-    final friends = [
-      ('A', 'Alex', 'Online'),
-      ('M', 'Marina', 'Ausente'),
-      ('R', 'Rafael', 'Offline'),
-    ];
-    return ListView(
-      padding: const EdgeInsets.all(18),
-      children: [
-        const Text('SEUS AMIGOS',
-            style: TextStyle(
-                color: muted, fontSize: 11, fontWeight: FontWeight.bold)),
-        const SizedBox(height: 12),
-        ...friends.map((f) => ListTile(
-              contentPadding: EdgeInsets.zero,
-              leading: CircleAvatar(
-                backgroundColor: purple.withOpacity(.8),
-                child: Text(f.$1),
-              ),
-              title: Text(f.$2),
-              subtitle: Text(f.$3, style: const TextStyle(color: muted)),
-              trailing: IconButton(
-                icon: const Icon(Icons.chat_bubble_outline, color: muted),
-                onPressed: () =>
-                    _notice('Mensagens privadas serão implementadas.'),
-              ),
-            )),
-        const SizedBox(height: 18),
-        OutlinedButton.icon(
-          onPressed: () =>
-              _notice('Convites de amigos serão implementados.'),
-          icon: const Icon(Icons.person_add_alt_1),
-          label: const Text('Adicionar amigo'),
-        ),
-      ],
-    );
-  }
-
-  Widget _profilePage() {
-    return Center(
-      child: Column(
-        mainAxisAlignment: MainAxisAlignment.center,
-        children: [
-          const CircleAvatar(
-            radius: 42,
-            backgroundColor: purple,
-            child: Icon(Icons.pets, size: 34, color: Colors.white),
-          ),
-          const SizedBox(height: 14),
-          const Text('Seu perfil',
-              style: TextStyle(fontSize: 21, fontWeight: FontWeight.bold)),
-          const Text('Configure seu perfil futuramente',
-              style: TextStyle(color: muted)),
-          const SizedBox(height: 20),
-          OutlinedButton.icon(
-            onPressed: () =>
-                _notice('Configurações serão adicionadas depois.'),
-            icon: const Icon(Icons.settings_outlined),
-            label: const Text('Configurações'),
-          ),
-        ],
-      ),
-    );
-  }
-
-  Widget _bottomNav() {
-    return Container(
-      decoration: const BoxDecoration(
-        color: panel,
-        border: Border(top: BorderSide(color: Color(0xFF292B38))),
-      ),
-      padding: const EdgeInsets.symmetric(vertical: 7),
-      child: Row(
-        mainAxisAlignment: MainAxisAlignment.spaceAround,
-        children: [
-          _navItem(Icons.chat_bubble_outline, 'Canais', 0),
-          _navItem(Icons.people_outline, 'Amigos', 1),
-          _navItem(Icons.person_outline, 'Perfil', 2),
-        ],
-      ),
-    );
-  }
-
-  Widget _navItem(IconData icon, String label, int tab) {
-    final active = selectedTab == tab;
-    return InkWell(
-      onTap: () => setState(() => selectedTab = tab),
-      child: Padding(
-        padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 4),
-        child: Column(
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            Icon(icon, color: active ? purple : muted),
-            const SizedBox(height: 3),
-            Text(label,
-                style: TextStyle(
-                    fontSize: 10, color: active ? Colors.white : muted)),
-          ],
-        ),
-      ),
-    );
-  }
-
-  void _openVoiceRoom() {
-    showModalBottomSheet(
-      context: context,
-      backgroundColor: panel,
-      showDragHandle: true,
-      builder: (context) => Padding(
-        padding: const EdgeInsets.fromLTRB(22, 12, 22, 30),
-        child: Column(
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            const Icon(Icons.headset_mic, color: purple, size: 42),
-            const SizedBox(height: 12),
-            const Text('Sala de voz',
-                style: TextStyle(fontSize: 21, fontWeight: FontWeight.bold)),
-            const SizedBox(height: 8),
-            const Text(
-              'Esta é uma prévia da interface. A conexão de áudio e a transmissão ainda não estão implementadas.',
-              textAlign: TextAlign.center,
-              style: TextStyle(color: muted, height: 1.45),
-            ),
-            const SizedBox(height: 18),
-            SizedBox(
-              width: double.infinity,
-              child: FilledButton(
-                onPressed: () => Navigator.pop(context),
-                style: FilledButton.styleFrom(backgroundColor: purple),
-                child: const Text('Entendi'),
-              ),
-            ),
-          ],
-        ),
-      ),
-    );
-  }
-
-  void _notice(String message) {
-    ScaffoldMessenger.of(context).showSnackBar(
-      SnackBar(
-        content: Text(message),
-        backgroundColor: panel2,
-        behavior: SnackBarBehavior.floating,
-      ),
-    );
-  }
+class ProfilePage extends StatelessWidget {
+  final String uid;
+  const ProfilePage({super.key, required this.uid});
+  @override Widget build(BuildContext context) => StreamBuilder<DocumentSnapshot<Map<String, dynamic>>>(
+    stream: FirebaseFirestore.instance.collection('users').doc(uid).snapshots(),
+    builder: (context, snap) => Center(child: Column(mainAxisSize: MainAxisSize.min, children: [
+      const CircleAvatar(radius: 45, backgroundColor: accent, child: Icon(Icons.pets, size: 42, color: Colors.white)),
+      const SizedBox(height: 16), Text('@${snap.data?.data()?['username'] ?? 'meow'}', style: const TextStyle(fontSize: 23, fontWeight: FontWeight.bold)),
+      const SizedBox(height: 8), const Text('Meu perfil', style: TextStyle(color: subtle)),
+      const SizedBox(height: 24), OutlinedButton(onPressed: () => FirebaseAuth.instance.signOut(), child: const Text('Sair da conta')),
+    ])),
+  );
 }
