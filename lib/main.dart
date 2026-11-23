@@ -670,7 +670,7 @@ class _MessageThreadState extends State<MessageThread> {
                     if (data['editedAt'] != null)
                       const Text('(editada)', style: TextStyle(fontSize: 11, color: Colors.white54)),
                   ])),
-                ])),
+                ]),
               ),
             );
           });
@@ -743,7 +743,7 @@ class _FriendsPageState extends State<FriendsPage> {
           title: Text(doc.data()['username']?.toString() ?? '?')),
       ]),
     )),
-    const Text('Pedidos de amizade e mensagens privadas serão adicionados depois.',
+    const Text('Toque em um amigo para abrir o perfil e enviar uma mensagem.',
       style: TextStyle(color: Colors.white54, fontSize: 12)),
   ]));
 }
