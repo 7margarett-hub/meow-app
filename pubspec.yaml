@@ -1,19 +1,14 @@
 name: meow
-description: Aplicativo de comunicação Meow.
-publish_to: 'none'
-version: 0.1.0+1
-
+description: Meow Social - private community chat
+publish_to: none
+version: 0.2.0+2
 environment:
-  sdk: '>=3.3.0 <4.0.0'
-
+  sdk: '>=3.4.0 <4.0.0'
 dependencies:
   flutter:
     sdk: flutter
-
-dev_dependencies:
-  flutter_test:
-    sdk: flutter
-  flutter_lints: ^4.0.0
-
+  firebase_core: ^3.12.1
+  firebase_auth: ^5.5.1
+  cloud_firestore: ^5.6.5
 flutter:
   uses-material-design: true
