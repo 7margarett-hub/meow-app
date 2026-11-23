@@ -29,6 +29,9 @@ jobs:
       - name: Instalar dependencias
         run: flutter pub get
 
+      - name: Gerar icone oficial do Meow
+        run: dart run flutter_launcher_icons
+
       - name: Verificar configuracao Firebase
         env:
           FB_API_KEY: ${{ secrets.FB_API_KEY }}
