@@ -500,8 +500,8 @@ class ProfilePage extends StatelessWidget {
 );
   @override Widget build(BuildContext c)=>StreamBuilder<DocumentSnapshot<Map<String,
   dynamic>>>(stream:db.collection('users').doc(uid).snapshots(), builder:(c, s){
-    if(!s.hasData)return const Center(child:CircularProgressIndicator());
     if(s.hasError)return const Center(child:Text('Perfil indisponível.'));
+    if(!s.hasData)return const Center(child:CircularProgressIndicator());
     final d=s.data?.data()??{
 }
 ;
@@ -970,11 +970,11 @@ class _SocialHomeState extends State<SocialHome> with WidgetsBindingObserver {
 }
       return ListView(children:[for(final g in groups.entries)...[ListTile(dense:true, title:Text(g.key,
     style:const TextStyle(fontSize:12, color:Colors.white70)
-), leading:Icon(collapsed.contains(g.key)?Icons.chevron_right:Icons.expand_more), onLongPress:()async{final v=await showTextPrompt(context,'Renomear categoria',g.key);if(v==null||v.isEmpty)return;final batch=db.batch();for(final d in g.value)batch.update(d.reference,{'category':v});await batch.commit();}, onTap:()=>setState((){
+), leading:Icon(collapsed.contains(g.key)?Icons.chevron_right:Icons.expand_more), onLongPress:()async{final server=await db.collection('servers').doc(serverId).get();if(server.data()?['ownerId']!=myUid)return;final v=await showTextPrompt(context,'Renomear categoria',g.key);if(v==null||v.isEmpty)return;final batch=db.batch();for(final d in g.value)batch.update(d.reference,{'category':v});await batch.commit();}, onTap:()=>setState((){
       if(!collapsed.add(g.key))collapsed.remove(g.key);
 }
 ),), if(!collapsed.contains(g.key))for(final d in g.value)ListTile(leading:const Icon(Icons.tag),
-      title:Text(d.data()['name']?.toString()??'canal'),trailing:ThreadUnreadDot(threadId:'server:$serverId:${d.id}',uid:myUid,collection:d.reference.collection('messages')), onLongPress:()async{final v=await showTextPrompt(context,'Renomear canal',d.data()['name']?.toString()??'');if(v!=null&&v.isNotEmpty)await d.reference.update({'name':v});}, onTap:()=>setState((){
+      title:Text(d.data()['name']?.toString()??'canal'),trailing:ThreadUnreadDot(threadId:'server:$serverId:${d.id}',uid:myUid,collection:d.reference.collection('messages')), onLongPress:()async{final server=await db.collection('servers').doc(serverId).get();if(server.data()?['ownerId']!=myUid)return;final v=await showTextPrompt(context,'Renomear canal',d.data()['name']?.toString()??'');if(v!=null&&v.isNotEmpty)await d.reference.update({'name':v});}, onTap:()=>setState((){
         channelId=d.id;
         channelName=d.data()['name']?.toString()??'canal';
         showingChannels=false;
@@ -1241,83 +1241,83 @@ class _MessageThreadState extends State<MessageThread> {
       if(mounted)setState(()=>sending=false);
 }
 }
-  Future<void> attach()async{
-    try{
-        final source=await showModalBottomSheet<String>(context:context, builder:(c)=>SafeArea(child:Column(mainAxisSize:MainAxisSize.min,
-          children:[ListTile(leading:const Icon(Icons.photo), title:const Text('Galeria'), onTap:()=>Navigator.pop(c,
-        'gallery'
-)), ListTile(leading:const Icon(Icons.folder), title:const Text('Arquivos (25 MiB)'), onTap:()=>Navigator.pop(c,
-        'files'
-))]
-)));
-      if(!mounted || source==null)return;
-      final f=source=='gallery'?await ImagePicker().pickImage(source:ImageSource.gallery, requestFullMetadata:false):await files.openFile();
-      if(f==null)return;
-      if(await f.length()>attachmentLimit)throw Exception('Arquivo maior que 25 MiB.');
-      final name=f.name;
-      final extension=name.contains('.')?name.split('.').last.toLowerCase():'';
-      const mime={
-        'jpg':'image/jpeg',
-        'jpeg':'image/jpeg',
-        'png':'image/png',
-        'gif':'image/gif',
-        'webp':'image/webp',
-        'pdf':'application/pdf',
-        'txt':'text/plain',
-        'mp4':'video/mp4'
-}
-;
-      final contentType=mime[extension]??'application/octet-stream';
-      // Requires an authenticated meow-anexos Edge Function accepting PUT bytes,
-      // returning JSON {id, name, contentType, size} and authorizing GET by ID.
-      // Stream the file rather than loading up to 25 MiB into memory.
-      final request = http.StreamedRequest('PUT', Uri.https(
-        imageHost,
-        '/functions/v1/meow-anexos',
-        {'thread': widget.threadId, 'name': name},
-      ));
-      request.headers.addAll({
-        ...await authHeaders(),
-        'Content-Type': contentType,
-      });
-      final length = await f.length();
-      request.contentLength = length;
-      final upload = f.openRead().listen(
-        request.sink.add,
-        onError: request.sink.addError,
-        onDone: request.sink.close,
-        cancelOnError: true,
+  bool uploading = false;
+  Future<void> attach() async {
+    if (uploading || sending) return;
+    setState(() => uploading = true);
+    try {
+      final source = await showModalBottomSheet<String>(
+        context: context,
+        builder: (c) => SafeArea(child: Column(mainAxisSize: MainAxisSize.min, children: [
+          ListTile(leading: const Icon(Icons.photo), title: const Text('Galeria'),
+            onTap: () => Navigator.pop(c, 'gallery')),
+          ListTile(leading: const Icon(Icons.folder), title: const Text('Arquivos (25 MiB)'),
+            onTap: () => Navigator.pop(c, 'files')),
+        ])),
       );
-      http.Response r;
+      if (!mounted || source == null) return;
+      final file = source == 'gallery'
+          ? await ImagePicker().pickImage(source: ImageSource.gallery, requestFullMetadata: false)
+          : await files.openFile();
+      if (file == null) return;
+      final length = await file.length();
+      if (length == 0 || length > attachmentLimit) {
+        throw Exception('O arquivo precisa ter entre 1 byte e 25 MiB.');
+      }
+      final name = file.name;
+      final extension = name.contains('.') ? name.split('.').last.toLowerCase() : '';
+      const mime = <String, String>{
+        'jpg': 'image/jpeg', 'jpeg': 'image/jpeg', 'png': 'image/png',
+        'gif': 'image/gif', 'webp': 'image/webp', 'pdf': 'application/pdf',
+        'txt': 'text/plain', 'mp4': 'video/mp4', 'mov': 'video/quicktime',
+        'mp3': 'audio/mpeg', 'wav': 'audio/wav', 'zip': 'application/zip',
+      };
+      final contentType = mime[extension] ?? 'application/octet-stream';
+      final uri = Uri.https(imageHost, '/functions/v1/meow-anexos',
+          {'thread': widget.threadId, 'name': name});
+      final request = http.StreamedRequest('PUT', uri);
+      request.headers.addAll({...await authHeaders(), 'Content-Type': contentType});
+      request.contentLength = length;
+      final client = http.Client();
       try {
-        final client = http.Client();
-        try {
-          final streamed = await client.send(request).timeout(
-            const Duration(minutes: 3),
-          );
-          r = await http.Response.fromStream(streamed);
-        } finally {
-          client.close();
+        // The producer is awaited, so errors from reading the file cannot be lost.
+        final producer = () async {
+          try {
+            await for (final chunk in file.openRead()) {
+              request.sink.add(chunk);
+            }
+            await request.sink.close();
+          } catch (e, st) {
+            request.sink.addError(e, st);
+            rethrow;
+          }
+        }();
+        final response = await client.send(request).timeout(const Duration(minutes: 3));
+        final result = await http.Response.fromStream(response)
+            .timeout(const Duration(minutes: 3));
+        await producer;
+        if (result.statusCode != 200 && result.statusCode != 201) {
+          throw Exception('Falha no upload (HTTP ${result.statusCode}): ${result.body}');
         }
+        final payload = jsonDecode(result.body);
+        if (payload is! Map || payload['id'] is! String ||
+            payload['name'] is! String || payload['contentType'] is! String ||
+            payload['size'] is! int || payload['size'] != length) {
+          throw Exception('Resposta inválida do servidor de anexos.');
+        }
+        await send(attachment: {
+          'id': payload['id'], 'name': payload['name'],
+          'contentType': payload['contentType'], 'size': payload['size'],
+        });
       } finally {
-        await upload.cancel();
+        client.close();
       }
-      if (r.statusCode != 200 && r.statusCode != 201) {
-        throw Exception('Falha no upload (HTTP ${r.statusCode}): ${r.body}');
-      }
-      final payload = jsonDecode(r.body);
-      if(payload is! Map||payload['id'] is! String)throw Exception('Resposta inválida do servidor de anexos.');
-      await send(attachment:{
-        'id':payload['id'],
-        'name':name,
-        'contentType':contentType,
-        'size':await f.length()
-}
-);
-}catch(e){
-      if(mounted)notice(context, e);
-}
-}
+    } catch (e) {
+      if (mounted) notice(context, 'Anexo não enviado: $e');
+    } finally {
+      if (mounted) setState(() => uploading = false);
+    }
+  }
   Future<bool> admin()async{
     if(widget.serverId==null)return false;
     final d=(await db.collection('servers').doc(widget.serverId).get()).data();
@@ -1444,7 +1444,7 @@ class _MessageThreadState extends State<MessageThread> {
     replyAuthor=null;
 }
 ))), SafeArea(top:false, child:Padding(padding:const EdgeInsets.all(8), child:Row(children:[IconButton(tooltip:'Anexar arquivo',
-  onPressed:sending?null:attach, icon:const Icon(Icons.add_circle_outline)
+  onPressed:(sending||uploading)?null:attach, icon:Icon(uploading?Icons.hourglass_top:Icons.add_circle_outline)
 ), Expanded(child:TextField(controller:input, maxLength:2000, maxLines:4, minLines:1, decoration:const InputDecoration(hintText:'Mensagem',
   counterText:''
 ), onSubmitted:(_)=>send())), IconButton(onPressed:sending?null:()=>send(), icon:const Icon(Icons.send,
@@ -1561,12 +1561,12 @@ class UnreadDot extends StatelessWidget {
 
 // 0.5.0: perfil e temas. As cores são persistidas em Firestore como ARGB HEX.
 Color meowColor(Object? value,Color fallback){
- final raw=value?.toString().replaceAll('#','')??'';
- final n=int.tryParse(raw,radix:16);
- if(n==null)return fallback;
- return Color(raw.length<=6?(0xFF000000|n):n);
+ final raw=value?.toString().trim().replaceFirst('#','')??'';
+ if(!RegExp(r'^(?:[0-9a-fA-F]{6}|[0-9a-fA-F]{8})$').hasMatch(raw))return fallback;
+ final n=int.parse(raw,radix:16);
+ return Color(raw.length==6?(0xFF000000|n):n);
 }
-String meowHex(Color color)=>color.value.toRadixString(16).padLeft(8,'0').toUpperCase();
+String meowHex(Color color)=>'#${(color.value & 0xFFFFFF).toRadixString(16).padLeft(6,'0').toUpperCase()}';
 LinearGradient profileGradient(Map<String,dynamic> data){
  final a=meowColor(data['themeColorA'],panel),b=meowColor(data['themeColorB'],a);
  return LinearGradient(begin:Alignment.topLeft,end:Alignment.bottomRight,colors:[a,data['themeGradient']==true?b:a]);
@@ -1624,21 +1624,22 @@ class ThreadUnreadDot extends StatelessWidget{
 class ServerUnreadDot extends StatelessWidget{
  final String serverId,uid;const ServerUnreadDot({super.key,required this.serverId,required this.uid});
  @override Widget build(BuildContext c)=>StreamBuilder<QuerySnapshot<Map<String,dynamic>>>(stream:db.collection('servers').doc(serverId).collection('channels').snapshots(),builder:(c,s){
-  return Stack(children:[for(final ch in s.data?.docs??[])ThreadUnreadDot(threadId:'server:$serverId:${ch.id}',uid:uid,collection:ch.reference.collection('messages'))]);
+  if(s.hasError || s.data?.docs.isEmpty != false)return const SizedBox.shrink();
+  return SizedBox(width:12,height:12,child:Stack(children:[for(final ch in s.data!.docs)ThreadUnreadDot(threadId:'server:$serverId:${ch.id}',uid:uid,collection:ch.reference.collection('messages'))]));
  });
 }
 class DmPreview extends StatelessWidget{
  final String id,uid;const DmPreview({super.key,required this.id,required this.uid});
  @override Widget build(BuildContext c)=>StreamBuilder<QuerySnapshot<Map<String,dynamic>>>(stream:db.collection('dms').doc(id).collection('messages').orderBy('createdAt',descending:true).limit(1).snapshots(),builder:(c,s){
   if(s.hasError)return const Text('Conversa',maxLines:1);
-  if(s.data?.docs.isEmpty??true)return const Text('Inicie a conversa',maxLines:1);
+  if(s.data == null || s.data!.docs.isEmpty)return const Text('Inicie a conversa',maxLines:1);
   final d=s.data!.docs.first.data();final t=((d['text']?.toString()??'').isNotEmpty?d['text']:d['attachment'] is Map?'📎 Anexo':'Mensagem').toString();
   return Text('${d['authorId']==uid?'Você: ':''}$t',maxLines:1,overflow:TextOverflow.ellipsis);
  });
 }
 // Consultas restritas ao destinatario: nao varrem solicitacoes de terceiros.
 Stream<QuerySnapshot<Map<String, dynamic>>> myDmRequests(String uid) =>
-    db.collection('dmRequests').where('to', isEqualTo: uid).snapshots();
+    db.collection('dmRequests').where('to', isEqualTo: uid).where('status', isEqualTo: 'pending').snapshots();
 
 class DmRequestsDot extends StatelessWidget {
   final String uid;
