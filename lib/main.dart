@@ -156,7 +156,7 @@ class MeowApp extends StatelessWidget {
 }
 );
     @override Widget build(BuildContext context) => MaterialApp(debugShowCheckedModeBanner:false, title:'Meow',
-      theme: ThemeData.dark(useMaterial3:true).copyWith(pageTransitionsTheme:const PageTransitionsTheme(builders:{TargetPlatform.android:FadeUpwardsPageTransitionsBuilder(),TargetPlatform.iOS:CupertinoPageTransitionsBuilder()}),scaffoldBackgroundColor:bg, colorScheme:ColorScheme.fromSeed(seedColor:purple,
+      theme: ThemeData.dark(useMaterial3:true).copyWith(pageTransitionsTheme:PageTransitionsTheme(builders:{TargetPlatform.android:FadeUpwardsPageTransitionsBuilder(),TargetPlatform.iOS:CupertinoPageTransitionsBuilder()}),scaffoldBackgroundColor:bg, colorScheme:ColorScheme.fromSeed(seedColor:purple,
     brightness:Brightness.dark
 ), appBarTheme:const AppBarTheme(backgroundColor:panel), inputDecorationTheme:InputDecorationTheme(filled:true,
     fillColor:panel, border:OutlineInputBorder(borderRadius:BorderRadius.circular(14))
