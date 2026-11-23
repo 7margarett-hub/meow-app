@@ -20,46 +20,79 @@ final db = FirebaseFirestore.instance;
 // Compartilha requisicoes entre avatares repetidos e evita novos downloads ao navegar.
 class PrivateMediaCache {
   static final Map<String, Future<Uint8List?>> _pending = {};
-  static final Map<String, Uint8List> _completed = {};
-  static const int maxEntries = 100;
+  static final Map<String, ({Uint8List bytes, DateTime time})> _completed = {};
+  static final Map<String, int> _generation = {};
+  static const int maxBytes = 40 * 1024 * 1024;
+  static const Duration lifetime = Duration(minutes: 5);
+  static int _usedBytes = 0;
 
   static String _key(Uri url) =>
       '${FirebaseAuth.instance.currentUser?.uid ?? ''}|$url';
 
   static Future<Uint8List?> get(Uri url) {
     final key = _key(url);
-    final cached = _completed[key];
-    if (cached != null) return Future.value(cached);
-    return _pending.putIfAbsent(key, () async {
-      try {
-        final response = await http.get(
-          url,
-          headers: await authHeaders(),
-        ).timeout(const Duration(seconds: 30));
-        if (response.statusCode != 200) return null;
-        final bytes = response.bodyBytes;
-        if (_completed.length >= maxEntries) {
-          _completed.remove(_completed.keys.first);
-        }
-        _completed[key] = bytes;
-        return bytes;
-      } catch (_) {
-        return null;
-      } finally {
-        _pending.remove(key);
+    final entry = _completed[key];
+    if (entry != null) {
+      if (DateTime.now().difference(entry.time) < lifetime) {
+        return Future.value(entry.bytes);
       }
+      _usedBytes -= entry.bytes.lengthInBytes;
+      _completed.remove(key);
+    }
+    final existing = _pending[key];
+    if (existing != null) return existing;
+    final generation = _generation[key] ?? 0;
+    final task = _download(url, key, generation);
+    _pending[key] = task;
+    task.whenComplete(() {
+      if (identical(_pending[key], task)) _pending.remove(key);
     });
+    return task;
+  }
+
+  static Future<Uint8List?> _download(Uri url, String key, int generation) async {
+    try {
+      final response = await http.get(url, headers: await authHeaders())
+          .timeout(const Duration(seconds: 30));
+      if (response.statusCode != 200) {
+        debugPrint('Meow media: HTTP ${response.statusCode} em ${url.path}');
+        return null;
+      }
+      final bytes = response.bodyBytes;
+      if (bytes.isEmpty) {
+        debugPrint('Meow media: resposta vazia em ${url.path}');
+        return null;
+      }
+      if ((_generation[key] ?? 0) == generation && bytes.lengthInBytes <= maxBytes) {
+        while (_completed.isNotEmpty && _usedBytes + bytes.lengthInBytes > maxBytes) {
+          final oldest = _completed.keys.first;
+          _usedBytes -= _completed.remove(oldest)!.bytes.lengthInBytes;
+        }
+        _completed[key] = (bytes: bytes, time: DateTime.now());
+        _usedBytes += bytes.lengthInBytes;
+      }
+      return bytes;
+    } catch (e) {
+      debugPrint('Meow media: falha no download (${url.path}): $e');
+      return null;
+    }
   }
 
   static void invalidate(Uri url) {
     final key = _key(url);
-    _completed.remove(key);
+    _generation[key] = (_generation[key] ?? 0) + 1;
+    final old = _completed.remove(key);
+    if (old != null) _usedBytes -= old.bytes.lengthInBytes;
     _pending.remove(key);
   }
 
   static void clear() {
+    for (final key in {..._pending.keys, ..._completed.keys}) {
+      _generation[key] = (_generation[key] ?? 0) + 1;
+    }
     _completed.clear();
     _pending.clear();
+    _usedBytes = 0;
   }
 }
 
@@ -261,7 +294,7 @@ class _PrivateImageState extends State<PrivateImage> {
 )));
           return s.data==null?placeholder:Image.memory(s.data!, fit:BoxFit.cover, gaplessPlayback:true, errorBuilder:(c,
         e, st
-)=>placeholder);
+){ debugPrint('Meow: falha ao decodificar imagem: $e'); return placeholder; });
 }
 )
 ));
@@ -291,11 +324,11 @@ class _ChangeImageState extends State<ChangeImage> {
         final source=await showModalBottomSheet<String>(context:context, builder:(c)=>SafeArea(child:Column(mainAxisSize:MainAxisSize.min,
           children:[ListTile(leading:const Icon(Icons.photo_library), title:const Text('Galeria'), onTap:()=>Navigator.pop(c,
         'gallery'
-)), ListTile(leading:const Icon(Icons.folder), title:const Text('Arquivos'), onTap:()=>Navigator.pop(c,
+)), ListTile(leading:const Icon(Icons.folder), title:const Text('Arquivos / GIF original'), onTap:()=>Navigator.pop(c,
         'files'
 )),]
 )));
-      if(source==null)return;
+      if(!mounted || source==null)return;
         final f=source=='gallery'?await ImagePicker().pickImage(source:ImageSource.gallery, requestFullMetadata:false):await files.openFile(acceptedTypeGroups:const [files.XTypeGroup(label:'Imagens',
       extensions:['jpg', 'jpeg', 'png', 'webp', 'gif']
 )]);
@@ -432,7 +465,7 @@ class ProfilePage extends StatelessWidget {
             if (expanded) navigator.pop();
             await openDm(safeContext, uid);
 }
-, icon:const Icon(Icons.message), label:const Text('Enviar mensagem'))), if(own&&!expanded)TextButton.icon(onPressed:()=>FirebaseAuth.instance.signOut(),
+, icon:const Icon(Icons.message), label:const Text('Enviar mensagem'))), if(own&&!expanded)TextButton.icon(onPressed:() { PrivateMediaCache.clear(); FirebaseAuth.instance.signOut(); },
           icon:const Icon(Icons.logout), label:const Text('Sair da conta')
 ),
 ]
@@ -657,63 +690,74 @@ class _SocialHomeState extends State<SocialHome> with WidgetsBindingObserver {
     presenceTimer?.cancel();
     super.dispose();
 }
-  Future<String?> prompt(String title, String hint, {
-    int maxLength=40
-}
-)async{
-    final t=TextEditingController();
-      final result=await showDialog<String>(context:context, builder:(c)=>AlertDialog(title:Text(title),
-        content:TextField(controller:t, maxLength:maxLength, decoration:InputDecoration(hintText:hint)), actions:[TextButton(onPressed:()=>Navigator.pop(c),
-      child:const Text('Cancelar')
-), FilledButton(onPressed:()=>Navigator.pop(c, t.text.trim()), child:const Text('Confirmar'))]
-));
-    t.dispose();
-    return result;
-}
-  Future<void> createServer()async{
-    final n=await prompt('Criar servidor', 'Nome');
-    if(n==null||n.isEmpty)return;
-    try{
-      final ref=await db.collection('servers').add({
-        'name':n,
-        'ownerId':myUid,
-        'members':[myUid],
-        'createdAt':FieldValue.serverTimestamp()
-}
-);
-      await ref.collection('channels').add({
-        'name':'geral',
-        'category':'GERAL',
-        'createdAt':FieldValue.serverTimestamp()
-}
-);
-      if(mounted)setState((){
-        serverId=ref.id;
-        channelId=null;
-        showingChannels=true;
-}
-);
-}catch(e){
-      if(mounted)notice(context, e);
-}
-}
-  Future<void> createChannel()async{
-    if(serverId==null)return;
-    final n=await prompt('Criar canal', 'Nome');
-    if(n==null||n.isEmpty)return;
-    final category=await prompt('Categoria', 'GERAL');
-    if(category==null)return;
-    try{
-      await db.collection('servers').doc(serverId).collection('channels').add({
-        'name':n,
-        'category':category.isEmpty?'GERAL':category.toUpperCase(),
-        'createdAt':FieldValue.serverTimestamp()
-}
-);
-}catch(e){
-      if(mounted)notice(context, e);
-}
-}
+  Future<String?> prompt(String title, String hint, {int maxLength = 40}) async {
+    String value = '';
+    return showDialog<String>(
+      context: context,
+      builder: (dialogContext) => AlertDialog(
+        title: Text(title),
+        content: TextField(
+          autofocus: true,
+          maxLength: maxLength,
+          decoration: InputDecoration(hintText: hint),
+          onChanged: (text) => value = text,
+          onSubmitted: (_) => Navigator.of(dialogContext).pop(value.trim()),
+        ),
+        actions: [
+          TextButton(onPressed: () => Navigator.of(dialogContext).pop(), child: const Text('Cancelar')),
+          FilledButton(onPressed: () => Navigator.of(dialogContext).pop(value.trim()), child: const Text('Confirmar')),
+        ],
+      ),
+    );
+  }
+  Future<void> createServer() async {
+    final n = await prompt('Criar servidor', 'Nome');
+    if (!mounted || n == null || n.isEmpty) return;
+    try {
+      final server = db.collection('servers').doc();
+      final channel = server.collection('channels').doc();
+      final batch = db.batch();
+      batch.set(server, {
+        'name': n,
+        'ownerId': myUid,
+        'members': [myUid],
+        'createdAt': FieldValue.serverTimestamp(),
+      });
+      batch.set(channel, {
+        'name': 'geral',
+        'category': 'GERAL',
+        'createdAt': FieldValue.serverTimestamp(),
+      });
+      await batch.commit();
+      if (!mounted) return;
+      setState(() {
+        serverId = server.id;
+        channelId = null;
+        showingChannels = true;
+      });
+    } catch (e) {
+      if (mounted) notice(context, 'Não foi possível criar o servidor: $e');
+    }
+  }
+
+  Future<void> createChannel() async {
+    final id = serverId;
+    if (id == null) return;
+    final n = await prompt('Criar canal', 'Nome');
+    if (!mounted || n == null || n.isEmpty) return;
+    final category = await prompt('Categoria', 'GERAL');
+    if (!mounted || category == null) return;
+    try {
+      await db.collection('servers').doc(id).collection('channels').add({
+        'name': n,
+        'category': category.isEmpty ? 'GERAL' : category.toUpperCase(),
+        'createdAt': FieldValue.serverTimestamp(),
+      });
+      if (mounted) notice(context, 'Canal criado!');
+    } catch (e) {
+      if (mounted) notice(context, 'Não foi possível criar o canal: $e');
+    }
+  }
   Future<void> createInvite()async{
     if(serverId==null)return;
     const alphabet='ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
@@ -741,7 +785,7 @@ class _SocialHomeState extends State<SocialHome> with WidgetsBindingObserver {
 }
   Future<void> joinInvite()async{
     final code=(await prompt('Entrar com convite', 'Código', maxLength:20))?.toUpperCase();
-    if(code==null||code.isEmpty)return;
+    if(!mounted||code==null||code.isEmpty)return;
     try{
       final d=(await db.collection('invites').doc(code).get()).data();
       if(d==null||d['active']!=true)throw Exception('Convite inválido');
@@ -844,7 +888,7 @@ class _SocialHomeState extends State<SocialHome> with WidgetsBindingObserver {
           setState(() => showingChannels = true);
         }
       },
-      child:Scaffold(appBar:AppBar(title:const Text('🐱 Meow'), actions:[IconButton(onPressed:()=>FirebaseAuth.instance.signOut(),
+      child:Scaffold(appBar:AppBar(title:const Text('🐱 Meow'), actions:[IconButton(onPressed:() { PrivateMediaCache.clear(); FirebaseAuth.instance.signOut(); },
   icon:const Icon(Icons.logout)
 )]), body:Column(children:[Expanded(child:AnimatedSwitcher(duration:const Duration(milliseconds:280),
       transitionBuilder:(child, a)=>FadeTransition(opacity:a, child:SlideTransition(position:Tween<Offset>(begin:const Offset(.04,
@@ -1058,7 +1102,7 @@ class _MessageThreadState extends State<MessageThread> {
         'files'
 ))]
 )));
-      if(source==null)return;
+      if(!mounted || source==null)return;
       final f=source=='gallery'?await ImagePicker().pickImage(source:ImageSource.gallery, requestFullMetadata:false):await files.openFile();
       if(f==null)return;
       if(await f.length()>attachmentLimit)throw Exception('Arquivo maior que 25 MiB.');
@@ -1145,39 +1189,53 @@ class _MessageThreadState extends State<MessageThread> {
       final action=await showModalBottomSheet<String>(context:context, builder:(c)=>SafeArea(child:Column(mainAxisSize:MainAxisSize.min,
         children:[ListTile(leading:const Icon(Icons.reply), title:const Text('Responder'), onTap:()=>Navigator.pop(c,
       'reply'
-)), if(own)ListTile(leading:const Icon(Icons.edit), title:const Text('Editar'), onTap:()=>Navigator.pop(c,
+)), if((d['text']?.toString()??'').isNotEmpty)ListTile(leading:const Icon(Icons.copy), title:const Text('Copiar mensagem'), onTap:()=>Navigator.pop(c, 'copy')), if(own)ListTile(leading:const Icon(Icons.edit), title:const Text('Editar'), onTap:()=>Navigator.pop(c,
       'edit'
 )), if(canDelete)ListTile(leading:const Icon(Icons.delete), title:const Text('Apagar'), onTap:()=>Navigator.pop(c,
       'delete'
 ))]
 )));
     if(!mounted)return;
+    if(action=='copy'){
+      await Clipboard.setData(ClipboardData(text:d['text']?.toString()??''));
+      if(mounted)notice(context, 'Mensagem copiada!');
+      return;
+    }
     if(action=='reply')setState((){
       replyId=doc.id;
       replyText=d['text']?.toString()??'';
       replyAuthor=d['author']?.toString()??'Usuário';
 }
 );
-    if(action=='edit'&&own){
-      final t=TextEditingController(text:d['text']?.toString()??'');
-        final v=await showDialog<String>(context:context, builder:(c)=>AlertDialog(title:const Text('Editar mensagem'),
-          content:TextField(controller:t, maxLength:2000, maxLines:4), actions:[TextButton(onPressed:()=>Navigator.pop(c),
-        child:const Text('Cancelar')
-), FilledButton(onPressed:()=>Navigator.pop(c, t.text.trim()), child:const Text('Salvar'))]
-));
-      t.dispose();
-      if(v!=null&&v.isNotEmpty){
-        try{
+    if (action == 'edit' && own) {
+      String edited = d['text']?.toString() ?? '';
+      final v = await showDialog<String>(
+        context: context,
+        builder: (dialogContext) => AlertDialog(
+          title: const Text('Editar mensagem'),
+          content: TextFormField(
+            initialValue: edited,
+            maxLength: 2000,
+            maxLines: 4,
+            onChanged: (value) => edited = value,
+          ),
+          actions: [
+            TextButton(onPressed: () => Navigator.pop(dialogContext), child: const Text('Cancelar')),
+            FilledButton(onPressed: () => Navigator.pop(dialogContext, edited.trim()), child: const Text('Salvar')),
+          ],
+        ),
+      );
+      if (v != null && v.isNotEmpty) {
+        try {
           await doc.reference.update({
-            'text':v,
-            'editedAt':FieldValue.serverTimestamp()
-}
-);
-}catch(e){
-          if(mounted)notice(context, e);
-}
-}
-}
+            'text': v,
+            'editedAt': FieldValue.serverTimestamp(),
+          });
+        } catch (e) {
+          if (mounted) notice(context, e);
+        }
+      }
+    }
     if(action=='delete'&&canDelete){
         final ok=await showDialog<bool>(context:context, builder:(c)=>AlertDialog(title:const Text('Apagar mensagem?'),
           actions:[TextButton(onPressed:()=>Navigator.pop(c, false), child:const Text('Cancelar')), FilledButton(onPressed:()=>Navigator.pop(c,
