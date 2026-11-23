@@ -204,12 +204,13 @@ class _SocialHomeState extends State<SocialHome> {
   Future<void> createInvite() async {
     if (serverId == null) return;
     try {
-      // Matches the Firestore invite schema: serverId, createdBy, createdAt.
+      // Matches the Firestore invite schema, including the active flag.
       final code = newCode();
       await db.collection('invites').doc(code).set({
         'serverId': serverId,
         'createdBy': uid,
         'createdAt': FieldValue.serverTimestamp(),
+        'active': true,
       });
       if (!mounted) return;
       await showDialog<void>(context: context, builder: (ctx) => AlertDialog(
@@ -243,8 +244,8 @@ class _SocialHomeState extends State<SocialHome> {
     try {
       final invite = await db.collection('invites').doc(code).get();
       final data = invite.data();
-      if (data == null || data['serverId'] is! String) {
-        notice('Convite inválido.');
+      if (data == null || data['active'] != true || data['serverId'] is! String) {
+        notice('Convite inválido ou desativado.');
         return;
       }
       final id = data['serverId'] as String;
