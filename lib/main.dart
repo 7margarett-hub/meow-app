@@ -9,6 +9,7 @@ import 'package:firebase_core/firebase_core.dart';
 import 'package:firebase_messaging/firebase_messaging.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
+import 'package:package_info_plus/package_info_plus.dart';
 import 'package:http/http.dart' as http;
 import 'package:image_picker/image_picker.dart';
 const bg = Color(0xFF111218), panel = Color(0xFF1C1D28), purple = Color(0xFF8B5CF6);
@@ -225,7 +226,7 @@ class _LoginPageState extends State<LoginPage> {
 }
     @override Widget build(BuildContext c)=>Scaffold(body:Center(child:SingleChildScrollView(padding:const EdgeInsets.all(24),
       child:ConstrainedBox(constraints:const BoxConstraints(maxWidth:420), child:Column(mainAxisSize:MainAxisSize.min,
-        children:[const Icon(Icons.pets, size:72, color:purple), const SizedBox(height:18), Text(register?'Criar conta Meow':'Entrar no Meow',
+        children:[const Image(image:AssetImage('assets/meow_foreground.png'), width:88, height:88), const SizedBox(height:18), Text(register?'Criar conta Meow':'Entrar no Meow',
       style:const TextStyle(fontSize:24, fontWeight:FontWeight.bold)
 ), const SizedBox(height:22), TextField(controller:name, decoration:const InputDecoration(labelText:'Usuário')),
         const SizedBox(height:12), TextField(controller:password, obscureText:true, decoration:const InputDecoration(labelText:'Senha')),
@@ -344,6 +345,7 @@ class _ChangeImageState extends State<ChangeImage> {
       body:await f.readAsBytes()
 ).timeout(const Duration(seconds:120));
       if(r.statusCode!=200)throw Exception('Upload falhou: ${r.statusCode} ${r.body}');
+      if(widget.scope=='profile'&&widget.slot=='banner')await db.collection('users').doc(widget.id).update({'bannerHidden':false});
       changedImage.value=null;
       changedImage.value=mediaUrl(widget.scope, widget.id, widget.slot);
       if(mounted)notice(context, 'Imagem atualizada!');
@@ -506,14 +508,12 @@ class ProfilePage extends StatelessWidget {
     final username=d['username']?.toString()??'meow';
     final own=uid==FirebaseAuth.instance.currentUser?.uid;
     final p=d['presence']?.toString()??'offline';
-      return ListView(controller:scrollController, children:[Stack(clipBehavior:Clip.none, children:[PrivateImage(scope:'profile',
-    id:uid, slot:'banner', size:180, borderRadius:BorderRadius.zero
-), Positioned(left:18, bottom:-44, child:Container(padding:const EdgeInsets.all(4), decoration:const BoxDecoration(color:panel,
+      return ListView(controller:scrollController, children:[Stack(clipBehavior:Clip.none, children:[ProfileBanner(uid:uid,data:d), Positioned(left:18, bottom:-44, child:Container(padding:const EdgeInsets.all(4), decoration:const BoxDecoration(color:panel,
     shape:BoxShape.circle
 ), child:PrivateImage(scope:'profile', id:uid, slot:'avatar', size:88)))]), const SizedBox(height:55),
-        Padding(padding:const EdgeInsets.all(18), child:Column(crossAxisAlignment:CrossAxisAlignment.start,
+        Container(decoration:BoxDecoration(gradient:profileGradient(d)),padding:const EdgeInsets.all(18), child:Column(crossAxisAlignment:CrossAxisAlignment.start,
           children:[Text(d['displayName']?.toString()??username, style:const TextStyle(fontSize:24, fontWeight:FontWeight.bold)),
-          Text('@$username', style:const TextStyle(color:Colors.white60)), const SizedBox(height:12), RelationshipCounters(uid:uid), if(!own)FollowButton(target:uid), if((d['pronouns']?.toString()??'').isNotEmpty)Text(d['pronouns'].toString()),
+          Text('@$username', style:const TextStyle(color:Colors.white60)), if((d['pronouns']?.toString()??'').isNotEmpty)Text(d['pronouns'].toString(),style:const TextStyle(color:Colors.white70)), const SizedBox(height:12), RelationshipCounters(uid:uid), if(!own)FollowButton(target:uid), 
             const SizedBox(height:8), Row(children:[Icon(Icons.circle, size:12, color:presenceColor(own?p:(p=='invisible'?'offline':p))),
           const SizedBox(width:6), Text(own?(presenceLabels[p]??'Offline'):(p=='invisible'?'Offline':(presenceLabels[p]??'Offline')))
 ]), if((d['customStatus']?.toString()??'').isNotEmpty)Padding(padding:const EdgeInsets.only(top:8),
@@ -530,9 +530,7 @@ class ProfilePage extends StatelessWidget {
             if (expanded) navigator.pop();
             await openDm(safeContext, uid);
 }
-, icon:const Icon(Icons.message), label:const Text('Enviar mensagem'))), if(own&&!expanded)TextButton.icon(onPressed:()=>Navigator.push(c,MaterialPageRoute(builder:(_)=>const AppSettingsPage())),icon:const Icon(Icons.settings),label:const Text('Configurações do aplicativo')), if(own&&!expanded)TextButton.icon(onPressed:() { PrivateMediaCache.clear(); FirebaseAuth.instance.signOut(); },
-          icon:const Icon(Icons.logout), label:const Text('Sair da conta')
-),
+, icon:const Icon(Icons.message), label:const Text('Enviar mensagem'))), if(own&&!expanded)TextButton.icon(onPressed:()=>Navigator.push(c,MaterialPageRoute(builder:(_)=>const AppSettingsPage())),icon:const Icon(Icons.settings),label:const Text('Configurações do aplicativo')), 
 ]
 ))
 ]);
@@ -547,7 +545,7 @@ class AppSettingsPage extends StatelessWidget {
     body:ListView(children:[
       ListTile(leading:const Icon(Icons.person),title:const Text('Conta'),onTap:()=>Navigator.push(c,MaterialPageRoute(builder:(_)=>Scaffold(appBar:AppBar(title:const Text('Conta')),body:ListView(children:[
         ListTile(title:const Text('Editar perfil'),onTap:()=>Navigator.push(c,MaterialPageRoute(builder:(_)=>EditProfilePage(uid:myUid)))),
-        ListTile(title:const Text('Sair da conta'),onTap:(){PrivateMediaCache.clear();FirebaseAuth.instance.signOut();})]))))),
+        ListTile(title:const Text('Alterar senha'),onTap:()=>Navigator.push(c,MaterialPageRoute(builder:(_)=>const ChangePasswordPage()))), ListTile(title:const Text('Sair da conta'),onTap:(){PrivateMediaCache.clear();FirebaseAuth.instance.signOut();})]))))),
       ListTile(leading:const Icon(Icons.notifications),title:const Text('Notificações'),onTap:()=>Navigator.push(c,MaterialPageRoute(builder:(_)=>const NotificationSettingsPage()))),
       ListTile(leading:const Icon(Icons.storage),title:const Text('Armazenamento'),onTap:()=>Navigator.push(c,MaterialPageRoute(builder:(_)=>Scaffold(appBar:AppBar(title:const Text('Armazenamento')),body:ListTile(title:const Text('Limpar cache de imagens'),onTap:(){PrivateMediaCache.clear();notice(c,'Cache limpo.');}))))),
       ListTile(leading:const Icon(Icons.info),title:const Text('Sobre o Meow'),onTap:()=>Navigator.push(c,MaterialPageRoute(builder:(_)=>Scaffold(appBar:AppBar(title:const Text('Sobre o Meow')),body:const Center(child:Text('Meow • Beta')))))),
@@ -631,11 +629,7 @@ class _EditProfilePageState extends State<EditProfilePage> {
           custom.text=d['customStatus']?.toString()??'';
           presence=presenceLabels.containsKey(d['presence'])?d['presence'].toString():'online';
 }
-          return ListView(children:[Stack(clipBehavior:Clip.none, children:[PrivateImage(scope:'profile', id:widget.uid,
-        slot:'banner', size:180, borderRadius:BorderRadius.zero
-), Positioned(right:10, top:10, child:ChangeImage('profile', widget.uid, 'banner', 'Trocar banner',
-        iconOnly:true
-)), Positioned(left:18, bottom:-45, child:Stack(alignment:Alignment.bottomRight, children:[PrivateImage(scope:'profile',
+          return ListView(children:[Stack(clipBehavior:Clip.none, children:[ProfileBanner(uid:widget.uid,data:d), Positioned(right:10,top:10,child:Row(mainAxisSize:MainAxisSize.min,children:[ChangeImage('profile',widget.uid,'banner','Trocar banner',iconOnly:true),IconButton.filledTonal(tooltip:'Remover banner',onPressed:()async{await db.collection('users').doc(widget.uid).update({'bannerHidden':true});},icon:const Icon(Icons.hide_image))])), Positioned(left:18, bottom:-45, child:Stack(alignment:Alignment.bottomRight, children:[PrivateImage(scope:'profile',
         id:widget.uid, slot:'avatar', size:90
 ), ChangeImage('profile', widget.uid, 'avatar', 'Trocar foto', iconOnly:true)]))]), const SizedBox(height:64),
             Padding(padding:const EdgeInsets.all(18), child:Column(children:[TextField(controller:name, maxLength:15,
@@ -648,7 +642,7 @@ class _EditProfilePageState extends State<EditProfilePage> {
               onChanged:(v){
                 if(v!=null)setState(()=>presence=v);
 }
-), const SizedBox(height:20), SizedBox(width:double.infinity, child:FilledButton(onPressed:busy?null:save,
+), const SizedBox(height:12), ProfileThemeEditor(uid:widget.uid),const SizedBox(height:20), SizedBox(width:double.infinity, child:FilledButton(onPressed:busy?null:save,
             child:Text(busy?'Salvando...':'Salvar alterações')
 )),
 ]))
@@ -670,11 +664,11 @@ class ServerHeader extends StatelessWidget {
     final d=s.data?.data()??{
 }
 ;
-      return Column(children:[Stack(children:[PrivateImage(scope:'server', id:id, slot:'banner', size:160, borderRadius:BorderRadius.zero), if(d['ownerId']==myUid)Positioned(right:8,top:8,child:IconButton.filledTonal(icon:const Icon(Icons.more_vert),onPressed:()=>Navigator.push(c,MaterialPageRoute(builder:(_)=>ServerSettingsPage(id:id)))))]),
+      return Column(children:[Stack(children:[PrivateImage(scope:'server', id:id, slot:'banner', size:160, borderRadius:BorderRadius.zero), Positioned(right:8,top:8,child:IconButton.filledTonal(icon:const Icon(Icons.more_vert),onPressed:()=>Navigator.push(c,MaterialPageRoute(builder:(_)=>ServerSettingsPage(id:id)))))]),
         ListTile(leading:PrivateImage(scope:'server', id:id, slot:'avatar', size:42), title:Text(d['name']?.toString()??'Servidor'),
-          subtitle:Text('${(d['members'] as List?)?.length??0} membros'), trailing:d['ownerId']==myUid?IconButton(icon:const Icon(Icons.more_vert),
+          subtitle:Text('${(d['members'] as List?)?.length??0} membros'), trailing:IconButton(icon:const Icon(Icons.more_vert),
         onPressed:()=>Navigator.push(c, MaterialPageRoute(builder:(_)=>ServerSettingsPage(id:id)))
-):null
+)
 ), const Divider(height:1)
 ]);
 }
@@ -695,13 +689,11 @@ class ServerSettingsPage extends StatelessWidget {
         final d=s.data?.data()??{
 }
 ;
-        if(d['ownerId']!=myUid)return const Center(child:Text('Somente o proprietário pode editar.'));
+        final owner=d['ownerId']==myUid;
           return ListView(children:[PrivateImage(scope:'server', id:id, slot:'banner', size:160), const SizedBox(height:16),
             Center(child:PrivateImage(scope:'server', id:id, slot:'avatar', size:88)), Padding(padding:const EdgeInsets.all(18),
               child:Column(children:[Text(d['name']?.toString()??'Servidor', style:const TextStyle(fontSize:22)),
-                const SizedBox(height:18), OutlinedButton.icon(icon:const Icon(Icons.edit),label:const Text('Renomear servidor'),onPressed:()async{final v=await showTextPrompt(c,'Nome do servidor',d['name']?.toString()??'');if(v!=null&&v.isNotEmpty)await db.collection('servers').doc(id).update({'name':v});}), const SizedBox(height:12), ListTile(title:const Text('Organizar categorias e canais'),trailing:const Icon(Icons.chevron_right),onTap:()=>Navigator.push(c,MaterialPageRoute(builder:(_)=>ServerOrganizationPage(id:id)))), ChangeImage('server', id, 'avatar', 'Trocar ícone (8 MiB)'), ChangeImage('server',
-              id, 'banner', 'Trocar banner (15 MiB)'
-)
+                const SizedBox(height:18), if(owner) OutlinedButton.icon(icon:const Icon(Icons.edit),label:const Text('Renomear servidor'),onPressed:()async{final v=await showTextPrompt(c,'Nome do servidor',d['name']?.toString()??'');if(v!=null&&v.isNotEmpty)await db.collection('servers').doc(id).update({'name':v});}), const SizedBox(height:12), if(owner) ListTile(title:const Text('Organizar categorias e canais'),trailing:const Icon(Icons.chevron_right),onTap:()=>Navigator.push(c,MaterialPageRoute(builder:(_)=>ServerOrganizationPage(id:id)))), if(owner) ChangeImage('server', id, 'avatar', 'Trocar ícone (8 MiB)'),if(owner) ChangeImage('server',id,'banner','Trocar banner (15 MiB)'),if(owner) OutlinedButton.icon(onPressed:()=>confirmServerDelete(c,id),icon:const Icon(Icons.delete),label:const Text('Excluir servidor')),if(!owner)OutlinedButton.icon(onPressed:()=>confirmLeaveServer(c,id),icon:const Icon(Icons.logout),label:const Text('Sair do servidor'))
 ])
 )
 ]);
@@ -890,7 +882,7 @@ class _SocialHomeState extends State<SocialHome> with WidgetsBindingObserver {
     try {
       await db.collection('servers').doc(id).collection('channels').add({
         'name': n,
-        'category': category.isEmpty ? 'GERAL' : category.toUpperCase(),
+        'category': category.isEmpty ? 'GERAL' : category,
         'createdAt': FieldValue.serverTimestamp(),
       });
       if (mounted) notice(context, 'Canal criado!');
@@ -962,7 +954,7 @@ class _SocialHomeState extends State<SocialHome> with WidgetsBindingObserver {
         channelId=null;
         showingChannels=true;
 }
-), icon:PrivateImage(scope:'server', id:d.id, slot:'avatar', size:36))
+), icon:Stack(clipBehavior:Clip.none,children:[PrivateImage(scope:'server', id:d.id, slot:'avatar', size:36),Positioned(right:-2,bottom:-2,child:ServerUnreadDot(serverId:d.id,uid:myUid))]))
 )]))
 )])));
   Widget channelList(List<QueryDocumentSnapshot<Map<String, dynamic>>> docs){
@@ -973,7 +965,7 @@ class _SocialHomeState extends State<SocialHome> with WidgetsBindingObserver {
 ;
     final ordered=[...docs]..sort((a,b)=>((a.data()['order'] as num?)?.toInt()??0).compareTo((b.data()['order'] as num?)?.toInt()??0));
     for(final d in ordered){
-      final cat=(d.data()['category']?.toString()??'GERAL').toUpperCase();
+      final cat=d.data()['category']?.toString()??'GERAL';
       groups.putIfAbsent(cat, ()=>[]).add(d);
 }
       return ListView(children:[for(final g in groups.entries)...[ListTile(dense:true, title:Text(g.key,
@@ -982,7 +974,7 @@ class _SocialHomeState extends State<SocialHome> with WidgetsBindingObserver {
       if(!collapsed.add(g.key))collapsed.remove(g.key);
 }
 ),), if(!collapsed.contains(g.key))for(final d in g.value)ListTile(leading:const Icon(Icons.tag),
-      title:Text(d.data()['name']?.toString()??'canal'), onLongPress:()async{final v=await showTextPrompt(context,'Renomear canal',d.data()['name']?.toString()??'');if(v!=null&&v.isNotEmpty)await d.reference.update({'name':v});}, onTap:()=>setState((){
+      title:Text(d.data()['name']?.toString()??'canal'),trailing:ThreadUnreadDot(threadId:'server:$serverId:${d.id}',uid:myUid,collection:d.reference.collection('messages')), onLongPress:()async{final v=await showTextPrompt(context,'Renomear canal',d.data()['name']?.toString()??'');if(v!=null&&v.isNotEmpty)await d.reference.update({'name':v});}, onTap:()=>setState((){
         channelId=d.id;
         channelName=d.data()['name']?.toString()??'canal';
         showingChannels=false;
@@ -1005,7 +997,7 @@ class _SocialHomeState extends State<SocialHome> with WidgetsBindingObserver {
           if(v>250&&!showingChannels)setState(()=>showingChannels=true);
           if(v< -250&&showingChannels&&active!=null)setState(()=>showingChannels=false);
 }
-, child:AnimatedSwitcher(duration:const Duration(milliseconds:250), child:showingChannels?Row(key:const ValueKey('list'),
+, child:AnimatedSwitcher(duration:const Duration(milliseconds:190), child:showingChannels?Row(key:const ValueKey('list'),
             children:[rail(), Expanded(child:ColoredBox(color:panel, child:Column(children:[ServerHeader(id:serverId!),
               Row(children:[const Expanded(child:Padding(padding:EdgeInsets.all(12), child:Text('Canais', style:TextStyle(fontSize:18)))),
                 IconButton(onPressed:createChannel, icon:const Icon(Icons.add)), IconButton(onPressed:createInvite,
@@ -1029,9 +1021,7 @@ class _SocialHomeState extends State<SocialHome> with WidgetsBindingObserver {
           setState(() => showingChannels = true);
         }
       },
-      child:Scaffold(appBar:AppBar(title:const Text('🐱 Meow'), actions:[IconButton(onPressed:() { PrivateMediaCache.clear(); FirebaseAuth.instance.signOut(); },
-  icon:const Icon(Icons.logout)
-)]), body:Column(children:[Expanded(child:AnimatedSwitcher(duration:const Duration(milliseconds:280),
+      child:Scaffold(appBar:AppBar(title:const MeowTitle()), body:Column(children:[Expanded(child:AnimatedSwitcher(duration:const Duration(milliseconds:190),
       transitionBuilder:(child, a)=>FadeTransition(opacity:a, child:SlideTransition(position:Tween<Offset>(begin:const Offset(.04,
     0
 ), end:Offset.zero).animate(a), child:child)), child:KeyedSubtree(key:ValueKey(tab), child:switch(tab){
@@ -1060,6 +1050,9 @@ Future<void> openDm(BuildContext context, String other)async{
       'members':[me, other]
 }
 , SetOptions(merge:true));
+      final follows=await db.collection('users').doc(me).collection('following').doc(other).get();
+      final followed=await db.collection('users').doc(other).collection('following').doc(me).get();
+      if(!(follows.exists&&followed.exists)){final existing=await db.collection('dms').doc(id).collection('requests').doc(other).get();if(!existing.exists)await db.collection('dms').doc(id).collection('requests').doc(other).set({'from':me,'status':'pending','createdAt':FieldValue.serverTimestamp()});}
       if(context.mounted)Navigator.push(context, MaterialPageRoute(builder:(_)=>DmChatPage(id:id, other:other,
     uid:me
 )));
@@ -1068,38 +1061,34 @@ Future<void> openDm(BuildContext context, String other)async{
 }
 }
 
-class DmListPage extends StatelessWidget {
-  final String uid;
-  const DmListPage({
-    super.key,
-    required this.uid
+class DmListPage extends StatefulWidget {
+ final String uid;
+ const DmListPage({super.key,required this.uid});
+ @override State<DmListPage> createState()=>_DmListPageState();
 }
-);
-    @override Widget build(BuildContext c)=>Column(children:[const ListTile(title:Text('Mensagens privadas',
-  style:TextStyle(fontSize:22, fontWeight:FontWeight.bold)
-)), Expanded(child:StreamBuilder<QuerySnapshot<Map<String, dynamic>>>(stream:db.collection('dms').where('members',
-  arrayContains:uid
-).snapshots(), builder:(c, s){
+class _DmListPageState extends State<DmListPage> {
+ String query='';
+ @override Widget build(BuildContext c)=>Column(children:[
+  ListTile(title:const Text('Mensagens privadas',style:TextStyle(fontSize:22,fontWeight:FontWeight.bold)),trailing:Stack(children:[IconButton(tooltip:'Solicitações',onPressed:()=>Navigator.push(c,MaterialPageRoute(builder:(_)=>DmRequestsPage(uid:widget.uid))),icon:const Icon(Icons.mail_outline)),Positioned(right:5,top:5,child:DmRequestsDot(uid:widget.uid))])),
+  Padding(padding:const EdgeInsets.symmetric(horizontal:12),child:TextField(decoration:const InputDecoration(hintText:'Buscar por nome ou @usuário',prefixIcon:Icon(Icons.search)),onChanged:(v)=>setState(()=>query=v.trim().toLowerCase()))),
+  Expanded(child:StreamBuilder<QuerySnapshot<Map<String,dynamic>>>(stream:db.collection('dms').where('members',arrayContains:widget.uid).snapshots(),builder:(c,s){
     if(s.hasError)return Center(child:Text('Erro: ${s.error}'));
     if(!s.hasData)return const Center(child:CircularProgressIndicator());
     if(s.data!.docs.isEmpty)return const Center(child:Text('Abra o perfil de alguém para conversar.'));
-    return ListView(children:[for(final d in s.data!.docs)Builder(builder:(c){
-      final others=List<String>.from(d.data()['members']??[]).where((x)=>x!=uid).toList();
+    return ListView(children:[for(final d in s.data!.docs) Builder(builder:(c){
+      final others=List<String>.from(d.data()['members']??[]).where((x)=>x!=widget.uid).toList();
       if(others.isEmpty)return const SizedBox.shrink();
       final other=others.first;
-      return StreamBuilder<DocumentSnapshot<Map<String,
-        dynamic>>>(stream:db.collection('users').doc(other).snapshots(), builder:(c, u)=>ListTile(leading:ProfileAvatar(uid:other),
-        title:Text(u.data?.data()?['displayName']?.toString()??u.data?.data()?['username']?.toString()??'Usuário'),
-          subtitle:UnreadLabel(threadId:'dm:${d.id}', uid:uid), onTap:()=>Navigator.push(c, MaterialPageRoute(builder:(_)=>DmChatPage(id:d.id,
-        other:other, uid:uid
-)))
-));
+      return StreamBuilder<DocumentSnapshot<Map<String,dynamic>>>(stream:db.collection('users').doc(other).snapshots(),builder:(c,u){
+        final data=u.data?.data()??{};
+        final name=((data['displayName']?.toString()??'').isNotEmpty?data['displayName']:data['username']??'Usuário').toString();
+        final username=data['username']?.toString()??'';
+        if(query.isNotEmpty&&!name.toLowerCase().contains(query)&&!username.toLowerCase().contains(query.replaceFirst('@','')))return const SizedBox.shrink();
+        return ListTile(leading:ProfileAvatar(uid:other),title:Text(name),subtitle:DmPreview(id:d.id,uid:widget.uid),trailing:ThreadUnreadDot(threadId:'dm:${d.id}',uid:widget.uid,collection:d.reference.collection('messages')),onTap:()=>Navigator.push(c,MaterialPageRoute(builder:(_)=>DmChatPage(id:d.id,other:other,uid:widget.uid))));
+      });
+    })]);
+  }))]);
 }
-)]);
-}
-))]);
-}
-
 class DmChatPage extends StatelessWidget {
   final String id,
   other,
@@ -1113,7 +1102,7 @@ class DmChatPage extends StatelessWidget {
 );
     @override Widget build(BuildContext c)=>Scaffold(appBar:AppBar(title:StreamBuilder<DocumentSnapshot<Map<String,
   dynamic>>>(stream:db.collection('users').doc(other).snapshots(), builder:(c, s)=>Text(s.data?.data()?['displayName']?.toString()??s.data?.data()?['username']?.toString()??'DM'))
-), body:MessageThread(collection:db.collection('dms').doc(id).collection('messages'), uid:uid, threadId:'dm:$id'));
+), body:DmPermissionGate(id:id,uid:uid,other:other));
 }
 // Read receipts: a user's last-read timestamp is stored separately per thread.
 // Security rules must restrict each receipt to its owner.
@@ -1398,7 +1387,7 @@ class _MessageThreadState extends State<MessageThread> {
         if(s.hasError)return Center(child:Text('Erro: ${s.error}'));
         if(!s.hasData)return const Center(child:CircularProgressIndicator());
         final docs=s.data!.docs;
-        if(docs.isEmpty)return const Center(child:Text('Diga oi! 👋'));
+        if(docs.isEmpty)return const Center(child:Column(mainAxisSize:MainAxisSize.min,children:[Image(image:AssetImage('assets/meow_foreground.png'),width:72,height:72),SizedBox(height:12),Text('Comece a conversa!')]));
         final newest = docs.first.data()['createdAt'];
         if (newest is Timestamp && newest != lastMarkedMessage) {
           lastMarkedMessage = newest;
@@ -1413,13 +1402,12 @@ class _MessageThreadState extends State<MessageThread> {
           d=doc.data();
           final author=d['authorId']?.toString()??'';
           final attachment=d['attachment'];
+          final older=i+1<docs.length?docs[i+1].data():null;
+          final grouped=older!=null && older['authorId']==author && older['createdAt'] is Timestamp && d['createdAt'] is Timestamp && (d['createdAt'] as Timestamp).toDate().difference((older['createdAt'] as Timestamp).toDate()).inMinutes.abs()<5;
+          final when=d['createdAt'] is Timestamp?formatMeowTime((d['createdAt'] as Timestamp).toDate()):'Enviando...';
             return InkWell(onLongPress:()=>options(doc), child:Padding(padding:const EdgeInsets.symmetric(vertical:6),
-              child:Row(crossAxisAlignment:CrossAxisAlignment.start, children:[ProfileAvatar(uid:author), const SizedBox(width:10),
-                Expanded(child:Column(crossAxisAlignment:CrossAxisAlignment.start, children:[InkWell(onTap:()=>openProfile(c,
-              author
-), child:Text(d['author']?.toString()??'Usuário', style:const TextStyle(fontWeight:FontWeight.bold,
-              color:purple
-))), if(d['replyToId']!=null)Text('↳ ${d['replyAuthor']??''}: ${d['replyText']??''}', maxLines:2,
+              child:Row(crossAxisAlignment:CrossAxisAlignment.start, children:[grouped?const SizedBox(width:40):ProfileAvatar(uid:author), const SizedBox(width:10),
+                Expanded(child:Column(crossAxisAlignment:CrossAxisAlignment.start, children:[if(!grouped)Row(children:[Flexible(child:InkWell(onTap:()=>openProfile(c,author),child:Text(d['author']?.toString()??'Usuário',style:const TextStyle(fontWeight:FontWeight.bold,color:purple)))),const SizedBox(width:8),Text(when,style:const TextStyle(fontSize:11,color:Colors.white54))]), if(d['replyToId']!=null)Text('↳ ${d['replyAuthor']??''}: ${d['replyText']??''}', maxLines:2,
               overflow:TextOverflow.ellipsis, style:const TextStyle(color:Colors.white60, fontSize:12)
 ), if((d['text']?.toString()??'').isNotEmpty)Text(d['text'].toString()), if(attachment is Map&&attachment['id'] is String)AttachmentView(attachment:attachment),
               if(d['editedAt']!=null)const Text('(editada)', style:TextStyle(fontSize:11, color:Colors.white54))
@@ -1491,4 +1479,176 @@ class FriendsPage extends StatelessWidget {
         })),
       Expanded(child:RelationshipListPage(uid:uid,kind:'friends')),
     ]));
+}
+
+
+String formatMeowTime(DateTime date) {
+  final d=date.toLocal();
+  final now=DateTime.now();
+  final hh=d.hour.toString().padLeft(2,'0');
+  final mm=d.minute.toString().padLeft(2,'0');
+  if(d.year==now.year && d.month==now.month && d.day==now.day) return 'Hoje, $hh:$mm';
+  return '${d.day.toString().padLeft(2,'0')}/${d.month.toString().padLeft(2,'0')}/${d.year} $hh:$mm';
+}
+class MeowTitle extends StatelessWidget {
+  const MeowTitle({super.key});
+  @override Widget build(BuildContext context)=>FutureBuilder<PackageInfo>(
+    future:PackageInfo.fromPlatform(),builder:(context,s)=>Row(mainAxisSize:MainAxisSize.min,children:[
+      const Text('Meow'),const SizedBox(width:8),
+      Text(s.data?.version??'',style:const TextStyle(fontSize:12,color:Colors.white54))]));
+}
+class ChangePasswordPage extends StatefulWidget {
+  const ChangePasswordPage({super.key});
+  @override State<ChangePasswordPage> createState()=>_ChangePasswordPageState();
+}
+class _ChangePasswordPageState extends State<ChangePasswordPage> {
+  final current=TextEditingController(), next=TextEditingController(), confirm=TextEditingController();
+  bool busy=false;
+  @override void dispose(){current.dispose();next.dispose();confirm.dispose();super.dispose();}
+  Future<void> save()async{
+    if(next.text.length<8 || next.text!=confirm.text){notice(context,'Confira a nova senha (mínimo 8 caracteres).');return;}
+    setState(()=>busy=true);
+    try{
+      final user=FirebaseAuth.instance.currentUser!;
+      await user.reauthenticateWithCredential(EmailAuthProvider.credential(email:user.email!,password:current.text));
+      await user.updatePassword(next.text);
+      if(mounted){notice(context,'Senha atualizada.');Navigator.pop(context);}
+    }catch(e){if(mounted)notice(context,'Não foi possível alterar a senha: $e');}
+    finally{if(mounted)setState(()=>busy=false);}
+  }
+  @override Widget build(BuildContext context)=>Scaffold(appBar:AppBar(title:const Text('Alterar senha')),
+    body:ListView(padding:const EdgeInsets.all(16),children:[
+      TextField(controller:current,obscureText:true,decoration:const InputDecoration(labelText:'Senha atual')),
+      const SizedBox(height:12),TextField(controller:next,obscureText:true,decoration:const InputDecoration(labelText:'Nova senha')),
+      const SizedBox(height:12),TextField(controller:confirm,obscureText:true,decoration:const InputDecoration(labelText:'Confirmar nova senha')),
+      const SizedBox(height:20),FilledButton(onPressed:busy?null:save,child:Text(busy?'Aguarde...':'Alterar senha'))]));
+}
+
+class UnreadDot extends StatelessWidget {
+ final String threadId,uid;
+ const UnreadDot({super.key,required this.threadId,required this.uid});
+ @override Widget build(BuildContext context){
+   final collection=threadId.startsWith('dm:')?db.collection('dms').doc(threadId.substring(3)).collection('messages'):null;
+   if(collection==null)return const SizedBox.shrink();
+   return StreamBuilder<DocumentSnapshot<Map<String,dynamic>>>(stream:receiptRef(threadId,uid).snapshots(),builder:(context,read){
+     final seen=read.data?.data()?['at'] as Timestamp?;
+     return StreamBuilder<QuerySnapshot<Map<String,dynamic>>>(stream:collection.orderBy('createdAt',descending:true).limit(20).snapshots(),builder:(context,s){
+       final unread=s.data?.docs.any((d){final at=d.data()['createdAt'];return d.data()['authorId']!=uid && at is Timestamp && (seen==null||at.compareTo(seen)>0);})??false;
+       return unread?const Icon(Icons.circle,color:Color(0xFF38F87A),size:11):const SizedBox.shrink();
+     });
+   });
+ }
+}
+
+
+// 0.5.0: perfil e temas. As cores são persistidas em Firestore como ARGB HEX.
+Color meowColor(Object? value,Color fallback){
+ final raw=value?.toString().replaceAll('#','')??'';
+ final n=int.tryParse(raw,radix:16);
+ if(n==null)return fallback;
+ return Color(raw.length<=6?(0xFF000000|n):n);
+}
+String meowHex(Color color)=>color.value.toRadixString(16).padLeft(8,'0').toUpperCase();
+LinearGradient profileGradient(Map<String,dynamic> data){
+ final a=meowColor(data['themeColorA'],panel),b=meowColor(data['themeColorB'],a);
+ return LinearGradient(begin:Alignment.topLeft,end:Alignment.bottomRight,colors:[a,data['themeGradient']==true?b:a]);
+}
+class ProfileBanner extends StatelessWidget{
+ final String uid;final Map<String,dynamic> data;
+ const ProfileBanner({super.key,required this.uid,required this.data});
+ @override Widget build(BuildContext context)=>data['bannerHidden']==true
+ ?Container(height:180,decoration:BoxDecoration(gradient:profileGradient(data)))
+ :PrivateImage(scope:'profile',id:uid,slot:'banner',size:180,borderRadius:BorderRadius.zero);
+}
+class ProfileThemeEditor extends StatefulWidget{
+ final String uid;const ProfileThemeEditor({super.key,required this.uid});
+ @override State<ProfileThemeEditor> createState()=>_ProfileThemeEditorState();
+}
+class _ProfileThemeEditorState extends State<ProfileThemeEditor>{
+ Color first=panel,second=purple;bool gradient=false,loaded=false,saving=false;
+ @override Widget build(BuildContext context)=>StreamBuilder<DocumentSnapshot<Map<String,dynamic>>>(stream:db.collection('users').doc(widget.uid).snapshots(),builder:(c,s){
+  final d=s.data?.data()??{};
+  if(!loaded&&s.hasData){loaded=true;first=meowColor(d['themeColorA'],panel);second=meowColor(d['themeColorB'],purple);gradient=d['themeGradient']==true;}
+  return Column(crossAxisAlignment:CrossAxisAlignment.stretch,children:[const Text('Tema do perfil',style:TextStyle(fontWeight:FontWeight.bold)),const SizedBox(height:8),
+   Container(height:70,decoration:BoxDecoration(borderRadius:BorderRadius.circular(12),gradient:LinearGradient(colors:[first,gradient?second:first]))),
+   SwitchListTile(title:const Text('Usar gradiente de duas cores'),value:gradient,onChanged:(v)=>setState(()=>gradient=v)),
+   OutlinedButton(onPressed:()=>pick(0),child:const Text('Selecionar cor principal')),
+   if(gradient)OutlinedButton(onPressed:()=>pick(1),child:const Text('Selecionar segunda cor')),
+   FilledButton(onPressed:saving?null:()async{setState(()=>saving=true);try{await db.collection('users').doc(widget.uid).update({'themeColorA':meowHex(first),'themeColorB':meowHex(second),'themeGradient':gradient});if(mounted)notice(context,'Tema salvo!');}catch(e){if(mounted)notice(context,e);}finally{if(mounted)setState(()=>saving=false);}},child:Text(saving?'Salvando...':'Salvar tema')),
+  ]);
+ });
+}
+extension MeowColorEditor on _ProfileThemeEditorState{
+ Future<void> pick(int index)async{
+  Color chosen=index==0?first:second;
+  final hex=TextEditingController(text:meowHex(chosen));
+  final result=await showDialog<Color>(context:context,builder:(dialog)=>StatefulBuilder(builder:(dialog,setDialog)=>AlertDialog(title:Text(index==0?'Cor principal':'Segunda cor'),content:SizedBox(width:320,child:SingleChildScrollView(child:Column(mainAxisSize:MainAxisSize.min,children:[
+   Container(height:40,color:chosen),const SizedBox(height:10),
+   for(final item in <(String,int)>[('Vermelho',0),('Verde',1),('Azul',2)])Row(children:[SizedBox(width:75,child:Text(item.$1)),Expanded(child:Slider(min:0,max:255,value:[chosen.red,chosen.green,chosen.blue][item.$2].toDouble(),onChanged:(v){final rgb=[chosen.red,chosen.green,chosen.blue];rgb[item.$2]=v.round();setDialog(()=>chosen=Color.fromARGB(255,rgb[0],rgb[1],rgb[2]));hex.text=meowHex(chosen);}))]),
+   TextField(controller:hex,decoration:const InputDecoration(labelText:'Cor hexadecimal (ARGB ou RGB)'),onChanged:(v){setDialog(()=>chosen=meowColor(v,chosen));}),
+  ]))),actions:[TextButton(onPressed:()=>Navigator.pop(dialog),child:const Text('Cancelar')),FilledButton(onPressed:()=>Navigator.pop(dialog,chosen),child:const Text('Aplicar'))])));
+  hex.dispose();if(result!=null&&mounted)setState((){if(index==0)first=result;else second=result;});
+ }
+}
+
+// Leituras por conversa e indicadores independentes de solicitações.
+class ThreadUnreadDot extends StatelessWidget{
+ final String threadId,uid;final CollectionReference<Map<String,dynamic>> collection;
+ const ThreadUnreadDot({super.key,required this.threadId,required this.uid,required this.collection});
+ @override Widget build(BuildContext c)=>StreamBuilder<DocumentSnapshot<Map<String,dynamic>>>(stream:receiptRef(threadId,uid).snapshots(),builder:(c,r){
+  final seen=r.data?.data()?['at'] as Timestamp?;
+  return StreamBuilder<QuerySnapshot<Map<String,dynamic>>>(stream:collection.orderBy('createdAt',descending:true).limit(30).snapshots(),builder:(c,s){
+   final unread=s.data?.docs.any((d){final t=d.data()['createdAt'];return d.data()['authorId']!=uid&&t is Timestamp&&(seen==null||t.compareTo(seen)>0);})??false;
+   return unread?const Icon(Icons.circle,color:Color(0xFF39F57A),size:12):const SizedBox.shrink();
+  });
+ });
+}
+class ServerUnreadDot extends StatelessWidget{
+ final String serverId,uid;const ServerUnreadDot({super.key,required this.serverId,required this.uid});
+ @override Widget build(BuildContext c)=>StreamBuilder<QuerySnapshot<Map<String,dynamic>>>(stream:db.collection('servers').doc(serverId).collection('channels').snapshots(),builder:(c,s){
+  return Stack(children:[for(final ch in s.data?.docs??[])ThreadUnreadDot(threadId:'server:$serverId:${ch.id}',uid:uid,collection:ch.reference.collection('messages'))]);
+ });
+}
+class DmPreview extends StatelessWidget{
+ final String id,uid;const DmPreview({super.key,required this.id,required this.uid});
+ @override Widget build(BuildContext c)=>StreamBuilder<QuerySnapshot<Map<String,dynamic>>>(stream:db.collection('dms').doc(id).collection('messages').orderBy('createdAt',descending:true).limit(1).snapshots(),builder:(c,s){
+  if(s.hasError)return const Text('Conversa',maxLines:1);
+  if(s.data?.docs.isEmpty??true)return const Text('Inicie a conversa',maxLines:1);
+  final d=s.data!.docs.first.data();final t=((d['text']?.toString()??'').isNotEmpty?d['text']:d['attachment'] is Map?'📎 Anexo':'Mensagem').toString();
+  return Text('${d['authorId']==uid?'Você: ':''}$t',maxLines:1,overflow:TextOverflow.ellipsis);
+ });
+}
+class DmRequestsDot extends StatelessWidget{
+ final String uid;const DmRequestsDot({super.key,required this.uid});
+ @override Widget build(BuildContext c)=>StreamBuilder<QuerySnapshot<Map<String,dynamic>>>(stream:db.collectionGroup('requests').where('status',isEqualTo:'pending').snapshots(),builder:(c,s){
+  final has=s.data?.docs.any((d)=>d.id==uid)??false;
+  return has?const Icon(Icons.circle,color:Colors.redAccent,size:10):const SizedBox.shrink();
+ });
+}
+class DmRequestsPage extends StatelessWidget{
+ final String uid;const DmRequestsPage({super.key,required this.uid});
+ @override Widget build(BuildContext c)=>Scaffold(appBar:AppBar(title:const Text('Solicitações de mensagens')),body:StreamBuilder<QuerySnapshot<Map<String,dynamic>>>(stream:db.collectionGroup('requests').where('status',isEqualTo:'pending').snapshots(),builder:(c,s){
+  if(s.hasError)return Center(child:Text('Erro: ${s.error}'));
+  final requests=s.data?.docs.where((d)=>d.id==uid).toList()??[];
+  if(requests.isEmpty)return const Center(child:Text('Nenhuma solicitação pendente.'));
+  return ListView(children:[for(final d in requests)ListTile(leading:ProfileAvatar(uid:d.data()['from']?.toString()??''),title:UserDisplayName(uid:d.data()['from']?.toString()??''),subtitle:const Text('Quer conversar com você'),trailing:Wrap(children:[IconButton(tooltip:'Aceitar',icon:const Icon(Icons.check),onPressed:()async{await d.reference.update({'status':'accepted'});if(c.mounted)Navigator.push(c,MaterialPageRoute(builder:(_)=>DmChatPage(id:d.reference.parent.parent!.id,other:d.data()['from'].toString(),uid:uid)));}),IconButton(tooltip:'Recusar',icon:const Icon(Icons.close),onPressed:()=>d.reference.update({'status':'declined'}))]))]);
+ }));
+}
+class DmPermissionGate extends StatelessWidget{
+ final String id,uid,other;const DmPermissionGate({super.key,required this.id,required this.uid,required this.other});
+ @override Widget build(BuildContext c)=>StreamBuilder<DocumentSnapshot<Map<String,dynamic>>>(stream:db.collection('dms').doc(id).collection('requests').doc(uid).snapshots(),builder:(c,s){
+  final pending=s.data?.data()?['status']=='pending';
+  if(pending)return Center(child:Column(mainAxisSize:MainAxisSize.min,children:[const Text('Solicitação de mensagem'),const SizedBox(height:10),FilledButton(onPressed:()async{await s.data!.reference.update({'status':'accepted'});},child:const Text('Aceitar conversa'))]));
+  return MessageThread(collection:db.collection('dms').doc(id).collection('messages'),uid:uid,threadId:'dm:$id');
+ });
+}
+Future<void> confirmLeaveServer(BuildContext context,String id)async{
+ final ok=await showDialog<bool>(context:context,builder:(c)=>AlertDialog(title:const Text('Sair do servidor?'),actions:[TextButton(onPressed:()=>Navigator.pop(c,false),child:const Text('Cancelar')),FilledButton(onPressed:()=>Navigator.pop(c,true),child:const Text('Sair'))]));
+ if(ok!=true)return;
+ try{await db.collection('servers').doc(id).update({'members':FieldValue.arrayRemove([myUid])});if(context.mounted)Navigator.pop(context);}catch(e){if(context.mounted)notice(context,e);}
+}
+Future<void> confirmServerDelete(BuildContext context,String id)async{
+ final ok=await showDialog<bool>(context:context,builder:(c)=>AlertDialog(title:const Text('Excluir servidor?'),content:const Text('Esta ação é permanente e apagará canais e mensagens quando o backend concluir a exclusão.'),actions:[TextButton(onPressed:()=>Navigator.pop(c,false),child:const Text('Cancelar')),FilledButton(onPressed:()=>Navigator.pop(c,true),child:const Text('Excluir'))]));
+ if(ok!=true)return;
+ try{await db.collection('serverDeletionRequests').doc(id).set({'ownerId':myUid,'requestedAt':FieldValue.serverTimestamp()});if(context.mounted)notice(context,'Exclusão solicitada. Aguardando processamento do servidor.');}catch(e){if(context.mounted)notice(context,e);}
 }
