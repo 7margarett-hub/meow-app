@@ -404,56 +404,239 @@ class _SocialHomeState extends State<SocialHome> {
     ]),
     body: Column(children: [
       Expanded(child: tab == 1 ? FriendsPage(uid: uid)
-        : tab == 2 ? ProfilePage(uid: uid) : serverContent()),
+        : tab == 2 ? DmListPage(uid: uid)
+        : tab == 3 ? ProfilePage(uid: uid) : serverContent()),
       NavigationBar(height: 70, selectedIndex: tab,
         onDestinationSelected: (i) => setState(() => tab = i), destinations: const [
           NavigationDestination(icon: Icon(Icons.tag), label: 'Canais'),
           NavigationDestination(icon: Icon(Icons.people), label: 'Amigos'),
+          NavigationDestination(icon: Icon(Icons.chat_bubble_outline), label: 'DMs'),
           NavigationDestination(icon: Icon(Icons.person), label: 'Perfil'),
         ]),
     ]),
   );
 }
 
-class ChatPage extends StatefulWidget {
+// Mensagens de servidores e DMs usam o mesmo menu e editor.
+class ChatPage extends StatelessWidget {
   final String serverId, channelId, uid;
   const ChatPage({super.key, required this.serverId, required this.channelId, required this.uid});
   @override
-  State<ChatPage> createState() => _ChatPageState();
+  Widget build(BuildContext context) => MessageThread(
+    key: ValueKey('server-$serverId-$channelId'),
+    collection: FirebaseFirestore.instance.collection('servers').doc(serverId)
+      .collection('channels').doc(channelId).collection('messages'),
+    uid: uid, serverId: serverId,
+  );
 }
 
-class _ChatPageState extends State<ChatPage> {
+String dmId(String a, String b) {
+  final ids = [a, b]..sort();
+  return '${ids[0]}_${ids[1]}';
+}
+
+Future<void> openDm(BuildContext context, String otherUid) async {
+  final me = FirebaseAuth.instance.currentUser?.uid;
+  if (me == null || otherUid.isEmpty || me == otherUid) return;
+  final id = dmId(me, otherUid);
+  try {
+    await FirebaseFirestore.instance.collection('dms').doc(id).set({
+      'members': [me, otherUid],
+    }, SetOptions(merge: true));
+    if (!context.mounted) return;
+    Navigator.push(context, MaterialPageRoute(builder: (_) => DmChatPage(
+      dmIdValue: id, otherUid: otherUid, uid: me)));
+  } catch (e) {
+    if (context.mounted) ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(content: Text('Não foi possível abrir a DM: $e')));
+  }
+}
+
+class DmListPage extends StatelessWidget {
+  final String uid;
+  const DmListPage({super.key, required this.uid});
+  @override
+  Widget build(BuildContext context) => Column(children: [
+    const Padding(padding: EdgeInsets.all(16), child: Align(
+      alignment: Alignment.centerLeft,
+      child: Text('Mensagens privadas', style: TextStyle(fontSize: 23, fontWeight: FontWeight.bold)))),
+    Expanded(child: StreamBuilder<QuerySnapshot<Map<String, dynamic>>>(
+      stream: FirebaseFirestore.instance.collection('dms')
+        .where('members', arrayContains: uid).snapshots(),
+      builder: (context, snap) {
+        if (snap.hasError) return Center(child: Text('Erro ao carregar DMs: ${snap.error}'));
+        if (!snap.hasData) return const Center(child: CircularProgressIndicator());
+        if (snap.data!.docs.isEmpty) return const Center(
+          child: Text('Abra o perfil de alguém e toque em Enviar mensagem.'));
+        return ListView(children: [for (final doc in snap.data!.docs)
+          Builder(builder: (context) {
+            final members = List<String>.from(doc.data()['members'] ?? []);
+            final others = members.where((id) => id != uid).toList();
+            if (others.isEmpty) return const SizedBox.shrink();
+            final other = others.first;
+            return StreamBuilder<DocumentSnapshot<Map<String, dynamic>>>(
+              stream: FirebaseFirestore.instance.collection('users').doc(other).snapshots(),
+              builder: (context, userSnap) {
+                final data = userSnap.data?.data();
+                return ListTile(
+                  leading: ProfileAvatar(uid: other),
+                  title: Text(data?['displayName']?.toString() ??
+                    data?['username']?.toString() ?? 'Usuário'),
+                  subtitle: const Text('Mensagem privada'),
+                  onTap: () => Navigator.push(context, MaterialPageRoute(builder: (_) =>
+                    DmChatPage(dmIdValue: doc.id, otherUid: other, uid: uid))),
+                );
+              });
+          }),
+        ]);
+      },
+    )),
+  ]);
+}
+
+class DmChatPage extends StatelessWidget {
+  final String dmIdValue, otherUid, uid;
+  const DmChatPage({super.key, required this.dmIdValue,
+    required this.otherUid, required this.uid});
+  @override
+  Widget build(BuildContext context) => Scaffold(
+    appBar: AppBar(title: StreamBuilder<DocumentSnapshot<Map<String, dynamic>>>(
+      stream: FirebaseFirestore.instance.collection('users').doc(otherUid).snapshots(),
+      builder: (context, snap) => Text(snap.data?.data()?['displayName']?.toString() ??
+        snap.data?.data()?['username']?.toString() ?? 'Mensagem privada'))),
+    body: MessageThread(
+      collection: FirebaseFirestore.instance.collection('dms').doc(dmIdValue)
+        .collection('messages'), uid: uid),
+  );
+}
+
+class MessageThread extends StatefulWidget {
+  final CollectionReference<Map<String, dynamic>> collection;
+  final String uid;
+  final String? serverId;
+  const MessageThread({super.key, required this.collection, required this.uid, this.serverId});
+  @override
+  State<MessageThread> createState() => _MessageThreadState();
+}
+
+class _MessageThreadState extends State<MessageThread> {
   final input = TextEditingController();
   bool sending = false;
+  String? replyingId, replyingText, replyingAuthor;
   @override
   void dispose() { input.dispose(); super.dispose(); }
-  CollectionReference<Map<String, dynamic>> get messages => FirebaseFirestore.instance
-    .collection('servers').doc(widget.serverId)
-    .collection('channels').doc(widget.channelId).collection('messages');
+
+  void notice(String message) {
+    if (mounted) ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(message)));
+  }
 
   Future<void> send() async {
-    final value = input.text.trim();
-    if (value.isEmpty || sending) return;
+    final text = input.text.trim();
+    if (text.isEmpty || sending) return;
     setState(() => sending = true);
     try {
       final user = await FirebaseFirestore.instance.collection('users').doc(widget.uid).get();
-      await messages.add({
-        'text': value, 'authorId': widget.uid,
+      final data = <String, dynamic>{
+        'text': text, 'authorId': widget.uid,
         'author': user.data()?['displayName'] ?? user.data()?['username'] ?? 'Usuário',
         'createdAt': FieldValue.serverTimestamp(),
-      });
+      };
+      if (replyingId != null) {
+        data['replyToId'] = replyingId;
+        data['replyText'] = replyingText;
+        data['replyAuthor'] = replyingAuthor;
+      }
+      await widget.collection.add(data);
       input.clear();
-    } catch (e) {
-      if (mounted) ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text('Falha ao enviar: $e')));
-    }
+      if (mounted) setState(() { replyingId = null; replyingText = null; replyingAuthor = null; });
+    } catch (e) { notice('Falha ao enviar: $e'); }
     if (mounted) setState(() => sending = false);
+  }
+
+  Future<bool> isServerAdmin() async {
+    if (widget.serverId == null) return false;
+    final server = await FirebaseFirestore.instance.collection('servers').doc(widget.serverId).get();
+    final data = server.data();
+    // A estrutura atual usa ownerId. Outros administradores podem ser
+    // reconhecidos futuramente pelo campo opcional adminIds.
+    final admins = data?['adminIds'];
+    return data?['ownerId'] == widget.uid ||
+      (admins is List && admins.contains(widget.uid));
+  }
+
+  Future<void> editMessage(QueryDocumentSnapshot<Map<String, dynamic>> doc) async {
+    final current = doc.data()['text']?.toString() ?? '';
+    final controller = TextEditingController(text: current);
+    final next = await showDialog<String>(context: context, builder: (ctx) => AlertDialog(
+      title: const Text('Editar mensagem'),
+      content: TextField(controller: controller, maxLength: 2000, maxLines: 5, minLines: 1),
+      actions: [
+        TextButton(onPressed: () => Navigator.pop(ctx), child: const Text('Cancelar')),
+        FilledButton(onPressed: () => Navigator.pop(ctx, controller.text.trim()),
+          child: const Text('Salvar')),
+      ],
+    ));
+    // Não descartar o controller antes da animação de fechamento do diálogo.
+    if (next == null || next.isEmpty || next == current) return;
+    try {
+      await doc.reference.update({'text': next, 'editedAt': FieldValue.serverTimestamp()});
+    } catch (e) { notice('Não foi possível editar: $e'); }
+  }
+
+  Future<void> deleteMessage(QueryDocumentSnapshot<Map<String, dynamic>> doc) async {
+    final confirm = await showDialog<bool>(context: context, builder: (ctx) => AlertDialog(
+      title: const Text('Apagar mensagem?'),
+      content: const Text('Esta ação não pode ser desfeita.'),
+      actions: [
+        TextButton(onPressed: () => Navigator.pop(ctx, false), child: const Text('Cancelar')),
+        FilledButton(onPressed: () => Navigator.pop(ctx, true), child: const Text('Apagar')),
+      ],
+    ));
+    if (confirm != true) return;
+    try { await doc.reference.delete(); }
+    catch (e) { notice('Não foi possível apagar: $e'); }
+  }
+
+  Future<void> messageOptions(QueryDocumentSnapshot<Map<String, dynamic>> doc) async {
+    final data = doc.data();
+    final own = data['authorId'] == widget.uid;
+    bool admin = false;
+    if (!own && widget.serverId != null) {
+      try { admin = await isServerAdmin(); }
+      catch (e) { notice('Não foi possível verificar permissões: $e'); return; }
+    }
+    if (!mounted) return;
+    final action = await showModalBottomSheet<String>(context: context,
+      backgroundColor: panel, showDragHandle: true, builder: (ctx) => SafeArea(
+        child: Column(mainAxisSize: MainAxisSize.min, children: [
+          ListTile(leading: const Icon(Icons.reply), title: const Text('Responder'),
+            onTap: () => Navigator.pop(ctx, 'reply')),
+          if (own && data['text'] is String)
+            ListTile(leading: const Icon(Icons.edit), title: const Text('Editar mensagem'),
+              onTap: () => Navigator.pop(ctx, 'edit')),
+          if (own || admin)
+            ListTile(leading: const Icon(Icons.delete_outline, color: Colors.redAccent),
+              title: const Text('Apagar mensagem', style: TextStyle(color: Colors.redAccent)),
+              onTap: () => Navigator.pop(ctx, 'delete')),
+        ])));
+    if (!mounted) return;
+    if (action == 'reply') {
+      setState(() {
+        replyingId = doc.id;
+        replyingText = data['text']?.toString() ?? '';
+        replyingAuthor = data['author']?.toString() ?? 'Usuário';
+      });
+    } else if (action == 'edit' && own) {
+      await editMessage(doc);
+    } else if (action == 'delete' && (own || admin)) {
+      await deleteMessage(doc);
+    }
   }
 
   @override
   Widget build(BuildContext context) => Column(children: [
     Expanded(child: StreamBuilder<QuerySnapshot<Map<String, dynamic>>>(
-      stream: messages.orderBy('createdAt', descending: true).limit(100).snapshots(),
+      stream: widget.collection.orderBy('createdAt', descending: true).limit(100).snapshots(),
       builder: (context, snap) {
         if (snap.hasError) return Center(child: Text('Erro ao carregar: ${snap.error}'));
         if (!snap.hasData) return const Center(child: CircularProgressIndicator());
@@ -461,20 +644,47 @@ class _ChatPageState extends State<ChatPage> {
         if (docs.isEmpty) return const Center(child: Text('Diga oi! 👋'));
         return ListView.builder(reverse: true, padding: const EdgeInsets.all(12),
           itemCount: docs.length, itemBuilder: (context, i) {
-            final data = docs[i].data();
-            final author = data['author']?.toString() ?? 'Usuário';
-            return ListTile(
-              leading: ProfileAvatar(uid: data['authorId']?.toString() ?? ''),
-              title: GestureDetector(
-                onTap: () => openProfile(context, data['authorId']?.toString() ?? ''),
-                child: Text(author, style: const TextStyle(fontSize: 13,
-                  fontWeight: FontWeight.bold))),
-              subtitle: Text(data['text']?.toString() ?? '',
-                style: const TextStyle(fontSize: 15, color: Colors.white)),
+            final doc = docs[i];
+            final data = doc.data();
+            final authorId = data['authorId']?.toString() ?? '';
+            return InkWell(
+              onLongPress: () => messageOptions(doc),
+              child: Padding(padding: const EdgeInsets.symmetric(vertical: 4), child: Row(
+                crossAxisAlignment: CrossAxisAlignment.start, children: [
+                  ProfileAvatar(uid: authorId),
+                  const SizedBox(width: 10),
+                  Expanded(child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+                    InkWell(onTap: () => openProfile(context, authorId), child: Text(
+                      data['author']?.toString() ?? 'Usuário',
+                      style: const TextStyle(fontSize: 13, fontWeight: FontWeight.bold, color: purple))),
+                    if (data['replyToId'] != null)
+                      Container(margin: const EdgeInsets.only(top: 4, bottom: 4),
+                        padding: const EdgeInsets.all(7),
+                        decoration: const BoxDecoration(border: Border(
+                          left: BorderSide(color: purple, width: 3))),
+                        child: Text('${data['replyAuthor'] ?? 'Usuário'}: ${data['replyText'] ?? ''}',
+                          maxLines: 2, overflow: TextOverflow.ellipsis,
+                          style: const TextStyle(fontSize: 12, color: Colors.white70))),
+                    Text(data['text']?.toString() ?? '',
+                      style: const TextStyle(fontSize: 15, color: Colors.white)),
+                    if (data['editedAt'] != null)
+                      const Text('(editada)', style: TextStyle(fontSize: 11, color: Colors.white54)),
+                  ])),
+                ])),
+              ),
             );
           });
       },
     )),
+    if (replyingId != null) Padding(padding: const EdgeInsets.symmetric(horizontal: 12),
+      child: Row(children: [
+        const Icon(Icons.reply, color: purple), const SizedBox(width: 8),
+        Expanded(child: Text('Respondendo a $replyingAuthor: $replyingText',
+          maxLines: 1, overflow: TextOverflow.ellipsis)),
+        IconButton(onPressed: () => setState(() {
+          replyingId = null; replyingText = null; replyingAuthor = null;
+        }), icon: const Icon(Icons.close)),
+      ])),
     SafeArea(top: false, child: Padding(padding: const EdgeInsets.all(8), child: Row(children: [
       Expanded(child: TextField(controller: input, minLines: 1, maxLines: 4, maxLength: 2000,
         decoration: const InputDecoration(hintText: 'Mensagem', counterText: ''),
@@ -777,6 +987,14 @@ class ProfilePage extends StatelessWidget {
         Text(name, style: Theme.of(context).textTheme.headlineSmall),
         Text('@$username'),
         if (pronouns.isNotEmpty) Text(pronouns),
+        if (!own) ...[
+          const SizedBox(height: 16),
+          FilledButton.icon(onPressed: () async {
+            final navContext = Navigator.of(context).context;
+            if (expanded) Navigator.of(context).pop();
+            await openDm(navContext, uid);
+          }, icon: const Icon(Icons.message_outlined), label: const Text('Enviar mensagem')),
+        ],
         if (own) ...[
           const SizedBox(height: 18),
           Wrap(children: [ChangeImage('profile', uid, 'avatar', 'Trocar foto'),
