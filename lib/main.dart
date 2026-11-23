@@ -156,7 +156,7 @@ class MeowApp extends StatelessWidget {
 }
 );
     @override Widget build(BuildContext context) => MaterialApp(debugShowCheckedModeBanner:false, title:'Meow',
-      theme: ThemeData.dark(useMaterial3:true).copyWith(scaffoldBackgroundColor:bg, colorScheme:ColorScheme.fromSeed(seedColor:purple,
+      theme: ThemeData.dark(useMaterial3:true).copyWith(pageTransitionsTheme:const PageTransitionsTheme(builders:{TargetPlatform.android:FadeUpwardsPageTransitionsBuilder(),TargetPlatform.iOS:CupertinoPageTransitionsBuilder()}),scaffoldBackgroundColor:bg, colorScheme:ColorScheme.fromSeed(seedColor:purple,
     brightness:Brightness.dark
 ), appBarTheme:const AppBarTheme(backgroundColor:panel), inputDecorationTheme:InputDecorationTheme(filled:true,
     fillColor:panel, border:OutlineInputBorder(borderRadius:BorderRadius.circular(14))
@@ -508,10 +508,10 @@ class ProfilePage extends StatelessWidget {
     final username=d['username']?.toString()??'meow';
     final own=uid==FirebaseAuth.instance.currentUser?.uid;
     final p=d['presence']?.toString()??'offline';
-      return ListView(controller:scrollController, children:[Stack(clipBehavior:Clip.none, children:[ProfileBanner(uid:uid,data:d), Positioned(left:18, bottom:-44, child:Container(padding:const EdgeInsets.all(4), decoration:const BoxDecoration(color:panel,
+      return Container(decoration:d['bannerHidden']==true?BoxDecoration(gradient:profileGradient(d)):null,child:ListView(controller:scrollController, children:[Stack(clipBehavior:Clip.none, children:[ProfileBanner(uid:uid,data:d), Positioned(left:18, bottom:-44, child:Container(padding:const EdgeInsets.all(4), decoration:BoxDecoration(color:d['bannerHidden']==true?Colors.transparent:panel,
     shape:BoxShape.circle
 ), child:PrivateImage(scope:'profile', id:uid, slot:'avatar', size:88)))]), const SizedBox(height:55),
-        Container(decoration:BoxDecoration(gradient:profileGradient(d)),padding:const EdgeInsets.all(18), child:Column(crossAxisAlignment:CrossAxisAlignment.start,
+        Container(decoration:d['bannerHidden']==true?null:BoxDecoration(gradient:profileGradient(d)),padding:const EdgeInsets.all(18), child:Column(crossAxisAlignment:CrossAxisAlignment.start,
           children:[Text(d['displayName']?.toString()??username, style:const TextStyle(fontSize:24, fontWeight:FontWeight.bold)),
           Text('@$username', style:const TextStyle(color:Colors.white60)), if((d['pronouns']?.toString()??'').isNotEmpty)Text(d['pronouns'].toString(),style:const TextStyle(color:Colors.white70)), const SizedBox(height:12), RelationshipCounters(uid:uid), if(!own)FollowButton(target:uid), 
             const SizedBox(height:8), Row(children:[Icon(Icons.circle, size:12, color:presenceColor(own?p:(p=='invisible'?'offline':p))),
@@ -533,7 +533,7 @@ class ProfilePage extends StatelessWidget {
 , icon:const Icon(Icons.message), label:const Text('Enviar mensagem'))), if(own&&!expanded)TextButton.icon(onPressed:()=>Navigator.push(c,MaterialPageRoute(builder:(_)=>const AppSettingsPage())),icon:const Icon(Icons.settings),label:const Text('Configurações do aplicativo')), 
 ]
 ))
-]);
+]));
 }
 );
 }
@@ -997,7 +997,7 @@ class _SocialHomeState extends State<SocialHome> with WidgetsBindingObserver {
           if(v>250&&!showingChannels)setState(()=>showingChannels=true);
           if(v< -250&&showingChannels&&active!=null)setState(()=>showingChannels=false);
 }
-, child:AnimatedSwitcher(duration:const Duration(milliseconds:190), child:showingChannels?Row(key:const ValueKey('list'),
+, child:AnimatedSwitcher(duration:const Duration(milliseconds:240),switchInCurve:Curves.easeOutCubic,switchOutCurve:Curves.easeInCubic,transitionBuilder:(child,animation)=>FadeTransition(opacity:animation,child:child), child:showingChannels?Row(key:const ValueKey('list'),
             children:[rail(), Expanded(child:ColoredBox(color:panel, child:Column(children:[ServerHeader(id:serverId!),
               Row(children:[const Expanded(child:Padding(padding:EdgeInsets.all(12), child:Text('Canais', style:TextStyle(fontSize:18)))),
                 IconButton(onPressed:createChannel, icon:const Icon(Icons.add)), IconButton(onPressed:createInvite,
@@ -1021,10 +1021,10 @@ class _SocialHomeState extends State<SocialHome> with WidgetsBindingObserver {
           setState(() => showingChannels = true);
         }
       },
-      child:Scaffold(appBar:AppBar(title:const MeowTitle()), body:Column(children:[Expanded(child:AnimatedSwitcher(duration:const Duration(milliseconds:190),
-      transitionBuilder:(child, a)=>FadeTransition(opacity:a, child:SlideTransition(position:Tween<Offset>(begin:const Offset(.04,
+      child:Scaffold(appBar:AppBar(title:const MeowTitle()), body:Column(children:[Expanded(child:AnimatedSwitcher(duration:const Duration(milliseconds:240),switchInCurve:Curves.easeOutCubic,switchOutCurve:Curves.easeInCubic,
+      transitionBuilder:(child, a)=>FadeTransition(opacity:a, child:SlideTransition(position:Tween<Offset>(begin:const Offset(.015,
     0
-), end:Offset.zero).animate(a), child:child)), child:KeyedSubtree(key:ValueKey(tab), child:switch(tab){
+), end:Offset.zero).animate(CurvedAnimation(parent:a,curve:Curves.easeOutCubic)), child:child)), child:KeyedSubtree(key:ValueKey(tab), child:switch(tab){
       1=>FriendsPage(uid:myUid),
       2=>DmListPage(uid:myUid),
       3=>ProfilePage(uid:myUid),
@@ -1575,7 +1575,7 @@ class ProfileBanner extends StatelessWidget{
  final String uid;final Map<String,dynamic> data;
  const ProfileBanner({super.key,required this.uid,required this.data});
  @override Widget build(BuildContext context)=>data['bannerHidden']==true
- ?Container(height:180,decoration:BoxDecoration(gradient:profileGradient(data)))
+ ?const SizedBox(height:180)
  :PrivateImage(scope:'profile',id:uid,slot:'banner',size:180,borderRadius:BorderRadius.zero);
 }
 class ProfileThemeEditor extends StatefulWidget{
@@ -1596,17 +1596,86 @@ class _ProfileThemeEditorState extends State<ProfileThemeEditor>{
   ]);
  });
 }
-extension MeowColorEditor on _ProfileThemeEditorState{
- Future<void> pick(int index)async{
-  Color chosen=index==0?first:second;
-  final hex=TextEditingController(text:meowHex(chosen));
-  final result=await showDialog<Color>(context:context,builder:(dialog)=>StatefulBuilder(builder:(dialog,setDialog)=>AlertDialog(title:Text(index==0?'Cor principal':'Segunda cor'),content:SizedBox(width:320,child:SingleChildScrollView(child:Column(mainAxisSize:MainAxisSize.min,children:[
-   Container(height:40,color:chosen),const SizedBox(height:10),
-   for(final item in <(String,int)>[('Vermelho',0),('Verde',1),('Azul',2)])Row(children:[SizedBox(width:75,child:Text(item.$1)),Expanded(child:Slider(min:0,max:255,value:[chosen.red,chosen.green,chosen.blue][item.$2].toDouble(),onChanged:(v){final rgb=[chosen.red,chosen.green,chosen.blue];rgb[item.$2]=v.round();setDialog(()=>chosen=Color.fromARGB(255,rgb[0],rgb[1],rgb[2]));hex.text=meowHex(chosen);}))]),
-   TextField(controller:hex,decoration:const InputDecoration(labelText:'Cor hexadecimal (ARGB ou RGB)'),onChanged:(v){setDialog(()=>chosen=meowColor(v,chosen));}),
-  ]))),actions:[TextButton(onPressed:()=>Navigator.pop(dialog),child:const Text('Cancelar')),FilledButton(onPressed:()=>Navigator.pop(dialog,chosen),child:const Text('Aplicar'))])));
-  hex.dispose();if(result!=null&&mounted)setState((){if(index==0)first=result;else second=result;});
+extension MeowColorEditor on _ProfileThemeEditorState {
+ Future<void> pick(int index) async {
+  final original=index==0?first:second;
+  final result=await showDialog<Color>(context:context,builder:(c)=>MeowColorWheelDialog(initial:original));
+  if(result!=null&&mounted)setState((){if(index==0)first=result;else second=result;});
  }
+}
+
+class MeowColorWheelDialog extends StatefulWidget {
+ final Color initial;
+ const MeowColorWheelDialog({super.key,required this.initial});
+ @override State<MeowColorWheelDialog> createState()=>_MeowColorWheelDialogState();
+}
+class _MeowColorWheelDialogState extends State<MeowColorWheelDialog> {
+ late HSVColor hsv;
+ late TextEditingController hex;
+ @override void initState(){
+  super.initState();
+  hsv=HSVColor.fromColor(widget.initial);
+  hex=TextEditingController(text:meowHex(widget.initial));
+ }
+ @override void dispose(){hex.dispose();super.dispose();}
+ void setHsv(HSVColor value){
+  setState(()=>hsv=value);
+  hex.value=TextEditingValue(text:meowHex(hsv.toColor()));
+ }
+ @override Widget build(BuildContext context)=>AlertDialog(
+  title:const Text('Escolher cor'),
+  content:SizedBox(width:300,child:SingleChildScrollView(child:Column(mainAxisSize:MainAxisSize.min,children:[
+   SizedBox(width:250,height:250,child:LayoutBuilder(builder:(c,box)=>GestureDetector(
+    behavior:HitTestBehavior.opaque,
+    onPanDown:(d)=>selectPoint(d.localPosition,box.biggest),
+    onPanUpdate:(d)=>selectPoint(d.localPosition,box.biggest),
+    child:CustomPaint(painter:MeowWheelPainter(hsv:hsv),size:box.biggest),
+   ))),
+   const SizedBox(height:12),
+   Row(children:[const Text('Brilho'),Expanded(child:Slider(value:hsv.value,min:0,max:1,onChanged:(v)=>setHsv(hsv.withValue(v))))]),
+   Container(height:36,decoration:BoxDecoration(color:hsv.toColor(),borderRadius:BorderRadius.circular(8))),
+   const SizedBox(height:12),
+   TextField(controller:hex,decoration:const InputDecoration(labelText:'Cor HEX (#RRGGBB)'),
+    onChanged:(v){if(RegExp(r'^#?[0-9a-fA-F]{6}$').hasMatch(v))setState(()=>hsv=HSVColor.fromColor(meowColor(v,hsv.toColor())));}),
+  ]))),
+  actions:[TextButton(onPressed:()=>Navigator.pop(context),child:const Text('Cancelar')),
+   FilledButton(onPressed:()=>Navigator.pop(context,hsv.toColor()),child:const Text('Aplicar'))],
+ );
+ void selectPoint(Offset point,Size size){
+  final center=Offset(size.width/2,size.height/2);
+  final dx=point.dx-center.dx,dy=point.dy-center.dy;
+  final radius=min(size.width,size.height)/2;
+  final saturation=(sqrt(dx*dx+dy*dy)/radius).clamp(0.0,1.0);
+  final angle=(atan2(dy,dx)*180/pi+360)%360;
+  setHsv(HSVColor.fromAHSV(1,angle,saturation,hsv.value));
+ }
+}
+class MeowWheelPainter extends CustomPainter {
+ final HSVColor hsv;
+ const MeowWheelPainter({required this.hsv});
+ @override void paint(Canvas canvas,Size size){
+  final center=Offset(size.width/2,size.height/2);
+  final radius=min(size.width,size.height)/2;
+  final paint=Paint()..style=PaintingStyle.fill;
+  // 72 hue slices; each uses radial saturation gradient.
+  for(var i=0;i<72;i++){
+   final a=i*2*pi/72, b=(i+1)*2*pi/72;
+   final hue=i*5.0;
+   final path=Path()..moveTo(center.dx,center.dy)
+    ..arcTo(Rect.fromCircle(center:center,radius:radius),a,b-a+0.003,false)..close();
+   paint.shader=RadialGradient(colors:[
+    HSVColor.fromAHSV(1,hue,0,1).toColor(),
+    HSVColor.fromAHSV(1,hue,1,1).toColor(),
+   ]).createShader(Rect.fromCircle(center:center,radius:radius));
+   canvas.drawPath(path,paint);
+  }
+  paint.shader=null;
+  final angle=hsv.hue*pi/180;
+  final marker=center+Offset(cos(angle),sin(angle))*radius*hsv.saturation;
+  canvas.drawCircle(marker,8,Paint()..color=Colors.black..style=PaintingStyle.stroke..strokeWidth=3);
+  canvas.drawCircle(marker,7,Paint()..color=Colors.white..style=PaintingStyle.stroke..strokeWidth=2);
+ }
+ @override bool shouldRepaint(covariant MeowWheelPainter old)=>old.hsv!=hsv;
 }
 
 // Leituras por conversa e indicadores independentes de solicitações.
