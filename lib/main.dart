@@ -373,8 +373,10 @@ class ProfilePage extends StatelessWidget {
             icon:const Icon(Icons.edit), label:const Text('Editar perfil e status')
 )
 ), if(!own)SizedBox(width:double.infinity, child:FilledButton.icon(onPressed:()async{
-            if(expanded)Navigator.pop(c);
-            await openDm(context, uid);
+            final navigator = Navigator.of(c);
+            final safeContext = navigator.context;
+            if (expanded) navigator.pop();
+            await openDm(safeContext, uid);
 }
 , icon:const Icon(Icons.message), label:const Text('Enviar mensagem'))), if(own&&!expanded)TextButton.icon(onPressed:()=>FirebaseAuth.instance.signOut(),
           icon:const Icon(Icons.logout), label:const Text('Sair da conta')
@@ -847,7 +849,7 @@ class DmListPage extends StatelessWidget {
 )))
 ));
 }
-))]);
+)]);
 }
 ))]);
 }
