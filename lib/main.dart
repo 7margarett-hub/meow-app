@@ -163,23 +163,17 @@ class MeowApp extends StatelessWidget {
 );
 }
 
-class LoadingCat extends StatefulWidget {
-  const LoadingCat({
-    super.key
-}
-);
-  @override State<LoadingCat> createState()=>_LoadingCatState();
-}
-
-class _LoadingCatState extends State<LoadingCat> with SingleTickerProviderStateMixin {
-  late final AnimationController spin = AnimationController(vsync:this, duration:const Duration(milliseconds:1600))..repeat();
-  @override void dispose(){
-    spin.dispose();
-    super.dispose();
-}
-    @override Widget build(BuildContext c)=>Scaffold(backgroundColor:Colors.black, body:Center(child:RotationTransition(turns:spin,
-  child:const Icon(Icons.pets, color:Colors.white, size:100)
-)));
+class LoadingCat extends StatelessWidget {
+  const LoadingCat({super.key});
+  @override Widget build(BuildContext context) => const Scaffold(
+    backgroundColor: Colors.black,
+    body: Center(child: Column(mainAxisSize: MainAxisSize.min, children: [
+      Image(image: AssetImage('assets/meow_foreground.png'), width: 180, height: 180),
+      SizedBox(height: 20),
+      Text('você é um testador Beta!', textAlign: TextAlign.center,
+        style: TextStyle(color: Colors.white, fontSize: 16)),
+    ])),
+  );
 }
 
 class LoginPage extends StatefulWidget {
@@ -420,6 +414,77 @@ void openProfile(BuildContext context, String uid){
 );
 }
 
+
+Future<void> toggleFollow(String target, bool following) async {
+  final mine = db.collection('users').doc(myUid).collection('following').doc(target);
+  final theirs = db.collection('users').doc(target).collection('followers').doc(myUid);
+  final batch = db.batch();
+  if (following) { batch.delete(mine); batch.delete(theirs); }
+  else { batch.set(mine, {'createdAt': FieldValue.serverTimestamp()}); batch.set(theirs, {'createdAt': FieldValue.serverTimestamp()}); }
+  await batch.commit();
+}
+
+class RelationshipListPage extends StatelessWidget {
+  final String uid, kind;
+  const RelationshipListPage({super.key, required this.uid, required this.kind});
+  @override Widget build(BuildContext context) => Scaffold(
+    appBar: AppBar(title: Text(kind=='followers'?'Seguidores':kind=='following'?'Seguindo':'Amigos')),
+    body: StreamBuilder<QuerySnapshot<Map<String,dynamic>>>(
+      stream: db.collection('users').doc(uid).collection(kind=='friends'?'following':kind).snapshots(),
+      builder: (context,s) {
+        if(s.hasError)return Center(child:Text('Erro: ${s.error}'));
+        if(!s.hasData)return const Center(child:CircularProgressIndicator());
+        final docs=s.data!.docs;
+        if(kind!='friends')return ListView(children:[for(final d in docs) ListTile(
+          leading: ProfileAvatar(uid:d.id), title: UserDisplayName(uid:d.id),
+          onTap:()=>openProfile(context,d.id))]);
+        return ListView(children:[for(final d in docs) StreamBuilder<DocumentSnapshot<Map<String,dynamic>>>(
+          stream:db.collection('users').doc(d.id).collection('following').doc(uid).snapshots(),
+          builder:(context,other)=>other.data?.exists==true?ListTile(
+            leading:ProfileAvatar(uid:d.id),title:UserDisplayName(uid:d.id),
+            onTap:()=>openProfile(context,d.id)):const SizedBox.shrink())]);
+      }));
+}
+class UserDisplayName extends StatelessWidget {
+  final String uid;
+  const UserDisplayName({super.key,required this.uid});
+  @override Widget build(BuildContext context)=>StreamBuilder<DocumentSnapshot<Map<String,dynamic>>>(
+    stream:db.collection('users').doc(uid).snapshots(),
+    builder:(context,s){final d=s.data?.data()??{};final name=d['displayName']?.toString()??'';return Text(name.isNotEmpty?name:d['username']?.toString()??'Usuário');});
+}
+class FollowButton extends StatelessWidget {
+  final String target;
+  const FollowButton({super.key,required this.target});
+  @override Widget build(BuildContext context)=>StreamBuilder<DocumentSnapshot<Map<String,dynamic>>>(
+    stream:db.collection('users').doc(myUid).collection('following').doc(target).snapshots(),
+    builder:(context,s)=>FilledButton.icon(
+      onPressed:()=>toggleFollow(target,s.data?.exists==true).catchError((Object e){if(context.mounted)notice(context,e);}),
+      icon:Icon(s.data?.exists==true?Icons.person_remove:Icons.person_add),
+      label:Text(s.data?.exists==true?'Deixar de seguir':'Seguir')));
+}
+class RelationshipCounters extends StatelessWidget {
+  final String uid;
+  const RelationshipCounters({super.key,required this.uid});
+  @override Widget build(BuildContext context)=>Row(children:[
+    for(final kind in ['followers','following','friends']) Expanded(child:StreamBuilder<QuerySnapshot<Map<String,dynamic>>>(
+      stream:db.collection('users').doc(uid).collection(kind=='friends'?'following':kind).snapshots(),
+      builder:(context,s){
+        if(kind=='friends')return FutureBuilder<int>(future: _mutualCount(uid,s.data?.docs??[]),builder:(context,c)=>_counter(context,kind,c.data??0));
+        return _counter(context,kind,s.data?.docs.length??0);
+      }))]);
+  Widget _counter(BuildContext c,String kind,int count)=>TextButton(
+    onPressed:()=>Navigator.push(c,MaterialPageRoute(builder:(_)=>RelationshipListPage(uid:uid,kind:kind))),
+    child:Column(children:[Text('$count',style:const TextStyle(fontWeight:FontWeight.bold)),
+      Text(kind=='followers'?'Seguidores':kind=='following'?'Seguindo':'Amigos',style:const TextStyle(fontSize:11))]));
+  Future<int> _mutualCount(String uid,List<QueryDocumentSnapshot<Map<String,dynamic>>> docs)async{
+    var count=0;
+    for(final d in docs){
+      if((await db.collection('users').doc(d.id).collection('following').doc(uid).get()).exists)count++;
+    }
+    return count;
+  }
+}
+
 class ProfilePage extends StatelessWidget {
   final String uid;
   final bool expanded;
@@ -448,7 +513,7 @@ class ProfilePage extends StatelessWidget {
 ), child:PrivateImage(scope:'profile', id:uid, slot:'avatar', size:88)))]), const SizedBox(height:55),
         Padding(padding:const EdgeInsets.all(18), child:Column(crossAxisAlignment:CrossAxisAlignment.start,
           children:[Text(d['displayName']?.toString()??username, style:const TextStyle(fontSize:24, fontWeight:FontWeight.bold)),
-          Text('@$username', style:const TextStyle(color:Colors.white60)), if((d['pronouns']?.toString()??'').isNotEmpty)Text(d['pronouns'].toString()),
+          Text('@$username', style:const TextStyle(color:Colors.white60)), const SizedBox(height:12), RelationshipCounters(uid:uid), if(!own)FollowButton(target:uid), if((d['pronouns']?.toString()??'').isNotEmpty)Text(d['pronouns'].toString()),
             const SizedBox(height:8), Row(children:[Icon(Icons.circle, size:12, color:presenceColor(own?p:(p=='invisible'?'offline':p))),
           const SizedBox(width:6), Text(own?(presenceLabels[p]??'Offline'):(p=='invisible'?'Offline':(presenceLabels[p]??'Offline')))
 ]), if((d['customStatus']?.toString()??'').isNotEmpty)Padding(padding:const EdgeInsets.only(top:8),
@@ -465,7 +530,7 @@ class ProfilePage extends StatelessWidget {
             if (expanded) navigator.pop();
             await openDm(safeContext, uid);
 }
-, icon:const Icon(Icons.message), label:const Text('Enviar mensagem'))), if(own&&!expanded)TextButton.icon(onPressed:() { PrivateMediaCache.clear(); FirebaseAuth.instance.signOut(); },
+, icon:const Icon(Icons.message), label:const Text('Enviar mensagem'))), if(own&&!expanded)TextButton.icon(onPressed:()=>Navigator.push(c,MaterialPageRoute(builder:(_)=>const AppSettingsPage())),icon:const Icon(Icons.settings),label:const Text('Configurações do aplicativo')), if(own&&!expanded)TextButton.icon(onPressed:() { PrivateMediaCache.clear(); FirebaseAuth.instance.signOut(); },
           icon:const Icon(Icons.logout), label:const Text('Sair da conta')
 ),
 ]
@@ -473,6 +538,34 @@ class ProfilePage extends StatelessWidget {
 ]);
 }
 );
+}
+
+
+class AppSettingsPage extends StatelessWidget {
+  const AppSettingsPage({super.key});
+  @override Widget build(BuildContext c)=>Scaffold(appBar:AppBar(title:const Text('Configurações')),
+    body:ListView(children:[
+      ListTile(leading:const Icon(Icons.person),title:const Text('Conta'),onTap:()=>Navigator.push(c,MaterialPageRoute(builder:(_)=>Scaffold(appBar:AppBar(title:const Text('Conta')),body:ListView(children:[
+        ListTile(title:const Text('Editar perfil'),onTap:()=>Navigator.push(c,MaterialPageRoute(builder:(_)=>EditProfilePage(uid:myUid)))),
+        ListTile(title:const Text('Sair da conta'),onTap:(){PrivateMediaCache.clear();FirebaseAuth.instance.signOut();})]))))),
+      ListTile(leading:const Icon(Icons.notifications),title:const Text('Notificações'),onTap:()=>Navigator.push(c,MaterialPageRoute(builder:(_)=>const NotificationSettingsPage()))),
+      ListTile(leading:const Icon(Icons.storage),title:const Text('Armazenamento'),onTap:()=>Navigator.push(c,MaterialPageRoute(builder:(_)=>Scaffold(appBar:AppBar(title:const Text('Armazenamento')),body:ListTile(title:const Text('Limpar cache de imagens'),onTap:(){PrivateMediaCache.clear();notice(c,'Cache limpo.');}))))),
+      ListTile(leading:const Icon(Icons.info),title:const Text('Sobre o Meow'),onTap:()=>Navigator.push(c,MaterialPageRoute(builder:(_)=>Scaffold(appBar:AppBar(title:const Text('Sobre o Meow')),body:const Center(child:Text('Meow • Beta')))))),
+    ]));
+}
+class NotificationSettingsPage extends StatefulWidget {
+  const NotificationSettingsPage({super.key});
+  @override State<NotificationSettingsPage> createState()=>_NotificationSettingsPageState();
+}
+class _NotificationSettingsPageState extends State<NotificationSettingsPage> {
+  bool enabled=true;
+  @override Widget build(BuildContext c)=>Scaffold(appBar:AppBar(title:const Text('Notificações')),
+    body:SwitchListTile(title:const Text('Notificações neste dispositivo'),value:enabled,onChanged:(v)async{
+      try{if(v){await FirebaseMessaging.instance.requestPermission();final t=await FirebaseMessaging.instance.getToken();if(t!=null)await db.collection('users').doc(myUid).collection('devices').doc(t).set({'token':t,'updatedAt':FieldValue.serverTimestamp()});}
+      else {final t=await FirebaseMessaging.instance.getToken();if(t!=null)await db.collection('users').doc(myUid).collection('devices').doc(t).delete();}
+      if(mounted)setState(()=>enabled=v);
+      }catch(e){if(mounted)notice(context,e);}
+    }));
 }
 
 class EditProfilePage extends StatefulWidget {
@@ -501,6 +594,7 @@ class _EditProfilePageState extends State<EditProfilePage> {
     super.dispose();
 }
   Future<void> save()async{
+    if(name.text.trim().length>15){notice(context, 'Máximo de 15 caracteres no nome.');return;}
     setState(()=>busy=true);
     try{
       await db.collection('users').doc(widget.uid).update({
@@ -544,7 +638,7 @@ class _EditProfilePageState extends State<EditProfilePage> {
 )), Positioned(left:18, bottom:-45, child:Stack(alignment:Alignment.bottomRight, children:[PrivateImage(scope:'profile',
         id:widget.uid, slot:'avatar', size:90
 ), ChangeImage('profile', widget.uid, 'avatar', 'Trocar foto', iconOnly:true)]))]), const SizedBox(height:64),
-            Padding(padding:const EdgeInsets.all(18), child:Column(children:[TextField(controller:name, maxLength:40,
+            Padding(padding:const EdgeInsets.all(18), child:Column(children:[TextField(controller:name, maxLength:15,
           decoration:const InputDecoration(labelText:'Nome de exibição')
 ), const SizedBox(height:10), TextField(controller:pronouns, maxLength:40, decoration:const InputDecoration(labelText:'Pronomes')),
             const SizedBox(height:10), TextField(controller:bio, maxLength:300, maxLines:4, decoration:const InputDecoration(labelText:'Biografia')),
@@ -576,9 +670,9 @@ class ServerHeader extends StatelessWidget {
     final d=s.data?.data()??{
 }
 ;
-      return Column(children:[PrivateImage(scope:'server', id:id, slot:'banner', size:160, borderRadius:BorderRadius.zero),
+      return Column(children:[Stack(children:[PrivateImage(scope:'server', id:id, slot:'banner', size:160, borderRadius:BorderRadius.zero), if(d['ownerId']==myUid)Positioned(right:8,top:8,child:IconButton.filledTonal(icon:const Icon(Icons.more_vert),onPressed:()=>Navigator.push(c,MaterialPageRoute(builder:(_)=>ServerSettingsPage(id:id)))))]),
         ListTile(leading:PrivateImage(scope:'server', id:id, slot:'avatar', size:42), title:Text(d['name']?.toString()??'Servidor'),
-          subtitle:Text('${(d['members'] as List?)?.length??0} membros'), trailing:d['ownerId']==myUid?IconButton(icon:const Icon(Icons.settings),
+          subtitle:Text('${(d['members'] as List?)?.length??0} membros'), trailing:d['ownerId']==myUid?IconButton(icon:const Icon(Icons.more_vert),
         onPressed:()=>Navigator.push(c, MaterialPageRoute(builder:(_)=>ServerSettingsPage(id:id)))
 ):null
 ), const Divider(height:1)
@@ -605,7 +699,7 @@ class ServerSettingsPage extends StatelessWidget {
           return ListView(children:[PrivateImage(scope:'server', id:id, slot:'banner', size:160), const SizedBox(height:16),
             Center(child:PrivateImage(scope:'server', id:id, slot:'avatar', size:88)), Padding(padding:const EdgeInsets.all(18),
               child:Column(children:[Text(d['name']?.toString()??'Servidor', style:const TextStyle(fontSize:22)),
-                const SizedBox(height:18), ChangeImage('server', id, 'avatar', 'Trocar ícone (8 MiB)'), ChangeImage('server',
+                const SizedBox(height:18), OutlinedButton.icon(icon:const Icon(Icons.edit),label:const Text('Renomear servidor'),onPressed:()async{final v=await showTextPrompt(c,'Nome do servidor',d['name']?.toString()??'');if(v!=null&&v.isNotEmpty)await db.collection('servers').doc(id).update({'name':v});}), const SizedBox(height:12), ListTile(title:const Text('Organizar categorias e canais'),trailing:const Icon(Icons.chevron_right),onTap:()=>Navigator.push(c,MaterialPageRoute(builder:(_)=>ServerOrganizationPage(id:id)))), ChangeImage('server', id, 'avatar', 'Trocar ícone (8 MiB)'), ChangeImage('server',
               id, 'banner', 'Trocar banner (15 MiB)'
 )
 ])
@@ -614,6 +708,52 @@ class ServerSettingsPage extends StatelessWidget {
 }
 )
 );
+}
+
+
+Future<String?> showTextPrompt(BuildContext c,String title,String initial) async {
+  String value=initial;
+  return showDialog<String>(context:c,builder:(dialog)=>AlertDialog(title:Text(title),
+    content:TextFormField(initialValue:initial,maxLength:40,onChanged:(v)=>value=v),
+    actions:[TextButton(onPressed:()=>Navigator.pop(dialog),child:const Text('Cancelar')),
+      FilledButton(onPressed:()=>Navigator.pop(dialog,value.trim()),child:const Text('Salvar'))]));
+}
+class ServerOrganizationPage extends StatelessWidget {
+  final String id;
+  const ServerOrganizationPage({super.key,required this.id});
+  @override Widget build(BuildContext c)=>Scaffold(appBar:AppBar(title:const Text('Categorias e canais')),
+    body:StreamBuilder<QuerySnapshot<Map<String,dynamic>>>(stream:db.collection('servers').doc(id).collection('channels').snapshots(),
+      builder:(c,s){
+        if(!s.hasData)return const Center(child:CircularProgressIndicator());
+        final docs=[...s.data!.docs];
+        docs.sort((a,b)=>((a.data()['order'] as num?)?.toInt()??0).compareTo((b.data()['order'] as num?)?.toInt()??0));
+        final cats=<String>[];
+        for(final d in docs){final cat=d.data()['category']?.toString()??'GERAL';if(!cats.contains(cat))cats.add(cat);}
+        return ListView(children:[for(final cat in cats)...[
+          ListTile(title:Text(cat),trailing:IconButton(icon:const Icon(Icons.edit),onPressed:()async{
+            final v=await showTextPrompt(c,'Renomear categoria',cat);
+            if(v==null||v.isEmpty||v==cat)return;
+            final batch=db.batch();
+            for(final d in docs.where((d)=>(d.data()['category']??'GERAL')==cat))batch.update(d.reference,{'category':v});
+            await batch.commit();
+          })),
+          for(final d in docs.where((d)=>(d.data()['category']??'GERAL')==cat))ListTile(
+            leading:const Icon(Icons.tag),title:Text(d.data()['name']?.toString()??'canal'),
+            trailing:PopupMenuButton<String>(onSelected:(action)async{
+              if(action=='rename'){final v=await showTextPrompt(c,'Renomear canal',d.data()['name']?.toString()??'');if(v!=null&&v.isNotEmpty)await d.reference.update({'name':v});}
+              if(action=='move'){final v=await showTextPrompt(c,'Mover para categoria',cat);if(v!=null&&v.isNotEmpty)await d.reference.update({'category':v});}
+              if(action=='up'||action=='down'){
+                final group=docs.where((x)=>(x.data()['category']??'GERAL')==cat).toList();
+                final idx=group.indexWhere((x)=>x.id==d.id);final other=idx+(action=='up'?-1:1);
+                if(other<0||other>=group.length)return;
+                final batch=db.batch();
+                for(var i=0;i<group.length;i++){final item=group[i==idx?other:i==other?idx:i];batch.update(item.reference,{'order':i+1});}
+                await batch.commit();
+              }
+            },itemBuilder:(_)=>const [PopupMenuItem(value:'rename',child:Text('Renomear')),PopupMenuItem(value:'move',child:Text('Mover de categoria')),PopupMenuItem(value:'up',child:Text('Subir')),PopupMenuItem(value:'down',child:Text('Descer'))]),
+          ),
+        ]]);
+      }));
 }
 
 class SocialHome extends StatefulWidget {
@@ -831,17 +971,18 @@ class _SocialHomeState extends State<SocialHome> with WidgetsBindingObserver {
     dynamic>>>>{
 }
 ;
-    for(final d in docs){
+    final ordered=[...docs]..sort((a,b)=>((a.data()['order'] as num?)?.toInt()??0).compareTo((b.data()['order'] as num?)?.toInt()??0));
+    for(final d in ordered){
       final cat=(d.data()['category']?.toString()??'GERAL').toUpperCase();
       groups.putIfAbsent(cat, ()=>[]).add(d);
 }
       return ListView(children:[for(final g in groups.entries)...[ListTile(dense:true, title:Text(g.key,
     style:const TextStyle(fontSize:12, color:Colors.white70)
-), leading:Icon(collapsed.contains(g.key)?Icons.chevron_right:Icons.expand_more), onTap:()=>setState((){
+), leading:Icon(collapsed.contains(g.key)?Icons.chevron_right:Icons.expand_more), onLongPress:()async{final v=await showTextPrompt(context,'Renomear categoria',g.key);if(v==null||v.isEmpty)return;final batch=db.batch();for(final d in g.value)batch.update(d.reference,{'category':v});await batch.commit();}, onTap:()=>setState((){
       if(!collapsed.add(g.key))collapsed.remove(g.key);
 }
 ),), if(!collapsed.contains(g.key))for(final d in g.value)ListTile(leading:const Icon(Icons.tag),
-      title:Text(d.data()['name']?.toString()??'canal'), onTap:()=>setState((){
+      title:Text(d.data()['name']?.toString()??'canal'), onLongPress:()async{final v=await showTextPrompt(context,'Renomear canal',d.data()['name']?.toString()??'');if(v!=null&&v.isNotEmpty)await d.reference.update({'name':v});}, onTap:()=>setState((){
         channelId=d.id;
         channelName=d.data()['name']?.toString()??'canal';
         showingChannels=false;
@@ -1334,48 +1475,20 @@ class _AttachmentViewState extends State<AttachmentView>{
 }
 }
 
-class FriendsPage extends StatefulWidget {
+class FriendsPage extends StatelessWidget {
   final String uid;
-  const FriendsPage({
-    super.key,
-    required this.uid
-}
-);
-  @override State<FriendsPage> createState()=>_FriendsPageState();
-}
-
-class _FriendsPageState extends State<FriendsPage>{
-  final username=TextEditingController();
-  @override void dispose(){
-    username.dispose();
-    super.dispose();
-}
-  Future<void> add()async{
-    final n=cleanName(username.text);
-    if(n.isEmpty)return;
-    try{
-      final found=await db.collection('users').where('username', isEqualTo:n).limit(1).get();
-      if(found.docs.isEmpty)throw Exception('Usuário não encontrado');
-      final other=found.docs.first.id;
-      if(other==widget.uid)throw Exception('Você não pode adicionar a si mesmo');
-      await db.collection('users').doc(widget.uid).collection('friends').doc(other).set({
-        'username':n,
-        'createdAt':FieldValue.serverTimestamp()
-}
-);
-      username.clear();
-      if(mounted)notice(context, 'Amigo adicionado!');
-}catch(e){
-      if(mounted)notice(context, e);
-}
-}
-    @override Widget build(BuildContext c)=>Padding(padding:const EdgeInsets.all(16), child:Column(children:[const Align(alignment:Alignment.centerLeft,
-  child:Text('Amigos', style:TextStyle(fontSize:24, fontWeight:FontWeight.bold))
-), const SizedBox(height:14), Row(children:[Expanded(child:TextField(controller:username, decoration:const InputDecoration(hintText:'Nome de usuário'))),
-  IconButton(onPressed:add, icon:const Icon(Icons.person_add, color:purple))
-]), Expanded(child:StreamBuilder<QuerySnapshot<Map<String, dynamic>>>(stream:db.collection('users').doc(widget.uid).collection('friends').snapshots(),
-      builder:(c, s)=>ListView(children:[for(final d in s.data?.docs??[])ListTile(leading:ProfileAvatar(uid:d.id),
-    title:Text(d.data()['username']?.toString()??'?'), onTap:()=>openProfile(c, d.id)
-)])
-))]));
+  const FriendsPage({super.key,required this.uid});
+  @override Widget build(BuildContext c)=>Scaffold(
+    body:Column(children:[const ListTile(title:Text('Amigos',style:TextStyle(fontSize:24,fontWeight:FontWeight.bold))),
+      Padding(padding:const EdgeInsets.symmetric(horizontal:16),child:TextField(
+        decoration:const InputDecoration(labelText:'Buscar usuário',prefixIcon:Icon(Icons.search)),
+        onSubmitted:(name)async{
+          final n=cleanName(name);
+          final found=await db.collection('users').where('username',isEqualTo:n).limit(1).get();
+          if(!c.mounted)return;
+          if(found.docs.isEmpty){notice(c,'Usuário não encontrado');return;}
+          openProfile(c,found.docs.first.id);
+        })),
+      Expanded(child:RelationshipListPage(uid:uid,kind:'friends')),
+    ]));
 }
