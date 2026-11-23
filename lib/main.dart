@@ -16,6 +16,53 @@ const avatarLimit = 8 * 1024 * 1024, bannerLimit = 15 * 1024 * 1024, attachmentL
 const imageHost = 'ffxsvctvcsldumxnkiob.supabase.co';
 final changedImage = ValueNotifier<Uri?>(null);
 final db = FirebaseFirestore.instance;
+// Cache privado em memoria por sessao. Nunca persiste imagens privadas no disco.
+// Compartilha requisicoes entre avatares repetidos e evita novos downloads ao navegar.
+class PrivateMediaCache {
+  static final Map<String, Future<Uint8List?>> _pending = {};
+  static final Map<String, Uint8List> _completed = {};
+  static const int maxEntries = 100;
+
+  static String _key(Uri url) =>
+      '${FirebaseAuth.instance.currentUser?.uid ?? ''}|$url';
+
+  static Future<Uint8List?> get(Uri url) {
+    final key = _key(url);
+    final cached = _completed[key];
+    if (cached != null) return Future.value(cached);
+    return _pending.putIfAbsent(key, () async {
+      try {
+        final response = await http.get(
+          url,
+          headers: await authHeaders(),
+        ).timeout(const Duration(seconds: 30));
+        if (response.statusCode != 200) return null;
+        final bytes = response.bodyBytes;
+        if (_completed.length >= maxEntries) {
+          _completed.remove(_completed.keys.first);
+        }
+        _completed[key] = bytes;
+        return bytes;
+      } catch (_) {
+        return null;
+      } finally {
+        _pending.remove(key);
+      }
+    });
+  }
+
+  static void invalidate(Uri url) {
+    final key = _key(url);
+    _completed.remove(key);
+    _pending.remove(key);
+  }
+
+  static void clear() {
+    _completed.clear();
+    _pending.clear();
+  }
+}
+
 String get myUid => FirebaseAuth.instance.currentUser!.uid;
 String cleanName(String s) => s.trim().toLowerCase();
 String loginEmail(String s) => '${cleanName(s)}@users.meow.invalid';
@@ -185,16 +232,12 @@ class PrivateImage extends StatefulWidget {
 
 class _PrivateImageState extends State<PrivateImage> {
   late Future<Uint8List?> future;
-  Future<Uint8List?> fetch() async {
-    try {
-      final r=await http.get(widget.url, headers:await authHeaders()).timeout(const Duration(seconds:30));
-      return r.statusCode==200?r.bodyBytes:null;
-}catch(_){
-      return null;
-}
-}
+  Future<Uint8List?> fetch() => PrivateMediaCache.get(widget.url);
   void refresh(){
-    if(changedImage.value==widget.url&&mounted)setState(()=>future=fetch());
+    if(changedImage.value==widget.url&&mounted){
+      PrivateMediaCache.invalidate(widget.url);
+      setState(()=>future=fetch());
+    }
 }
   @override void initState(){
     super.initState();
@@ -259,7 +302,18 @@ class _ChangeImageState extends State<ChangeImage> {
       if(f==null)return;
       final limit=widget.slot=='banner'?bannerLimit:avatarLimit;
       if(await f.length()>limit)throw Exception('Limite de ${limit~/1048576} MiB.');
-        final r=await http.put(mediaUrl(widget.scope, widget.id, widget.slot), headers:await authHeaders(),
+        // Preserva o tipo original do arquivo (inclusive GIF animado).
+      final extension = f.name.split('.').last.toLowerCase();
+      const imageMime = <String, String>{
+        'gif': 'image/gif',
+        'png': 'image/png',
+        'jpg': 'image/jpeg',
+        'jpeg': 'image/jpeg',
+        'webp': 'image/webp',
+      };
+      final headers = await authHeaders();
+      headers['Content-Type'] = imageMime[extension] ?? 'application/octet-stream';
+      final r=await http.put(mediaUrl(widget.scope, widget.id, widget.slot), headers:headers,
       body:await f.readAsBytes()
 ).timeout(const Duration(seconds:120));
       if(r.statusCode!=200)throw Exception('Upload falhou: ${r.statusCode} ${r.body}');
@@ -783,7 +837,14 @@ class _SocialHomeState extends State<SocialHome> with WidgetsBindingObserver {
 }
 );
 }
-    @override Widget build(BuildContext c)=>Scaffold(appBar:AppBar(title:const Text('🐱 Meow'), actions:[IconButton(onPressed:()=>FirebaseAuth.instance.signOut(),
+    @override Widget build(BuildContext c)=>PopScope(
+      canPop: !(tab == 0 && !showingChannels),
+      onPopInvokedWithResult: (didPop, result) {
+        if (!didPop && tab == 0 && !showingChannels) {
+          setState(() => showingChannels = true);
+        }
+      },
+      child:Scaffold(appBar:AppBar(title:const Text('🐱 Meow'), actions:[IconButton(onPressed:()=>FirebaseAuth.instance.signOut(),
   icon:const Icon(Icons.logout)
 )]), body:Column(children:[Expanded(child:AnimatedSwitcher(duration:const Duration(milliseconds:280),
       transitionBuilder:(child, a)=>FadeTransition(opacity:a, child:SlideTransition(position:Tween<Offset>(begin:const Offset(.04,
@@ -795,11 +856,11 @@ class _SocialHomeState extends State<SocialHome> with WidgetsBindingObserver {
       _=>serverContent()
 }
 )
-)), NavigationBar(height:70, selectedIndex:tab, onDestinationSelected:(i)=>setState(()=>tab=i), destinations:const [NavigationDestination(icon:Icon(Icons.tag),
+)), if (tab != 0 || showingChannels) NavigationBar(height:70, selectedIndex:tab, onDestinationSelected:(i)=>setState(()=>tab=i), destinations:const [NavigationDestination(icon:Icon(Icons.tag),
   label:'Canais'
 ), NavigationDestination(icon:Icon(Icons.people), label:'Amigos'), NavigationDestination(icon:Icon(Icons.chat_bubble_outline),
   label:'DMs'
-), NavigationDestination(icon:Icon(Icons.person), label:'Perfil')])]));
+), NavigationDestination(icon:Icon(Icons.person), label:'Perfil')])])));
 }
 String dmId(String a, String b){
   final ids=[a, b]..sort();
@@ -1198,14 +1259,9 @@ class AttachmentView extends StatefulWidget {
 
 class _AttachmentViewState extends State<AttachmentView>{
   Future<Uint8List?>? imageFuture;
-  Future<Uint8List?> fetch()async{
-    try{
-      final r=await http.get(attachmentUrl(widget.attachment['id'].toString()), headers:await authHeaders());
-      return r.statusCode==200?r.bodyBytes:null;
-}catch(_){
-      return null;
-}
-}
+  Future<Uint8List?> fetch() => PrivateMediaCache.get(
+    attachmentUrl(widget.attachment['id'].toString()),
+  );
   @override void initState(){
     super.initState();
     if((widget.attachment['contentType']?.toString()??'').startsWith('image/'))imageFuture=fetch();
