@@ -1041,24 +1041,42 @@ String dmId(String a, String b){
   final ids=[a, b]..sort();
   return '${ids[0]}_${ids[1]}';
 }
-Future<void> openDm(BuildContext context, String other)async{
-  final me=FirebaseAuth.instance.currentUser?.uid;
-  if(me==null||other==me||other.isEmpty)return;
-  final id=dmId(me, other);
-  try{
-    await db.collection('dms').doc(id).set({
-      'members':[me, other]
-}
-, SetOptions(merge:true));
-      final follows=await db.collection('users').doc(me).collection('following').doc(other).get();
-      final followed=await db.collection('users').doc(other).collection('following').doc(me).get();
-      if(!(follows.exists&&followed.exists)){final existing=await db.collection('dms').doc(id).collection('requests').doc(other).get();if(!existing.exists)await db.collection('dms').doc(id).collection('requests').doc(other).set({'from':me,'status':'pending','createdAt':FieldValue.serverTimestamp()});}
-      if(context.mounted)Navigator.push(context, MaterialPageRoute(builder:(_)=>DmChatPage(id:id, other:other,
-    uid:me
-)));
-}catch(e){
-    if(context.mounted)notice(context, e);
-}
+// A conversa so libera mensagens depois da amizade mutua ou do aceite.
+Future<void> openDm(BuildContext context, String other) async {
+  final me = FirebaseAuth.instance.currentUser?.uid;
+  if (me == null || other == me || other.isEmpty) return;
+  final id = dmId(me, other);
+  try {
+    final otherUser = await db.collection('users').doc(other).get();
+    if (!otherUser.exists) throw Exception('Usuario nao encontrado.');
+    final dm = db.collection('dms').doc(id);
+    final existingDm = await dm.get();
+    if (!existingDm.exists) await dm.set({'members': [me, other]});
+    final follows = await db.collection('users').doc(me).collection('following').doc(other).get();
+    final followed = await db.collection('users').doc(other).collection('following').doc(me).get();
+    if (!(follows.exists && followed.exists)) {
+      final requestRef = db.collection('dmRequests').doc(id);
+      final existing = await requestRef.get();
+      if (!existing.exists) {
+        await requestRef.set({
+          'from': me,
+          'to': other,
+          'status': 'pending',
+          'createdAt': FieldValue.serverTimestamp(),
+        });
+      } else if (existing.data()?['status'] == 'declined') {
+        if (context.mounted) notice(context, 'Esta solicitacao foi recusada.');
+        return;
+      }
+    }
+    if (context.mounted) {
+      Navigator.push(context, MaterialPageRoute(
+        builder: (_) => DmChatPage(id: id, other: other, uid: me),
+      ));
+    }
+  } catch (e) {
+    if (context.mounted) notice(context, 'Nao foi possivel abrir a DM: $e');
+  }
 }
 
 class DmListPage extends StatefulWidget {
@@ -1618,30 +1636,121 @@ class DmPreview extends StatelessWidget{
   return Text('${d['authorId']==uid?'Você: ':''}$t',maxLines:1,overflow:TextOverflow.ellipsis);
  });
 }
-class DmRequestsDot extends StatelessWidget{
- final String uid;const DmRequestsDot({super.key,required this.uid});
- @override Widget build(BuildContext c)=>StreamBuilder<QuerySnapshot<Map<String,dynamic>>>(stream:db.collectionGroup('requests').where('status',isEqualTo:'pending').snapshots(),builder:(c,s){
-  final has=s.data?.docs.any((d)=>d.id==uid)??false;
-  return has?const Icon(Icons.circle,color:Colors.redAccent,size:10):const SizedBox.shrink();
- });
+// Consultas restritas ao destinatario: nao varrem solicitacoes de terceiros.
+Stream<QuerySnapshot<Map<String, dynamic>>> myDmRequests(String uid) =>
+    db.collection('dmRequests').where('to', isEqualTo: uid).snapshots();
+
+class DmRequestsDot extends StatelessWidget {
+  final String uid;
+  const DmRequestsDot({super.key, required this.uid});
+  @override
+  Widget build(BuildContext context) => StreamBuilder<QuerySnapshot<Map<String, dynamic>>>(
+    stream: myDmRequests(uid),
+    builder: (context, snapshot) {
+      if (snapshot.hasError) return const SizedBox.shrink();
+      final pending = snapshot.data?.docs.any((doc) => doc.data()['status'] == 'pending') ?? false;
+      return pending ? const Icon(Icons.circle, color: Colors.redAccent, size: 10)
+          : const SizedBox.shrink();
+    },
+  );
 }
-class DmRequestsPage extends StatelessWidget{
- final String uid;const DmRequestsPage({super.key,required this.uid});
- @override Widget build(BuildContext c)=>Scaffold(appBar:AppBar(title:const Text('Solicitações de mensagens')),body:StreamBuilder<QuerySnapshot<Map<String,dynamic>>>(stream:db.collectionGroup('requests').where('status',isEqualTo:'pending').snapshots(),builder:(c,s){
-  if(s.hasError)return Center(child:Text('Erro: ${s.error}'));
-  final requests=s.data?.docs.where((d)=>d.id==uid).toList()??[];
-  if(requests.isEmpty)return const Center(child:Text('Nenhuma solicitação pendente.'));
-  return ListView(children:[for(final d in requests)ListTile(leading:ProfileAvatar(uid:d.data()['from']?.toString()??''),title:UserDisplayName(uid:d.data()['from']?.toString()??''),subtitle:const Text('Quer conversar com você'),trailing:Wrap(children:[IconButton(tooltip:'Aceitar',icon:const Icon(Icons.check),onPressed:()async{await d.reference.update({'status':'accepted'});if(c.mounted)Navigator.push(c,MaterialPageRoute(builder:(_)=>DmChatPage(id:d.reference.parent.parent!.id,other:d.data()['from'].toString(),uid:uid)));}),IconButton(tooltip:'Recusar',icon:const Icon(Icons.close),onPressed:()=>d.reference.update({'status':'declined'}))]))]);
- }));
+
+class DmRequestsPage extends StatelessWidget {
+  final String uid;
+  const DmRequestsPage({super.key, required this.uid});
+  @override
+  Widget build(BuildContext context) => Scaffold(
+    appBar: AppBar(title: const Text('Solicitacoes de mensagens')),
+    body: StreamBuilder<QuerySnapshot<Map<String, dynamic>>>(
+      stream: myDmRequests(uid),
+      builder: (context, snapshot) {
+        if (snapshot.hasError) return Center(child: Text('Erro: ${snapshot.error}'));
+        if (!snapshot.hasData) return const Center(child: CircularProgressIndicator());
+        final requests = snapshot.data!.docs
+            .where((doc) => doc.data()['status'] == 'pending').toList();
+        if (requests.isEmpty) return const Center(child: Text('Nenhuma solicitacao pendente.'));
+        return ListView(children: [
+          for (final request in requests)
+            ListTile(
+              leading: ProfileAvatar(uid: request.data()['from']?.toString() ?? ''),
+              title: UserDisplayName(uid: request.data()['from']?.toString() ?? ''),
+              subtitle: const Text('Quer conversar com voce'),
+              trailing: Wrap(children: [
+                IconButton(
+                  tooltip: 'Aceitar', icon: const Icon(Icons.check),
+                  onPressed: () async {
+                    try {
+                      await request.reference.update({'status': 'accepted'});
+                      if (context.mounted) {
+                        Navigator.push(context, MaterialPageRoute(builder: (_) =>
+                            DmChatPage(id: request.id, other: request.data()['from'].toString(), uid: uid)));
+                      }
+                    } catch (e) { if (context.mounted) notice(context, e); }
+                  },
+                ),
+                IconButton(
+                  tooltip: 'Recusar', icon: const Icon(Icons.close),
+                  onPressed: () async {
+                    try { await request.reference.update({'status': 'declined'}); }
+                    catch (e) { if (context.mounted) notice(context, e); }
+                  },
+                ),
+              ]),
+            ),
+        ]);
+      },
+    ),
+  );
 }
-class DmPermissionGate extends StatelessWidget{
- final String id,uid,other;const DmPermissionGate({super.key,required this.id,required this.uid,required this.other});
- @override Widget build(BuildContext c)=>StreamBuilder<DocumentSnapshot<Map<String,dynamic>>>(stream:db.collection('dms').doc(id).collection('requests').doc(uid).snapshots(),builder:(c,s){
-  final pending=s.data?.data()?['status']=='pending';
-  if(pending)return Center(child:Column(mainAxisSize:MainAxisSize.min,children:[const Text('Solicitação de mensagem'),const SizedBox(height:10),FilledButton(onPressed:()async{await s.data!.reference.update({'status':'accepted'});},child:const Text('Aceitar conversa'))]));
-  return MessageThread(collection:db.collection('dms').doc(id).collection('messages'),uid:uid,threadId:'dm:$id');
- });
+
+class DmPermissionGate extends StatelessWidget {
+  final String id, uid, other;
+  const DmPermissionGate({super.key, required this.id, required this.uid, required this.other});
+  @override
+  Widget build(BuildContext context) => StreamBuilder<DocumentSnapshot<Map<String, dynamic>>>(
+    stream: db.collection('users').doc(uid).collection('following').doc(other).snapshots(),
+    builder: (context, mine) => StreamBuilder<DocumentSnapshot<Map<String, dynamic>>>(
+      stream: db.collection('users').doc(other).collection('following').doc(uid).snapshots(),
+      builder: (context, theirs) {
+        if (mine.hasError || theirs.hasError) return const Center(child: Text('Nao foi possivel verificar a amizade.'));
+        if (!mine.hasData || !theirs.hasData) return const Center(child: CircularProgressIndicator());
+        if (mine.data!.exists && theirs.data!.exists) {
+          return MessageThread(collection: db.collection('dms').doc(id).collection('messages'), uid: uid, threadId: 'dm:$id');
+        }
+        return StreamBuilder<DocumentSnapshot<Map<String, dynamic>>>(
+          stream: db.collection('dmRequests').doc(id).snapshots(),
+          builder: (context, request) {
+            if (request.hasError) return Center(child: Text('Erro: ${request.error}'));
+            if (!request.hasData) return const Center(child: CircularProgressIndicator());
+            final data = request.data!.data();
+            if (data?['status'] == 'accepted') {
+              return MessageThread(collection: db.collection('dms').doc(id).collection('messages'), uid: uid, threadId: 'dm:$id');
+            }
+            if (data?['status'] == 'pending' && data?['to'] == uid) {
+              return Center(child: Column(mainAxisSize: MainAxisSize.min, children: [
+                const Text('Solicitacao de mensagem'),
+                const SizedBox(height: 12),
+                FilledButton(onPressed: () async {
+                  try { await request.data!.reference.update({'status': 'accepted'}); }
+                  catch (e) { if (context.mounted) notice(context, e); }
+                }, child: const Text('Aceitar conversa')),
+                TextButton(onPressed: () async {
+                  try { await request.data!.reference.update({'status': 'declined'}); }
+                  catch (e) { if (context.mounted) notice(context, e); }
+                }, child: const Text('Recusar')),
+              ]));
+            }
+            if (data?['status'] == 'pending') {
+              return const Center(child: Text('Aguardando a outra pessoa aceitar sua solicitacao.'));
+            }
+            return const Center(child: Text('Conversa indisponivel sem amizade mutua ou solicitacao aceita.'));
+          },
+        );
+      },
+    ),
+  );
 }
+
 Future<void> confirmLeaveServer(BuildContext context,String id)async{
  final ok=await showDialog<bool>(context:context,builder:(c)=>AlertDialog(title:const Text('Sair do servidor?'),actions:[TextButton(onPressed:()=>Navigator.pop(c,false),child:const Text('Cancelar')),FilledButton(onPressed:()=>Navigator.pop(c,true),child:const Text('Sair'))]));
  if(ok!=true)return;
