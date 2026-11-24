@@ -63,21 +63,36 @@ jobs:
             fi
           done
 
-      - name: Gerar APK
+      - name: Gerar APKs Release (Beta)
         env:
           FB_API_KEY: ${{ secrets.FB_API_KEY }}
           FB_APP_ID: ${{ secrets.FB_APP_ID }}
           FB_SENDER_ID: ${{ secrets.FB_SENDER_ID }}
           FB_PROJECT_ID: ${{ secrets.FB_PROJECT_ID }}
         run: |
-          flutter build apk --debug \
+          flutter build apk --release --split-per-abi \
             --dart-define="FB_API_KEY=$FB_API_KEY" \
             --dart-define="FB_APP_ID=$FB_APP_ID" \
             --dart-define="FB_SENDER_ID=$FB_SENDER_ID" \
             --dart-define="FB_PROJECT_ID=$FB_PROJECT_ID"
 
-      - name: Disponibilizar APK
+      - name: Disponibilizar APK ARM64
         uses: actions/upload-artifact@v4
         with:
-          name: Meow-APK
-          path: build/app/outputs/flutter-apk/app-debug.apk
+          name: Meow-Release-ARM64
+          path: build/app/outputs/flutter-apk/app-arm64-v8a-release.apk
+          if-no-files-found: error
+
+      - name: Disponibilizar APK ARM32
+        uses: actions/upload-artifact@v4
+        with:
+          name: Meow-Release-ARM32
+          path: build/app/outputs/flutter-apk/app-armeabi-v7a-release.apk
+          if-no-files-found: error
+
+      - name: Disponibilizar APK x86-64
+        uses: actions/upload-artifact@v4
+        with:
+          name: Meow-Release-x86-64
+          path: build/app/outputs/flutter-apk/app-x86_64-release.apk
+          if-no-files-found: error
