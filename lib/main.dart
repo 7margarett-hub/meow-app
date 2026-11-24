@@ -2,6 +2,11 @@ import 'dart:async';
 import 'dart:convert';
 import 'dart:math';
 import 'dart:typed_data';
+import 'dart:ui' as ui;
+import 'package:gal/gal.dart';
+import 'package:file_saver/file_saver.dart';
+import 'package:characters/characters.dart';
+import 'package:scrollable_positioned_list/scrollable_positioned_list.dart';
 import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:flutter/cupertino.dart';
 import 'package:file_selector/file_selector.dart' as files;
@@ -18,6 +23,37 @@ const avatarLimit = 8 * 1024 * 1024, bannerLimit = 15 * 1024 * 1024, attachmentL
 const imageHost = 'ffxsvctvcsldumxnkiob.supabase.co';
 final changedImage = ValueNotifier<Uri?>(null);
 final db = FirebaseFirestore.instance;
+final meowNavigator = GlobalKey<NavigatorState>();
+final meowRouteObserver = RouteObserver<ModalRoute<dynamic>>();
+final activeThread = ValueNotifier<String?>(null);
+String userLabel(Map<String,dynamic> d) {
+  final n=d['displayName']?.toString().trim()??'';
+  return n.isNotEmpty?n:d['username']?.toString()??'Usuário';
+}
+String currentPresence(Map<String,dynamic>? d) {
+  final p=d?['presence']?.toString()??'offline';
+  final t=d?['lastSeen'];
+  if(p=='invisible'||t is! Timestamp||DateTime.now().difference(t.toDate())>const Duration(seconds:110))return 'offline';
+  return presenceLabels.containsKey(p)?p:'offline';
+}
+Future<void> notifyMessage(String path) async {
+  try {
+    final r=await http.post(Uri.https(imageHost,'/functions/v1/meow-notificacoes'),headers:{...await authHeaders(),'Content-Type':'application/json'},body:jsonEncode({'messagePath':path})).timeout(const Duration(seconds:45));
+    if(r.statusCode!=200)debugPrint('Meow FCM: HTTP ${r.statusCode}');
+  }catch(e){debugPrint('Meow FCM indisponível: $e');}
+}
+Future<void> logoutMeow(BuildContext c) async {
+  try {
+    final uid=myUid; final f=FirebaseMessaging.instance;
+    final token=await f.getToken();
+    if(token!=null)await db.collection('users').doc(uid).collection('devices').doc(token).delete();
+    try {await f.deleteToken();}catch(_){}
+  }catch(e){if(c.mounted)notice(c,'Não foi possível desregistrar as notificações: $e');return;}
+  PrivateMediaCache.clear();activeThread.value=null;
+  meowNavigator.currentState?.popUntil((route)=>route.isFirst);
+  await FirebaseAuth.instance.signOut();
+}
+
 // Cache privado em memoria por sessao. Nunca persiste imagens privadas no disco.
 // Compartilha requisicoes entre avatares repetidos e evita novos downloads ao navegar.
 class PrivateMediaCache {
@@ -156,7 +192,7 @@ class MeowApp extends StatelessWidget {
     super.key
 }
 );
-    @override Widget build(BuildContext context) => MaterialApp(debugShowCheckedModeBanner:false, title:'Meow',
+    @override Widget build(BuildContext context) => MaterialApp(navigatorKey:meowNavigator,navigatorObservers:[meowRouteObserver],debugShowCheckedModeBanner:false, title:'Meow',
       theme: ThemeData.dark(useMaterial3:true).copyWith(pageTransitionsTheme:PageTransitionsTheme(builders:{TargetPlatform.android:FadeUpwardsPageTransitionsBuilder(),TargetPlatform.iOS:CupertinoPageTransitionsBuilder()}),scaffoldBackgroundColor:bg, colorScheme:ColorScheme.fromSeed(seedColor:purple,
     brightness:Brightness.dark
 ), appBarTheme:const AppBarTheme(backgroundColor:panel), inputDecorationTheme:InputDecorationTheme(filled:true,
@@ -339,10 +375,27 @@ class _ChangeImageState extends State<ChangeImage> {
         'jpeg': 'image/jpeg',
         'webp': 'image/webp',
       };
+      var bytes=await f.readAsBytes();
+      var mime=imageMime[extension]??'application/octet-stream';
+      if(!mounted)return;
+      var edit=true;
+      if(extension=='gif'||extension=='webp'){
+        final codec=await ui.instantiateImageCodec(bytes);final animated=codec.frameCount>1;codec.dispose();
+        if(!mounted)return;
+        if(animated){final choice=await showDialog<String>(context:context,builder:(c)=>AlertDialog(title:const Text('Imagem animada'),content:const Text('Enviar o original preserva a animação. Recortar cria uma imagem estática.'),actions:[TextButton(onPressed:()=>Navigator.pop(c,'cancel'),child:const Text('Cancelar')),TextButton(onPressed:()=>Navigator.pop(c,'crop'),child:const Text('Recortar')),FilledButton(onPressed:()=>Navigator.pop(c,'original'),child:const Text('Enviar original'))]));if(choice==null||choice=='cancel')return;edit=choice=='crop';}
+      }
+      if(edit){
+        if(!mounted)return;
+        final result=await Navigator.push<Uint8List>(context,MaterialPageRoute(builder:(_)=>MeowCropPage(bytes:bytes,aspect:widget.slot=='avatar'?1.0:widget.slot=='banner'?3.0:0.75,circle:widget.slot=='avatar')));
+        if(result==null)return;
+        if(!identical(result,bytes))mime='image/png';
+        bytes=result;
+      }
+      if(bytes.length>limit)throw Exception('Imagem acima do limite após edição.');
       final headers = await authHeaders();
-      headers['Content-Type'] = imageMime[extension] ?? 'application/octet-stream';
+      headers['Content-Type'] = mime;
       final r=await http.put(mediaUrl(widget.scope, widget.id, widget.slot), headers:headers,
-      body:await f.readAsBytes()
+      body:bytes
 ).timeout(const Duration(seconds:120));
       if(r.statusCode!=200)throw Exception('Upload falhou: ${r.statusCode} ${r.body}');
       if(widget.scope=='profile'&&widget.slot=='banner')await db.collection('users').doc(widget.id).update({'bannerHidden':false});
@@ -376,24 +429,19 @@ Color presenceColor(String p)=>switch(p){
 }
 ;
 
-class PresenceDot extends StatelessWidget {
+class PresenceDot extends StatefulWidget {
   final String uid;
-  const PresenceDot({
-    super.key,
-    required this.uid
+  const PresenceDot({super.key,required this.uid});
+  @override State<PresenceDot> createState()=>_PresenceDotState();
 }
-);
-  @override Widget build(BuildContext c)=>StreamBuilder<DocumentSnapshot<Map<String,
-  dynamic>>>(stream:db.collection('users').doc(uid).snapshots(), builder:(c, s){
-    final d=s.data?.data();
-    final p=d?['presence']=='invisible'?'offline':(d?['presence']?.toString()??'offline');
-      return Container(width:11, height:11, decoration:BoxDecoration(color:presenceColor(p), shape:BoxShape.circle,
-    border:Border.all(color:bg, width:2)
-));
+class _PresenceDotState extends State<PresenceDot>{
+  Timer? timer;
+  late Stream<DocumentSnapshot<Map<String,dynamic>>> stream;
+  @override void initState(){super.initState();stream=db.collection('users').doc(widget.uid).snapshots();timer=Timer.periodic(const Duration(seconds:15),(_){if(mounted)setState((){});});}
+  @override void didUpdateWidget(covariant PresenceDot old){super.didUpdateWidget(old);if(old.uid!=widget.uid)stream=db.collection('users').doc(widget.uid).snapshots();}
+  @override void dispose(){timer?.cancel();super.dispose();}
+  @override Widget build(BuildContext c)=>StreamBuilder<DocumentSnapshot<Map<String,dynamic>>>(stream:stream,builder:(c,s)=>Container(width:13,height:13,decoration:BoxDecoration(color:presenceColor(currentPresence(s.data?.data())),shape:BoxShape.circle,border:Border.all(color:bg,width:2))));
 }
-);
-}
-
 class ProfileAvatar extends StatelessWidget {
   final String uid;
   final double size;
@@ -440,6 +488,7 @@ class RelationshipListPage extends StatelessWidget {
         if(s.hasError)return Center(child:Text('Erro: ${s.error}'));
         if(!s.hasData)return const Center(child:CircularProgressIndicator());
         final docs=s.data!.docs;
+        if(kind=='friends')return MutualFriendsList(uid:uid);
         if(kind!='friends')return ListView(children:[for(final d in docs) ListTile(
           leading: ProfileAvatar(uid:d.id), title: UserDisplayName(uid:d.id),
           onTap:()=>openProfile(context,d.id))]);
@@ -491,61 +540,36 @@ class RelationshipCounters extends StatelessWidget {
 }
 
 class ProfilePage extends StatelessWidget {
-  final String uid;
-  final bool expanded;
-  final ScrollController? scrollController;
-  const ProfilePage({
-    super.key,
-    required this.uid,
-    this.expanded=false,
-    this.scrollController
-}
-);
-  @override Widget build(BuildContext c)=>StreamBuilder<DocumentSnapshot<Map<String,
-  dynamic>>>(stream:db.collection('users').doc(uid).snapshots(), builder:(c, s){
+  final String uid; final bool expanded; final ScrollController? scrollController;
+  const ProfilePage({super.key,required this.uid,this.expanded=false,this.scrollController});
+  @override Widget build(BuildContext c)=>StreamBuilder<DocumentSnapshot<Map<String,dynamic>>>(stream:db.collection('users').doc(uid).snapshots(),builder:(c,s){
     if(s.hasError)return const Center(child:Text('Perfil indisponível.'));
     if(!s.hasData)return const Center(child:CircularProgressIndicator());
-    final d=s.data?.data()??{
+    final d=s.data!.data()??{}; final own=uid==FirebaseAuth.instance.currentUser?.uid;
+    final base=meowColor(d['themeColorA'],panel);final end=d['themeGradient']==true?meowColor(d['themeColorB'],base):base;
+    final ink=d['backgroundEnabled']==true?Colors.white:Color.lerp(base,end,.5)!.computeLuminance()>.42?Colors.black:Colors.white;
+    final accent=Color.lerp(base,ink,.22)!;final cardColor=Color.lerp(base,ink,.09)!.withOpacity(.88);
+    return Theme(data:Theme.of(c).copyWith(textTheme:Theme.of(c).textTheme.apply(bodyColor:ink,displayColor:ink),colorScheme:Theme.of(c).colorScheme.copyWith(primary:ink,onPrimary:base,surface:cardColor,onSurface:ink)),child:Container(decoration:BoxDecoration(gradient:profileGradient(d)),child:Stack(children:[
+      if(d['backgroundEnabled']==true)Positioned.fill(top:d['bannerHidden']==true?0:180,child:ProfileBackground(uid:uid)),
+      ListView(controller:scrollController,children:[Stack(children:[const SizedBox(height:230,width:double.infinity),ProfileBanner(uid:uid,data:d),Positioned(left:18,bottom:0,child:Container(padding:const EdgeInsets.all(4),decoration:BoxDecoration(color:base,shape:BoxShape.circle),child:Stack(children:[PrivateImage(scope:'profile',id:uid,slot:'avatar',size:88),Positioned(bottom:2,right:2,child:PresenceDot(uid:uid))]))) ]),
+      Padding(padding:const EdgeInsets.all(18),child:Column(crossAxisAlignment:CrossAxisAlignment.start,children:[Text(userLabel(d),style:TextStyle(fontSize:25,fontWeight:FontWeight.bold,color:ink)),const SizedBox(height:4),Wrap(crossAxisAlignment:WrapCrossAlignment.center,spacing:8,children:[Text('@${d['username']??'meow'}',style:TextStyle(color:ink.withOpacity(.75))),if((d['pronouns']?.toString()??'').isNotEmpty)Container(padding:const EdgeInsets.symmetric(horizontal:9,vertical:3),decoration:BoxDecoration(color:cardColor,borderRadius:BorderRadius.circular(20)),child:Text(d['pronouns'].toString(),style:TextStyle(color:ink,fontSize:12)))]),
+      if((d['customStatus']?.toString()??'').isNotEmpty)Padding(padding:const EdgeInsets.only(top:12),child:Text(d['customStatus'].toString(),style:TextStyle(color:ink))),const SizedBox(height:16),
+      Container(decoration:BoxDecoration(color:cardColor,borderRadius:BorderRadius.circular(15),border:Border.all(color:accent)),padding:const EdgeInsets.symmetric(vertical:8),child:RelationshipCounters(uid:uid)),
+      if((d['bio']?.toString()??'').isNotEmpty)...[const SizedBox(height:18),Text('SOBRE MIM',style:TextStyle(color:ink.withOpacity(.7),fontSize:12,fontWeight:FontWeight.bold)),const SizedBox(height:6),Text(d['bio'].toString(),style:TextStyle(color:ink))],const SizedBox(height:20),
+      if(own)SizedBox(width:double.infinity,child:FilledButton.icon(onPressed:()=>Navigator.push(c,MaterialPageRoute(builder:(_)=>EditProfilePage(uid:uid))),icon:const Icon(Icons.edit),label:const Text('Editar perfil e status'))),
+      if(!own)...[FollowButton(target:uid),SizedBox(width:double.infinity,child:FilledButton.icon(onPressed:()async{if(expanded){Navigator.pop(c,'dm');}else{await openDm(c,uid);}},icon:const Icon(Icons.message),label:const Text('Enviar mensagem')))],
+      const SizedBox(height:12),FriendsPreview(uid:uid,background:cardColor,ink:ink),
+      if(own&&!expanded)TextButton.icon(onPressed:()=>Navigator.push(c,MaterialPageRoute(builder:(_)=>const AppSettingsPage())),icon:const Icon(Icons.settings),label:const Text('Configurações do aplicativo')),
+      ]))])])));
+  });
 }
-;
-    final username=d['username']?.toString()??'meow';
-    final own=uid==FirebaseAuth.instance.currentUser?.uid;
-    final p=d['presence']?.toString()??'offline';
-      return Container(decoration:BoxDecoration(gradient:profileGradient(d)),child:Stack(children:[if(d['backgroundEnabled']==true) Positioned.fill(top:d['bannerHidden']==true?0:180,child:ProfileBackground(uid:uid)),ListView(controller:scrollController, children:[Stack(clipBehavior:Clip.none, children:[ProfileBanner(uid:uid,data:d), Positioned(left:18, bottom:-44, child:Container(padding:const EdgeInsets.all(4), decoration:BoxDecoration(color:d['bannerHidden']==true?Colors.transparent:panel,
-    shape:BoxShape.circle
-), child:PrivateImage(scope:'profile', id:uid, slot:'avatar', size:88)))]), const SizedBox(height:55),
-        Container(padding:const EdgeInsets.all(18), child:Column(crossAxisAlignment:CrossAxisAlignment.start,
-          children:[Text(d['displayName']?.toString()??username, style:const TextStyle(fontSize:24, fontWeight:FontWeight.bold)),
-          Text('@$username', style:const TextStyle(color:Colors.white60)), if((d['pronouns']?.toString()??'').isNotEmpty)Text(d['pronouns'].toString(),style:const TextStyle(color:Colors.white70)), const SizedBox(height:12), RelationshipCounters(uid:uid), if(!own)FollowButton(target:uid), 
-            const SizedBox(height:8), Row(children:[Icon(Icons.circle, size:12, color:presenceColor(own?p:(p=='invisible'?'offline':p))),
-          const SizedBox(width:6), Text(own?(presenceLabels[p]??'Offline'):(p=='invisible'?'Offline':(presenceLabels[p]??'Offline')))
-]), if((d['customStatus']?.toString()??'').isNotEmpty)Padding(padding:const EdgeInsets.only(top:8),
-          child:Text(d['customStatus'].toString())
-), if((d['bio']?.toString()??'').isNotEmpty)...[const SizedBox(height:18), const Text('SOBRE MIM',
-          style:TextStyle(color:Colors.white60, fontSize:12)
-), const SizedBox(height:6), Text(d['bio'].toString())], const SizedBox(height:20), if(own)SizedBox(width:double.infinity,
-              child:FilledButton.icon(onPressed:()=>Navigator.push(c, MaterialPageRoute(builder:(_)=>EditProfilePage(uid:uid))),
-            icon:const Icon(Icons.edit), label:const Text('Editar perfil e status')
-)
-), if(!own)SizedBox(width:double.infinity, child:FilledButton.icon(onPressed:()async{
-            if(expanded){Navigator.pop(c,'dm');}else{await openDm(c,uid);}
-}
-, icon:const Icon(Icons.message), label:const Text('Enviar mensagem'))), if(own&&!expanded)TextButton.icon(onPressed:()=>Navigator.push(c,MaterialPageRoute(builder:(_)=>const AppSettingsPage())),icon:const Icon(Icons.settings),label:const Text('Configurações do aplicativo')), 
-]
-))
-])]));
-}
-);
-}
-
-
 class AppSettingsPage extends StatelessWidget {
   const AppSettingsPage({super.key});
   @override Widget build(BuildContext c)=>Scaffold(appBar:AppBar(title:const Text('Configurações')),
     body:ListView(children:[
       ListTile(leading:const Icon(Icons.person),title:const Text('Conta'),onTap:()=>Navigator.push(c,MaterialPageRoute(builder:(_)=>Scaffold(appBar:AppBar(title:const Text('Conta')),body:ListView(children:[
         ListTile(title:const Text('Editar perfil'),onTap:()=>Navigator.push(c,MaterialPageRoute(builder:(_)=>EditProfilePage(uid:myUid)))),
-        ListTile(title:const Text('Alterar senha'),onTap:()=>Navigator.push(c,MaterialPageRoute(builder:(_)=>const ChangePasswordPage()))), ListTile(title:const Text('Sair da conta'),onTap:(){PrivateMediaCache.clear();FirebaseAuth.instance.signOut();})]))))),
+        ListTile(title:const Text('Alterar senha'),onTap:()=>Navigator.push(c,MaterialPageRoute(builder:(_)=>const ChangePasswordPage()))), ListTile(title:const Text('Sair da conta'),onTap:()=>logoutMeow(c))]))))),
       ListTile(leading:const Icon(Icons.notifications),title:const Text('Notificações'),onTap:()=>Navigator.push(c,MaterialPageRoute(builder:(_)=>const NotificationSettingsPage()))),
       ListTile(leading:const Icon(Icons.storage),title:const Text('Armazenamento'),onTap:()=>Navigator.push(c,MaterialPageRoute(builder:(_)=>Scaffold(appBar:AppBar(title:const Text('Armazenamento')),body:ListTile(title:const Text('Limpar cache de imagens'),onTap:(){PrivateMediaCache.clear();notice(c,'Cache limpo.');}))))),
       ListTile(leading:const Icon(Icons.info),title:const Text('Sobre o Meow'),onTap:()=>Navigator.push(c,MaterialPageRoute(builder:(_)=>Scaffold(appBar:AppBar(title:const Text('Sobre o Meow')),body:const Center(child:Text('Meow • Beta')))))),
@@ -556,16 +580,11 @@ class NotificationSettingsPage extends StatefulWidget {
   @override State<NotificationSettingsPage> createState()=>_NotificationSettingsPageState();
 }
 class _NotificationSettingsPageState extends State<NotificationSettingsPage> {
-  bool enabled=true;
-  @override Widget build(BuildContext c)=>Scaffold(appBar:AppBar(title:const Text('Notificações')),
-    body:SwitchListTile(title:const Text('Notificações neste dispositivo'),value:enabled,onChanged:(v)async{
-      try{if(v){await FirebaseMessaging.instance.requestPermission();final t=await FirebaseMessaging.instance.getToken();if(t!=null)await db.collection('users').doc(myUid).collection('devices').doc(t).set({'token':t,'updatedAt':FieldValue.serverTimestamp()});}
-      else {final t=await FirebaseMessaging.instance.getToken();if(t!=null)await db.collection('users').doc(myUid).collection('devices').doc(t).delete();}
-      if(mounted)setState(()=>enabled=v);
-      }catch(e){if(mounted)notice(context,e);}
-    }));
+  @override Widget build(BuildContext c)=>Scaffold(appBar:AppBar(title:const Text('Notificações')),body:StreamBuilder<DocumentSnapshot<Map<String,dynamic>>>(stream:db.collection('users').doc(myUid).collection('preferences').doc('notifications').snapshots(),builder:(c,s){
+    final d=s.data?.data()??{};final enabled=d['enabled']!=false;
+    return ListView(children:[SwitchListTile(title:const Text('Notificações da conta'),value:enabled,onChanged:(v)async{try{await db.collection('users').doc(myUid).collection('preferences').doc('notifications').set({'enabled':v},SetOptions(merge:true));if(v)await FirebaseMessaging.instance.requestPermission();}catch(e){if(c.mounted)notice(c,e);}}),const ListTile(title:Text('Silenciar conversas'),subtitle:Text('Use o sino no cabeçalho de um canal ou DM.')),const ListTile(title:Text('Privacidade'),subtitle:Text('O conteúdo das mensagens fica oculto na notificação do sistema.'))]);
+  }));
 }
-
 class EditProfilePage extends StatefulWidget {
   final String uid;
   const EditProfilePage({
@@ -693,7 +712,7 @@ class ServerSettingsPage extends StatelessWidget {
           return ListView(children:[PrivateImage(scope:'server', id:id, slot:'banner', size:160), const SizedBox(height:16),
             Center(child:PrivateImage(scope:'server', id:id, slot:'avatar', size:88)), Padding(padding:const EdgeInsets.all(18),
               child:Column(children:[Text(d['name']?.toString()??'Servidor', style:const TextStyle(fontSize:22)),
-                const SizedBox(height:18), if(owner) OutlinedButton.icon(icon:const Icon(Icons.edit),label:const Text('Renomear servidor'),onPressed:()async{final v=await showTextPrompt(c,'Nome do servidor',d['name']?.toString()??'');if(v!=null&&v.isNotEmpty)await db.collection('servers').doc(id).update({'name':v});}), const SizedBox(height:12), if(owner) ListTile(title:const Text('Organizar categorias e canais'),trailing:const Icon(Icons.chevron_right),onTap:()=>Navigator.push(c,MaterialPageRoute(builder:(_)=>ServerOrganizationPage(id:id)))), if(owner||(d['adminIds'] is List&&(d['adminIds'] as List).contains(myUid)))ListTile(title:const Text('Emojis e figurinhas'),onTap:()=>Navigator.push(c,MaterialPageRoute(builder:(_)=>ExpressionSettings(server:id)))),if(owner) ChangeImage('server', id, 'avatar', 'Trocar ícone (8 MiB)'),if(owner) ChangeImage('server',id,'banner','Trocar banner (15 MiB)'),if(owner) OutlinedButton.icon(onPressed:()=>confirmServerDelete(c,id),icon:const Icon(Icons.delete),label:const Text('Excluir servidor')),if(!owner)OutlinedButton.icon(onPressed:()=>confirmLeaveServer(c,id),icon:const Icon(Icons.logout),label:const Text('Sair do servidor'))
+                const SizedBox(height:18), if(owner) OutlinedButton.icon(icon:const Icon(Icons.edit),label:const Text('Renomear servidor'),onPressed:()async{final v=await showTextPrompt(c,'Nome do servidor',d['name']?.toString()??'');if(v!=null&&v.isNotEmpty)await db.collection('servers').doc(id).update({'name':v});}), const SizedBox(height:12), if(owner) ListTile(title:const Text('Organizar categorias e canais'),trailing:const Icon(Icons.chevron_right),onTap:()=>Navigator.push(c,MaterialPageRoute(builder:(_)=>ServerOrganizationPage(id:id)))), if(owner||(d['adminIds'] is List&&(d['adminIds'] as List).contains(myUid)))ListTile(title:const Text('Emojis e figurinhas'),onTap:()=>Navigator.push(c,MaterialPageRoute(builder:(_)=>ExpressionSettings(server:id)))),if(owner) SwitchListTile(title:const Text('Permitir @everyone a todos os membros'),value:d['everyoneEnabled']==true,onChanged:(v)async{try{await db.collection('servers').doc(id).update({'everyoneEnabled':v});}catch(e){if(c.mounted)notice(c,e);}}),if(owner) ChangeImage('server', id, 'avatar', 'Trocar ícone (8 MiB)'),if(owner) ChangeImage('server',id,'banner','Trocar banner (15 MiB)'),if(owner) OutlinedButton.icon(onPressed:()=>confirmServerDelete(c,id),icon:const Icon(Icons.delete),label:const Text('Excluir servidor')),if(!owner)OutlinedButton.icon(onPressed:()=>confirmLeaveServer(c,id),icon:const Icon(Icons.logout),label:const Text('Sair do servidor'))
 ])
 )
 ]);
@@ -766,6 +785,9 @@ class _SocialHomeState extends State<SocialHome> with WidgetsBindingObserver {
 }
 ;
   StreamSubscription<String>? tokenSub;
+  StreamSubscription<RemoteMessage>? foregroundSub,openedSub;
+  OverlayEntry? notificationOverlay; Timer? notificationTimer;
+  final seenNotifications=<String>{};
   Timer? presenceTimer;
   bool appActive = true;
   @override void initState(){
@@ -793,8 +815,13 @@ class _SocialHomeState extends State<SocialHome> with WidgetsBindingObserver {
 }
   Future<void> initNotifications()async{
     try{
-      final fcm=FirebaseMessaging.instance;
+      final fcm=FirebaseMessaging.instance;final registeredUid=myUid;
       await fcm.requestPermission(alert:true, badge:true, sound:true);
+      if(!mounted)return;
+      foregroundSub=FirebaseMessaging.onMessage.listen(showNotification);
+      openedSub=FirebaseMessaging.onMessageOpenedApp.listen(openNotification);
+      final initial=await fcm.getInitialMessage();
+      if(initial!=null&&mounted)WidgetsBinding.instance.addPostFrameCallback((_){if(mounted)openNotification(initial);});
       final token=await fcm.getToken();
       if(token!=null)await db.collection('users').doc(myUid).collection('devices').doc(token).set({
         'token':token,
@@ -802,6 +829,7 @@ class _SocialHomeState extends State<SocialHome> with WidgetsBindingObserver {
 }
 );
       tokenSub=fcm.onTokenRefresh.listen((token)async{
+        if(!mounted||FirebaseAuth.instance.currentUser?.uid!=registeredUid)return;
         try{
           await db.collection('users').doc(myUid).collection('devices').doc(token).set({
             'token':token,
@@ -818,10 +846,43 @@ class _SocialHomeState extends State<SocialHome> with WidgetsBindingObserver {
 }
   @override void dispose(){
     WidgetsBinding.instance.removeObserver(this);
-    tokenSub?.cancel();
+    tokenSub?.cancel(); foregroundSub?.cancel(); openedSub?.cancel(); dismissNotification();
     presenceTimer?.cancel();
     super.dispose();
 }
+  void dismissNotification(){notificationTimer?.cancel();notificationOverlay?.remove();notificationOverlay=null;}
+  Future<void> showNotification(RemoteMessage message) async {
+    final path=message.data['messagePath']??'';
+    if(!mounted||message.data['recipientId']!=FirebaseAuth.instance.currentUser?.uid||!validMessagePath(path)||!seenNotifications.add(path))return;
+    if(seenNotifications.length>300)seenNotifications.remove(seenNotifications.first);
+    if(activeThread.value==threadFromPath(path))return;
+    try{
+      final snap=await db.doc(path).get();if(!snap.exists||!mounted)return;
+      final d=snap.data()!;final sender=d['authorId']?.toString()??'';
+      final u=(await db.collection('users').doc(sender).get()).data()??{};
+      final text=(d['text']?.toString()??'').trim();
+      if(!mounted||activeThread.value==threadFromPath(path))return;
+      dismissNotification();
+      notificationOverlay=OverlayEntry(builder:(c)=>Positioned(top:MediaQuery.paddingOf(c).top+8,left:12,right:12,child:MeowNotificationBanner(key:ValueKey(path),sender:sender,title:userLabel(u),subtitle:message.data['kind']=='reply'?'Respondeu à sua mensagem':message.data['kind']=='mention'?'Mencionou você':'Mensagem privada',preview:text.isEmpty?'Nova mensagem':text,onDismiss:dismissNotification,onTap:(){dismissNotification();openNotification(message);} )));
+      final overlay=meowNavigator.currentState?.overlay;if(overlay==null){notificationOverlay=null;return;}
+      overlay.insert(notificationOverlay!);notificationTimer=Timer(const Duration(seconds:5),dismissNotification);
+    }catch(_){}
+  }
+  Future<void> openNotification(RemoteMessage message) async {
+    if(!mounted||message.data['recipientId']!=FirebaseAuth.instance.currentUser?.uid)return;
+    final path=message.data['messagePath']??'';if(!validMessagePath(path))return;
+    try{
+      final snap=await db.doc(path).get();if(!snap.exists||!mounted)return;
+      final parts=path.split('/');final nav=meowNavigator.currentState;if(nav==null)return;
+      if(parts.first=='dms'){
+        final dm=(await db.collection('dms').doc(parts[1]).get()).data();final others=List<String>.from(dm?['members']??[]).where((x)=>x!=myUid);
+        if(others.isNotEmpty&&mounted)nav.push(MaterialPageRoute(builder:(_)=>DmChatPage(id:parts[1],other:others.first,uid:myUid,initialMessageId:parts.last)));
+      }else{
+        final ch=(await db.collection('servers').doc(parts[1]).collection('channels').doc(parts[3]).get()).data();
+        if(mounted)nav.push(MaterialPageRoute(builder:(_)=>Scaffold(appBar:AppBar(title:Text('# ${ch?['name']??'canal'}'),actions:[MuteButton(thread:'server:${parts[1]}:${parts[3]}')]),body:MessageThread(collection:db.collection('servers').doc(parts[1]).collection('channels').doc(parts[3]).collection('messages'),uid:myUid,serverId:parts[1],threadId:'server:${parts[1]}:${parts[3]}',initialMessageId:parts.last))));
+      }
+    }catch(e){if(mounted)notice(context,'Mensagem indisponível.');}
+  }
   Future<String?> prompt(String title, String hint, {int maxLength = 40}) async {
     String value = '';
     return showDialog<String>(
@@ -948,13 +1009,13 @@ class _SocialHomeState extends State<SocialHome> with WidgetsBindingObserver {
 ), IconButton(onPressed:joinInvite, icon:const Icon(Icons.group_add)), Expanded(child:StreamBuilder<QuerySnapshot<Map<String,
       dynamic>>>(stream:db.collection('servers').where('members', arrayContains:myUid).snapshots(), builder:(c,
     s
-)=>ListView(children:[for(final d in s.data?.docs??[])Padding(padding:const EdgeInsets.symmetric(vertical:5),
+)=>ListView(children:[UnreadDmRail(uid:myUid),for(final d in s.data?.docs??[])Padding(key:ValueKey(d.id),padding:const EdgeInsets.symmetric(vertical:5),
       child:IconButton(tooltip:d.data()['name']?.toString()??'Servidor', onPressed:()=>setState((){
         serverId=d.id;
         channelId=null;
         showingChannels=true;
 }
-), icon:Stack(clipBehavior:Clip.none,children:[PrivateImage(scope:'server', id:d.id, slot:'avatar', size:48),Positioned(right:-2,bottom:-2,child:ServerUnreadDot(serverId:d.id,uid:myUid))]))
+), icon:Stack(clipBehavior:Clip.none,children:[PrivateImage(scope:'server', id:d.id, slot:'avatar', size:48),Positioned(right:-2,bottom:-2,child:ServerUnreadDot(key:ValueKey(d.id),serverId:d.id,uid:myUid))]))
 )]))
 )])));
   Widget channelList(List<QueryDocumentSnapshot<Map<String, dynamic>>> docs){
@@ -992,51 +1053,14 @@ class _SocialHomeState extends State<SocialHome> with WidgetsBindingObserver {
         final active=docs.any((d)=>d.id==channelId)?channelId:(docs.isEmpty?null:docs.first.id);
         final activeDoc=docs.where((d)=>d.id==active);
         final activeName=activeDoc.isEmpty?'canal':activeDoc.first.data()['name']?.toString()??'canal';
-        return GestureDetector(onHorizontalDragEnd:(d){
-          final v=d.primaryVelocity??0;
-          if(v>250&&!showingChannels)setState(()=>showingChannels=true);
-          if(v< -250&&showingChannels&&active!=null)setState(()=>showingChannels=false);
+        return ChannelSlide(open:showingChannels,onChange:(v)=>setState(()=>showingChannels=v),
+          list:Row(children:[rail(),Expanded(child:ColoredBox(color:panel,child:Column(children:[ServerHeader(id:serverId!),Row(children:[const Expanded(child:Padding(padding:EdgeInsets.all(12),child:Text('Canais',style:TextStyle(fontSize:18)))),IconButton(onPressed:createChannel,icon:const Icon(Icons.add)),IconButton(onPressed:createInvite,icon:const Icon(Icons.share))]),Expanded(child:channelList(docs))])))]),
+          chat:Column(children:[ListTile(leading:IconButton(icon:const Icon(Icons.menu),onPressed:()=>setState(()=>showingChannels=true)),title:InkWell(onTap:()=>showGeneralDialog(context:context,barrierDismissible:true,barrierLabel:'Membros',transitionDuration:const Duration(milliseconds:220),pageBuilder:(c,_,__)=>Align(alignment:Alignment.centerRight,child:Material(color:panel,child:SizedBox(width:min(MediaQuery.sizeOf(c).width*.85,350.0),child:ServerMembers(server:serverId!)))),transitionBuilder:(c,a,_,child)=>SlideTransition(position:Tween(begin:const Offset(1,0),end:Offset.zero).animate(a),child:child)),child:Text('# $activeName')),trailing:active==null?null:MuteButton(thread:'server:$serverId:$active')),Expanded(child:active==null?const Center(child:Text('Sem canais')):MessageThread(key:ValueKey('$serverId/$active'),collection:db.collection('servers').doc(serverId).collection('channels').doc(active).collection('messages'),uid:myUid,serverId:serverId,threadId:'server:$serverId:$active',visible:!showingChannels&&tab==0))]));
+      });
+  }
+  @override Widget build(BuildContext c)=>PopScope(canPop:!(tab==0&&!showingChannels),onPopInvokedWithResult:(didPop,result){if(!didPop&&tab==0&&!showingChannels)setState(()=>showingChannels=true);},child:Scaffold(appBar:AppBar(title:const MeowTitle()),body:Column(children:[Expanded(child:MeowTabs(index:tab,children:[serverContent(),DmListPage(uid:myUid),ProfilePage(uid:myUid)])),if(tab!=0||showingChannels)NavigationBar(height:70,selectedIndex:tab,onDestinationSelected:(i)=>setState(()=>tab=i),destinations:const [NavigationDestination(icon:Icon(Icons.tag),label:'Canais'),NavigationDestination(icon:Icon(Icons.chat_bubble_outline),label:'DMs'),NavigationDestination(icon:Icon(Icons.person),label:'Perfil')])])));
 }
-, child:AnimatedSwitcher(duration:const Duration(milliseconds:240),switchInCurve:Curves.easeOutCubic,switchOutCurve:Curves.easeInCubic,transitionBuilder:(child,animation)=>FadeTransition(opacity:animation,child:SlideTransition(position:Tween<Offset>(begin:const Offset(.12,0),end:Offset.zero).animate(animation),child:child)), child:showingChannels?Row(key:const ValueKey('list'),
-            children:[rail(), Expanded(child:ColoredBox(color:panel, child:Column(children:[ServerHeader(id:serverId!),
-              Row(children:[const Expanded(child:Padding(padding:EdgeInsets.all(12), child:Text('Canais', style:TextStyle(fontSize:18)))),
-                IconButton(onPressed:createChannel, icon:const Icon(Icons.add)), IconButton(onPressed:createInvite,
-              icon:const Icon(Icons.share)
-)
-]), Expanded(child:channelList(docs))
-])))]
-):Column(key:const ValueKey('chat'), children:[ListTile(leading:IconButton(icon:const Icon(Icons.menu),
-        onPressed:()=>setState(()=>showingChannels=true)
-), title:Text('# $activeName')), Expanded(child:active==null?const Center(child:Text('Sem canais')):MessageThread(key:ValueKey('$serverId/$active'),
-          collection:db.collection('servers').doc(serverId).collection('channels').doc(active).collection('messages'),
-        uid:myUid, serverId:serverId, threadId:'server:$serverId:$active'
-))])));
-}
-);
-}
-    @override Widget build(BuildContext c)=>PopScope(
-      canPop: !(tab == 0 && !showingChannels),
-      onPopInvokedWithResult: (didPop, result) {
-        if (!didPop && tab == 0 && !showingChannels) {
-          setState(() => showingChannels = true);
-        }
-      },
-      child:Scaffold(appBar:AppBar(title:const MeowTitle()), body:Column(children:[Expanded(child:AnimatedSwitcher(duration:const Duration(milliseconds:240),switchInCurve:Curves.easeOutCubic,switchOutCurve:Curves.easeInCubic,
-      transitionBuilder:(child, a)=>FadeTransition(opacity:a, child:SlideTransition(position:Tween<Offset>(begin:const Offset(.015,
-    0
-), end:Offset.zero).animate(CurvedAnimation(parent:a,curve:Curves.easeOutCubic)), child:child)), child:KeyedSubtree(key:ValueKey(tab), child:switch(tab){
-      1=>FriendsPage(uid:myUid),
-      2=>DmListPage(uid:myUid),
-      3=>ProfilePage(uid:myUid),
-      _=>serverContent()
-}
-)
-)), if (tab != 0 || showingChannels) NavigationBar(height:70, selectedIndex:tab, onDestinationSelected:(i)=>setState(()=>tab=i), destinations:const [NavigationDestination(icon:Icon(Icons.tag),
-  label:'Canais'
-), NavigationDestination(icon:Icon(Icons.people), label:'Amigos'), NavigationDestination(icon:Icon(Icons.chat_bubble_outline),
-  label:'DMs'
-), NavigationDestination(icon:Icon(Icons.person), label:'Perfil')])])));
-}
+
 String dmId(String a, String b){
   final ids=[a, b]..sort();
   return '${ids[0]}_${ids[1]}';
@@ -1107,19 +1131,9 @@ class _DmListPageState extends State<DmListPage> {
   }))]);
 }
 class DmChatPage extends StatelessWidget {
-  final String id,
-  other,
-  uid;
-  const DmChatPage({
-    super.key,
-    required this.id,
-    required this.other,
-    required this.uid
-}
-);
-    @override Widget build(BuildContext c)=>Scaffold(appBar:AppBar(title:StreamBuilder<DocumentSnapshot<Map<String,
-  dynamic>>>(stream:db.collection('users').doc(other).snapshots(), builder:(c, s)=>Text(s.data?.data()?['displayName']?.toString()??s.data?.data()?['username']?.toString()??'DM'))
-), body:DmPermissionGate(id:id,uid:uid,other:other));
+ final String id,other,uid;final String? initialMessageId;
+ const DmChatPage({super.key,required this.id,required this.other,required this.uid,this.initialMessageId});
+ @override Widget build(BuildContext c)=>Scaffold(appBar:AppBar(title:UserDisplayName(uid:other),actions:[MuteButton(thread:'dm:$id')]),body:DmPermissionGate(id:id,uid:uid,other:other,initialMessageId:initialMessageId));
 }
 // Read receipts: a user's last-read timestamp is stored separately per thread.
 // Security rules must restrict each receipt to its owner.
@@ -1164,19 +1178,40 @@ class MessageThread extends StatefulWidget {
   dynamic>> collection;
   final String uid,
   threadId;
-  final String? serverId;
+  final String? serverId,initialMessageId; final bool visible;
   const MessageThread({
     super.key,
     required this.collection,
     required this.uid,
     required this.threadId,
-    this.serverId
+    this.serverId,this.initialMessageId,this.visible=true
 }
 );
   @override State<MessageThread> createState()=>_MessageThreadState();
 }
 
-class _MessageThreadState extends State<MessageThread> {
+class _MessageThreadState extends State<MessageThread> with RouteAware,WidgetsBindingObserver {
+  final itemScroll=ItemScrollController();
+  bool jumped=false,routeActive=true,foreground=true,anchored=false;
+  String? username; Map<String,Map<String,dynamic>> people={}; bool everyoneAllowed=false;
+  StreamSubscription<DocumentSnapshot<Map<String,dynamic>>>? memberSub;
+  final memberSubscriptions=<String,StreamSubscription<DocumentSnapshot<Map<String,dynamic>>>>{};
+  late Stream<QuerySnapshot<Map<String,dynamic>>> messages;
+  
+  @override void initState(){super.initState();WidgetsBinding.instance.addObserver(this);messages=widget.collection.orderBy('createdAt',descending:true).limit(100).snapshots();memberSub=widget.serverId==null?widget.collection.parent!.snapshots().listen(updateMembers):db.collection('servers').doc(widget.serverId).snapshots().listen(updateMembers);if(widget.initialMessageId!=null)loadTarget();}
+  Future<void> loadTarget()async {try{final target=await widget.collection.doc(widget.initialMessageId).get();final t=target.data()?['createdAt'];if(t is Timestamp&&mounted){final recent=await widget.collection.orderBy('createdAt',descending:true).limit(100).get();if(!recent.docs.any((d)=>d.id==target.id)&&mounted)setState((){anchored=true;jumped=false;messages=widget.collection.orderBy('createdAt',descending:true).startAt([t]).limit(100).snapshots();});}}catch(_){} }
+  void updateMembers(DocumentSnapshot<Map<String,dynamic>> snapshot){if(!mounted)return;final d=snapshot.data()??{};final ids=List<String>.from(d['members']??[]).toSet();everyoneAllowed=d['ownerId']==widget.uid||d['everyoneEnabled']==true;for(final id in memberSubscriptions.keys.toList()){if(!ids.contains(id)){memberSubscriptions.remove(id)?.cancel();people.remove(id);}}for(final id in ids){memberSubscriptions.putIfAbsent(id,()=>db.collection('users').doc(id).snapshots().listen((u){if(mounted)setState(()=>people[id]=u.data()??{});}));}setState((){});}
+  @override void didChangeDependencies(){super.didChangeDependencies();final route=ModalRoute.of(context);if(route!=null)meowRouteObserver.subscribe(this,route);routeActive=route?.isCurrent??true;updateActive();}
+  @override void didUpdateWidget(covariant MessageThread old){super.didUpdateWidget(old);if(old.visible!=widget.visible){updateActive();lastMarkedMessage=null;}}
+  void updateActive(){if(widget.visible&&routeActive&&foreground){activeThread.value=widget.threadId;}else if(activeThread.value==widget.threadId){activeThread.value=null;}}
+  @override void didPush(){routeActive=true;updateActive();} @override void didPopNext(){routeActive=true;updateActive();if(mounted)setState(()=>lastMarkedMessage=null);} @override void didPushNext(){routeActive=false;updateActive();} @override void didPop(){routeActive=false;updateActive();}
+  @override void didChangeAppLifecycleState(AppLifecycleState state){foreground=state==AppLifecycleState.resumed;updateActive();if(foreground&&mounted)setState(()=>lastMarkedMessage=null);}
+  void replyTo(QueryDocumentSnapshot<Map<String,dynamic>> doc){final d=doc.data();setState((){replyId=doc.id;replyText=d['text']?.toString()??'';replyAuthor=d['author']?.toString()??'Usuário';replyAuthorId=d['authorId']?.toString();});}
+  String? get mentionQuery=>RegExp(r'(?:^|\s)@([a-zA-Z0-9_]*)$').firstMatch(input.text)?.group(1)?.toLowerCase();
+  void selectMention(String name){final match=RegExp(r'@([a-zA-Z0-9_]*)$').firstMatch(input.text);if(match==null)return;input.text=input.text.replaceRange(match.start,match.end,'@$name ');input.selection=TextSelection.collapsed(offset:input.text.length);typingChanged(input.text);}
+  bool highlighted(Map<String,dynamic> d){if(d['authorId']==widget.uid)return false;final names=mentionNames(d['text']?.toString()??'');return d['replyAuthorId']==widget.uid||names.contains(people[widget.uid]?['username'])||(names.contains('everyone')&&d['everyoneMention']==true);}
+  Widget mentionSuggestions(){final q=mentionQuery;if(q==null)return const SizedBox.shrink();final suggestions=people.entries.where((e)=>e.key!=widget.uid&&(e.value['username']?.toString()??'').startsWith(q)).take(5);return ConstrainedBox(constraints:const BoxConstraints(maxHeight:230),child:Material(color:panel,child:ListView(shrinkWrap:true,children:[if(widget.serverId!=null&&everyoneAllowed&&'everyone'.startsWith(q))ListTile(dense:true,title:const Text('@everyone'),onTap:()=>selectMention('everyone')),for(final e in suggestions)ListTile(dense:true,leading:PrivateImage(scope:'profile',id:e.key,slot:'avatar',size:30),title:Text(userLabel(e.value)),subtitle:Text('@${e.value['username']}'),onTap:()=>selectMention(e.value['username'].toString()))])));}
+
   final input=TextEditingController();
   bool sending=false;
   Timestamp? lastMarkedMessage;
@@ -1184,17 +1219,19 @@ class _MessageThreadState extends State<MessageThread> {
   DateTime? lastTyping;
   DocumentReference<Map<String,dynamic>> get typingRef=>widget.collection.parent!.collection('typing').doc(widget.uid);
   Future<void> stopTyping() async {typingTimer?.cancel();lastTyping=null;try{await typingRef.delete();}catch(_){} }
-  void typingChanged(String value){if(value.trim().isEmpty){stopTyping();return;}final now=DateTime.now();if(lastTyping==null||now.difference(lastTyping!).inMilliseconds>1500){lastTyping=now;typingRef.set({'at':FieldValue.serverTimestamp()}).catchError((Object _){});}typingTimer?.cancel();typingTimer=Timer(const Duration(seconds:3),stopTyping);}
+  void typingChanged(String value){if(mounted)setState((){});if(value.trim().isEmpty){stopTyping();return;}final now=DateTime.now();if(lastTyping==null||now.difference(lastTyping!).inMilliseconds>1500){lastTyping=now;typingRef.set({'at':FieldValue.serverTimestamp()}).catchError((Object _){});}typingTimer?.cancel();typingTimer=Timer(const Duration(seconds:3),stopTyping);}
 
   String? replyId,
   replyText,
-  replyAuthor;
+  replyAuthor,replyAuthorId;
   @override void dispose(){
+    meowRouteObserver.unsubscribe(this);WidgetsBinding.instance.removeObserver(this);memberSub?.cancel();for(final sub in memberSubscriptions.values){sub.cancel();}if(activeThread.value==widget.threadId)activeThread.value=null;
     stopTyping();
     input.dispose();
     super.dispose();
 }
   Future<void> markRead()async{
+    if(!widget.visible||!foreground||!routeActive)return;
     try{
       await receiptRef(widget.threadId, widget.uid).set({
         'at':FieldValue.serverTimestamp()
@@ -1219,7 +1256,7 @@ class _MessageThreadState extends State<MessageThread> {
       dynamic>{
         'text':text,
         'authorId':widget.uid,
-        'author':u['displayName']??u['username']??'Usuário',
+        'author':userLabel(u),
         'createdAt':FieldValue.serverTimestamp()
 }
 ;
@@ -1227,19 +1264,22 @@ class _MessageThreadState extends State<MessageThread> {
         data.addAll({
           'replyToId':replyId,
           'replyText':replyText,
-          'replyAuthor':replyAuthor
+          'replyAuthor':replyAuthor,if(replyAuthorId!=null)'replyAuthorId':replyAuthorId
 }
 );
 }
       if(attachment!=null)data['attachment']=attachment;
       if(expression!=null)data['expression']=expression;
-      await widget.collection.add(data);
+      if(widget.serverId!=null&&everyoneAllowed&&mentionNames(text).contains('everyone'))data['everyoneMention']=true;
+      final sent=await widget.collection.add(data);
+      unawaited(notifyMessage(sent.path));
+      if(!mounted)return;
       input.clear();
       await stopTyping();
       if(mounted)setState((){
         replyId=null;
         replyText=null;
-        replyAuthor=null;
+        replyAuthor=null;replyAuthorId=null;
 }
 );
       await markRead();
@@ -1249,16 +1289,18 @@ class _MessageThreadState extends State<MessageThread> {
       if(mounted)setState(()=>sending=false);
 }
 }
-  bool uploading = false;
+  bool uploading = false; double? uploadProgress;
   Future<void> attach() async {
     if (uploading || sending) return;
-    setState(() => uploading = true);
+    setState(() {uploading=true;uploadProgress=null;});
     try {
       final source = await showModalBottomSheet<String>(
         context: context,
         builder: (c) => SafeArea(child: Column(mainAxisSize: MainAxisSize.min, children: [
           ListTile(leading: const Icon(Icons.photo), title: const Text('Galeria'),
             onTap: () => Navigator.pop(c, 'gallery')),
+          ListTile(leading:const Icon(Icons.videocam),title:const Text('Vídeo da galeria'),onTap:()=>Navigator.pop(c,'video')),
+          ListTile(leading:const Icon(Icons.camera_alt),title:const Text('Câmera'),onTap:()=>Navigator.pop(c,'camera')),
           ListTile(leading: const Icon(Icons.folder), title: const Text('Arquivos (25 MiB)'),
             onTap: () => Navigator.pop(c, 'files')),
         ])),
@@ -1266,12 +1308,15 @@ class _MessageThreadState extends State<MessageThread> {
       if (!mounted || source == null) return;
       final file = source == 'gallery'
           ? await ImagePicker().pickImage(source: ImageSource.gallery, requestFullMetadata: false)
-          : await files.openFile();
-      if (file == null) return;
+          : source=='video'?await ImagePicker().pickVideo(source:ImageSource.gallery):source=='camera'?await ImagePicker().pickImage(source:ImageSource.camera,requestFullMetadata:false):await files.openFile();
+      if (file == null || !mounted) return;
       final length = await file.length();
       if (length == 0 || length > attachmentLimit) {
         throw Exception('O arquivo precisa ter entre 1 byte e 25 MiB.');
       }
+      if(!mounted)return;
+      final confirm=await showModalBottomSheet<bool>(context:context,builder:(c)=>SafeArea(child:Padding(padding:const EdgeInsets.all(18),child:Column(mainAxisSize:MainAxisSize.min,children:[const Icon(Icons.attach_file,size:36),Text(file.name),Text(fileSizeLabel(length)),const SizedBox(height:12),FilledButton(onPressed:()=>Navigator.pop(c,true),child:const Text('Enviar arquivo')),TextButton(onPressed:()=>Navigator.pop(c,false),child:const Text('Cancelar'))]))));
+      if(confirm!=true||!mounted)return;
       final name = file.name;
       final extension = name.contains('.') ? name.split('.').last.toLowerCase() : '';
       const mime = <String, String>{
@@ -1291,8 +1336,10 @@ class _MessageThreadState extends State<MessageThread> {
         // The producer is awaited, so errors from reading the file cannot be lost.
         final producer = () async {
           try {
+            var transferred=0;
             await for (final chunk in file.openRead()) {
-              request.sink.add(chunk);
+              request.sink.add(chunk);transferred+=chunk.length;
+              if(mounted)setState(()=>uploadProgress=(transferred/length).clamp(0.0,1.0).toDouble());
             }
             await request.sink.close();
           } catch (e, st) {
@@ -1313,6 +1360,7 @@ class _MessageThreadState extends State<MessageThread> {
             payload['size'] is! int || payload['size'] != length) {
           throw Exception('Resposta inválida do servidor de anexos.');
         }
+        if(!mounted)return;
         await send(attachment: {
           'id': payload['id'], 'name': payload['name'],
           'contentType': payload['contentType'], 'size': payload['size'],
@@ -1343,7 +1391,7 @@ class _MessageThreadState extends State<MessageThread> {
 }
     if(!mounted)return;
       final action=await showModalBottomSheet<String>(context:context, builder:(c)=>SafeArea(child:Column(mainAxisSize:MainAxisSize.min,
-        children:[ListTile(leading:const Icon(Icons.reply), title:const Text('Responder'), onTap:()=>Navigator.pop(c,
+        children:[ListTile(leading:const Icon(Icons.add_reaction_outlined),title:const Text('Adicionar reação'),onTap:()=>Navigator.pop(c,'react')),ListTile(leading:const Icon(Icons.reply), title:const Text('Responder'), onTap:()=>Navigator.pop(c,
       'reply'
 )), if((d['text']?.toString()??'').isNotEmpty)ListTile(leading:const Icon(Icons.copy), title:const Text('Copiar mensagem'), onTap:()=>Navigator.pop(c, 'copy')), if(own)ListTile(leading:const Icon(Icons.edit), title:const Text('Editar'), onTap:()=>Navigator.pop(c,
       'edit'
@@ -1357,12 +1405,8 @@ class _MessageThreadState extends State<MessageThread> {
       if(mounted)notice(context, 'Mensagem copiada!');
       return;
     }
-    if(action=='reply')setState((){
-      replyId=doc.id;
-      replyText=d['text']?.toString()??'';
-      replyAuthor=d['author']?.toString()??'Usuário';
-}
-);
+    if(action=='reply')replyTo(doc);
+    if(action=='react')await addReaction(context,doc.reference,widget.uid);
     if (action == 'edit' && own) {
       String edited = d['text']?.toString() ?? '';
       final v = await showDialog<String>(
@@ -1407,21 +1451,23 @@ class _MessageThreadState extends State<MessageThread> {
 }
 }
 }
-    @override Widget build(BuildContext c)=>Column(children:[Expanded(child:StreamBuilder<QuerySnapshot<Map<String,
-      dynamic>>>(stream:widget.collection.orderBy('createdAt', descending:true).limit(100).snapshots(),
+    @override Widget build(BuildContext c)=>Column(children:[if(anchored)TextButton(onPressed:()=>setState((){anchored=false;jumped=true;messages=widget.collection.orderBy('createdAt',descending:true).limit(100).snapshots();}),child:const Text('Voltar às mensagens recentes')),Expanded(child:StreamBuilder<QuerySnapshot<Map<String,
+      dynamic>>>(stream:messages,
       builder:(c, s){
         if(s.hasError)return Center(child:Text('Erro: ${s.error}'));
         if(!s.hasData)return const Center(child:CircularProgressIndicator());
         final docs=s.data!.docs;
         if(docs.isEmpty)return const Center(child:Column(mainAxisSize:MainAxisSize.min,children:[Image(image:AssetImage('assets/meow_foreground.png'),width:72,height:72),SizedBox(height:12),Text('Comece a conversa!')]));
         final newest = docs.first.data()['createdAt'];
-        if (newest is Timestamp && newest != lastMarkedMessage) {
+        if (widget.visible && foreground && routeActive && newest is Timestamp && newest != lastMarkedMessage && !anchored) {
           lastMarkedMessage = newest;
           WidgetsBinding.instance.addPostFrameCallback((_) {
             if (mounted) markRead();
           });
         }
-          return ListView.builder(reverse:true, padding:const EdgeInsets.all(12), itemCount:docs.length, itemBuilder:(c,
+          final targetIndex=docs.indexWhere((d)=>d.id==widget.initialMessageId);
+          if(targetIndex>=0&&!jumped){jumped=true;WidgetsBinding.instance.addPostFrameCallback((_){if(mounted&&itemScroll.isAttached)itemScroll.jumpTo(index:targetIndex);});}
+          return ScrollablePositionedList.builder(itemScrollController:itemScroll,reverse:true,padding:const EdgeInsets.all(12),itemCount:docs.length,itemBuilder:(c,
         i
 ){
           final doc=docs[i],
@@ -1431,82 +1477,61 @@ class _MessageThreadState extends State<MessageThread> {
           final older=i+1<docs.length?docs[i+1].data():null;
           final grouped=older!=null && older['authorId']==author && older['createdAt'] is Timestamp && d['createdAt'] is Timestamp && (d['createdAt'] as Timestamp).toDate().difference((older['createdAt'] as Timestamp).toDate()).inMinutes.abs()<5;
           final when=d['createdAt'] is Timestamp?formatMeowTime((d['createdAt'] as Timestamp).toDate()):'Enviando...';
-            return InkWell(onLongPress:()=>options(doc), child:Padding(padding:const EdgeInsets.symmetric(vertical:6),
+            return ReplySwipe(key:ValueKey(doc.id),onReply:()=>replyTo(doc),child:InkWell(onLongPress:()=>options(doc), child:Container(decoration:highlighted(d)?const BoxDecoration(color:Color(0x22FFC107),border:Border(left:BorderSide(color:Colors.amber,width:3))):null,padding:EdgeInsets.symmetric(vertical:grouped?2:7,horizontal:4),
               child:Row(crossAxisAlignment:CrossAxisAlignment.start, children:[grouped?const SizedBox(width:40):ProfileAvatar(uid:author), const SizedBox(width:10),
                 Expanded(child:Column(crossAxisAlignment:CrossAxisAlignment.start, children:[if(!grouped)Row(children:[Flexible(child:InkWell(onTap:()=>openProfile(c,author),child:Text(d['author']?.toString()??'Usuário',style:const TextStyle(fontWeight:FontWeight.bold,color:purple)))),const SizedBox(width:8),Text(when,style:const TextStyle(fontSize:11,color:Colors.white54))]), if(d['replyToId']!=null)Text('↳ ${d['replyAuthor']??''}: ${d['replyText']??''}', maxLines:2,
               overflow:TextOverflow.ellipsis, style:const TextStyle(color:Colors.white60, fontSize:12)
-), if((d['text']?.toString()??'').isNotEmpty)Text(d['text'].toString()), if(attachment is Map&&attachment['id'] is String)AttachmentView(attachment:attachment),if(d['expression'] is Map) ExpressionImage(data:Map<String,dynamic>.from(d['expression'] as Map),message:doc.reference.path),ReactionBar(ref:doc.reference,uid:widget.uid),
+), if((d['text']?.toString()??'').isNotEmpty)MeowMessageText(text:d['text'].toString(),people:people), if(attachment is Map&&attachment['id'] is String)AttachmentView(key:ValueKey(attachment['id']),attachment:attachment),if(d['expression'] is Map) ExpressionImage(data:Map<String,dynamic>.from(d['expression'] as Map),message:doc.reference.path,size:(d['expression'] as Map)['kind']=='emoji'&&(d['text']?.toString()??'').isNotEmpty?26.0:null),ReactionBar(ref:doc.reference,uid:widget.uid),
               if(d['editedAt']!=null)const Text('(editada)', style:TextStyle(fontSize:11, color:Colors.white54))
 ]))
 ])
-));
+)));
 }
 );
 }
 )
-), TypingLabel(collection:widget.collection.parent!.collection('typing'),uid:widget.uid), if(replyId!=null)ListTile(dense:true, title:Text('Respondendo a $replyAuthor: $replyText', maxLines:1,
+), if(uploading)LinearProgressIndicator(value:uploadProgress),TypingLabel(collection:widget.collection.parent!.collection('typing'),uid:widget.uid), mentionSuggestions(), if(replyId!=null)ListTile(dense:true, title:Text('Respondendo a $replyAuthor: $replyText', maxLines:1,
   overflow:TextOverflow.ellipsis
 ), trailing:IconButton(icon:const Icon(Icons.close), onPressed:()=>setState((){
     replyId=null;
     replyText=null;
-    replyAuthor=null;
+    replyAuthor=null;replyAuthorId=null;
 }
 ))), SafeArea(top:false, child:Padding(padding:const EdgeInsets.all(8), child:Row(children:[IconButton(tooltip:'Anexar arquivo',
   onPressed:(sending||uploading)?null:attach, icon:Icon(uploading?Icons.hourglass_top:Icons.add_circle_outline)
 ), Expanded(child:TextField(controller:input, maxLength:2000, maxLines:4, minLines:1, decoration:const InputDecoration(hintText:'Mensagem',
   counterText:''
-), onChanged:typingChanged,onSubmitted:(_)=>send())), IconButton(tooltip:'Emojis e figurinhas',icon:const Icon(Icons.emoji_emotions_outlined),onPressed:()async{final v=await pickExpression(context);if(!mounted||v==null)return;if(v is String){input.text+=v;typingChanged(input.text);}else if(v is Map<String,dynamic>){await send(expression:v);}}), IconButton(onPressed:sending?null:()=>send(), icon:const Icon(Icons.send,
+), onChanged:typingChanged,onSubmitted:(_){if(!uploading)send();})), IconButton(tooltip:'Emojis e figurinhas',icon:const Icon(Icons.emoji_emotions_outlined),onPressed:(sending||uploading)?null:()async{final v=await pickExpression(context);if(!mounted||v==null)return;if(v is String){input.text+=v;typingChanged(input.text);}else if(v is Map<String,dynamic>){await send(expression:v);}}), IconButton(onPressed:(sending||uploading)?null:()=>send(), icon:const Icon(Icons.send,
   color:purple
 ))])))]);
 }
 
 class AttachmentView extends StatefulWidget {
-  final Map attachment;
-  const AttachmentView({
-    super.key,
-    required this.attachment
+ final Map attachment;const AttachmentView({super.key,required this.attachment});
+ @override State<AttachmentView> createState()=>_AttachmentViewState();
 }
-);
-  @override State<AttachmentView> createState()=>_AttachmentViewState();
-}
-
 class _AttachmentViewState extends State<AttachmentView>{
-  Future<Uint8List?>? imageFuture;
-  Future<Uint8List?> fetch() => PrivateMediaCache.get(
-    attachmentUrl(widget.attachment['id'].toString()),
-  );
-  @override void initState(){
-    super.initState();
-    if((widget.attachment['contentType']?.toString()??'').startsWith('image/'))imageFuture=fetch();
+ Future<Uint8List?>? imageFuture;bool busy=false;
+ bool get isImage=>(widget.attachment['contentType']?.toString()??'').startsWith('image/');
+ Future<Uint8List?> fetch()=>PrivateMediaCache.get(attachmentUrl(widget.attachment['id'].toString()));
+ @override void initState(){super.initState();if(isImage)imageFuture=fetch();}
+ Future<void> save()async{if(busy)return;setState(()=>busy=true);try{final bytes=await fetch();if(bytes==null)throw Exception('Arquivo indisponível.');if(!mounted)return;await saveMeowFile(context,bytes,widget.attachment['name']?.toString()??'arquivo',isImage); }catch(e){if(mounted)notice(context,e);}finally{if(mounted)setState(()=>busy=false);}}
+ @override Widget build(BuildContext c){final name=widget.attachment['name']?.toString()??'Arquivo';return Container(margin:const EdgeInsets.only(top:5),constraints:const BoxConstraints(maxWidth:320),decoration:BoxDecoration(color:panel,borderRadius:BorderRadius.circular(12),border:Border.all(color:Colors.white12)),child:Column(crossAxisAlignment:CrossAxisAlignment.start,children:[if(isImage)FutureBuilder<Uint8List?>(future:imageFuture,builder:(c,s){if(s.connectionState!=ConnectionState.done)return const Padding(padding:EdgeInsets.all(14),child:LinearProgressIndicator());if(s.data==null)return TextButton(onPressed:()=>setState(()=>imageFuture=fetch()),child:const Text('Tentar carregar imagem'));return GestureDetector(onTap:()=>Navigator.push(c,MaterialPageRoute(builder:(_)=>MeowImageViewer(bytes:s.data!,name:name))),child:ClipRRect(borderRadius:const BorderRadius.vertical(top:Radius.circular(12)),child:ConstrainedBox(constraints:const BoxConstraints(maxHeight:250),child:Image.memory(s.data!,fit:BoxFit.contain,gaplessPlayback:true,errorBuilder:(c,e,st)=>const Text('Imagem indisponível')))));}),ListTile(dense:true,leading:Icon(isImage?Icons.image:Icons.insert_drive_file),title:Text(name,maxLines:1,overflow:TextOverflow.ellipsis),subtitle:Text(fileSizeLabel((widget.attachment['size'] as num?)?.toInt()??0)),trailing:IconButton(tooltip:'Salvar arquivo',onPressed:busy?null:save,icon:Icon(busy?Icons.hourglass_top:Icons.download))) ]));}
 }
-  @override Widget build(BuildContext c){
-    final name=widget.attachment['name']?.toString()??'Arquivo';
-      return Column(crossAxisAlignment:CrossAxisAlignment.start, children:[if(imageFuture!=null)FutureBuilder<Uint8List?>(future:imageFuture,
-        builder:(c, s)=>s.data==null?const SizedBox(height:36, child:Text('Carregando imagem...')):ConstrainedBox(constraints:const BoxConstraints(maxHeight:250,
-      maxWidth:300
-), child:Image.memory(s.data!, fit:BoxFit.contain, errorBuilder:(c, e, st)=>const Text('Imagem indisponível')))
-), Text('📎 $name', style:const TextStyle(color:purple))]);
-}
-}
-
 class FriendsPage extends StatelessWidget {
-  final String uid;
-  const FriendsPage({super.key,required this.uid});
-  @override Widget build(BuildContext c)=>Scaffold(
-    body:Column(children:[const ListTile(title:Text('Amigos',style:TextStyle(fontSize:24,fontWeight:FontWeight.bold))),
-      Padding(padding:const EdgeInsets.symmetric(horizontal:16),child:TextField(
-        decoration:const InputDecoration(labelText:'Buscar usuário',prefixIcon:Icon(Icons.search)),
-        onSubmitted:(name)async{
-          final n=cleanName(name);
-          final found=await db.collection('users').where('username',isEqualTo:n).limit(1).get();
-          if(!c.mounted)return;
-          if(found.docs.isEmpty){notice(c,'Usuário não encontrado');return;}
-          openProfile(c,found.docs.first.id);
-        })),
-      Expanded(child:RelationshipListPage(uid:uid,kind:'friends')),
-    ]));
+ final String uid;const FriendsPage({super.key,required this.uid});
+ @override Widget build(BuildContext c)=>Scaffold(appBar:AppBar(title:const Text('Amigos')),body:Column(children:[Padding(padding:const EdgeInsets.symmetric(horizontal:16,vertical:8),child:TextField(decoration:const InputDecoration(labelText:'Buscar usuário',prefixIcon:Icon(Icons.search)),onSubmitted:(name)async{try{final n=cleanName(name.replaceFirst('@',''));final found=await db.collection('users').where('username',isEqualTo:n).limit(1).get();if(!c.mounted)return;if(found.docs.isEmpty){notice(c,'Usuário não encontrado');return;}openProfile(c,found.docs.first.id);}catch(e){if(c.mounted)notice(c,e);}})),Expanded(child:MutualFriendsList(uid:uid))]));
 }
-
+class MutualFriendsList extends StatefulWidget {
+ final String uid;const MutualFriendsList({super.key,required this.uid});
+ @override State<MutualFriendsList> createState()=>_MutualFriendsListState();
+}
+class _MutualFriendsListState extends State<MutualFriendsList>{
+ StreamSubscription<QuerySnapshot<Map<String,dynamic>>>? following;final mutualSubs=<String,StreamSubscription<DocumentSnapshot<Map<String,dynamic>>>>{};final profileSubs=<String,StreamSubscription<DocumentSnapshot<Map<String,dynamic>>>>{};final profiles=<String,Map<String,dynamic>>{};Timer? timer;bool loaded=false;
+ @override void initState(){super.initState();following=db.collection('users').doc(widget.uid).collection('following').snapshots().listen((s){if(!mounted)return;final ids=s.docs.map((d)=>d.id).toSet();for(final id in mutualSubs.keys.toList()){if(!ids.contains(id)){mutualSubs.remove(id)?.cancel();profileSubs.remove(id)?.cancel();profiles.remove(id);}}for(final id in ids){mutualSubs.putIfAbsent(id,()=>db.collection('users').doc(id).collection('following').doc(widget.uid).snapshots().listen((m){if(!mounted||!mutualSubs.containsKey(id))return;if(m.exists){profiles.putIfAbsent(id,()=>{});profileSubs.putIfAbsent(id,()=>db.collection('users').doc(id).snapshots().listen((u){if(mounted&&profileSubs.containsKey(id))setState(()=>profiles[id]=u.data()??{});}));}else{profileSubs.remove(id)?.cancel();profiles.remove(id);}setState((){});}));}setState(()=>loaded=true);},onError:(Object _){if(mounted)setState(()=>loaded=true);});timer=Timer.periodic(const Duration(seconds:15),(_){if(mounted)setState((){});});}
+ @override void dispose(){following?.cancel();timer?.cancel();for(final s in mutualSubs.values){s.cancel();}for(final s in profileSubs.values){s.cancel();}super.dispose();}
+ @override Widget build(BuildContext c){if(!loaded)return const Center(child:CircularProgressIndicator());if(profiles.isEmpty)return const Center(child:Text('Nenhum amigo ainda.'));final entries=profiles.entries.toList()..sort((a,b){final offA=currentPresence(a.value)=='offline';final offB=currentPresence(b.value)=='offline';if(offA!=offB)return offA?1:-1;return userLabel(a.value).compareTo(userLabel(b.value));});return ListView(children:[for(final e in entries)ListTile(leading:ProfileAvatar(uid:e.key),title:Text(userLabel(e.value)),subtitle:Text('@${e.value['username']??''}'),onTap:()=>openProfile(c,e.key))]);}
+}
 
 String formatMeowTime(DateTime date) {
   final d=date.toLocal();
@@ -1520,7 +1545,7 @@ class MeowTitle extends StatelessWidget {
   const MeowTitle({super.key});
   @override Widget build(BuildContext context)=>FutureBuilder<PackageInfo>(
     future:PackageInfo.fromPlatform(),builder:(context,s)=>Row(mainAxisSize:MainAxisSize.min,children:[
-      const Text('Meow'),const SizedBox(width:8),
+      const Image(image:AssetImage('assets/meow_foreground.png'),width:30,height:30),const SizedBox(width:6),const Text('Meow',style:TextStyle(fontWeight:FontWeight.bold)),const SizedBox(width:8),
       Text(s.data?.version??'',style:const TextStyle(fontSize:12,color:Colors.white54))]));
 }
 class ChangePasswordPage extends StatefulWidget {
@@ -1690,20 +1715,25 @@ class MeowWheelPainter extends CustomPainter {
 class ThreadUnreadDot extends StatelessWidget{
  final String threadId,uid;final CollectionReference<Map<String,dynamic>> collection;
  const ThreadUnreadDot({super.key,required this.threadId,required this.uid,required this.collection});
- @override Widget build(BuildContext c)=>StreamBuilder<DocumentSnapshot<Map<String,dynamic>>>(stream:receiptRef(threadId,uid).snapshots(),builder:(c,r){
-  final seen=r.data?.data()?['at'] as Timestamp?;
-  return StreamBuilder<QuerySnapshot<Map<String,dynamic>>>(stream:collection.orderBy('createdAt',descending:true).limit(30).snapshots(),builder:(c,s){
-   final unread=s.data?.docs.any((d){final t=d.data()['createdAt'];return d.data()['authorId']!=uid&&t is Timestamp&&(seen==null||t.compareTo(seen)>0);})??false;
-   return unread?const Icon(Icons.circle,color:Color(0xFF39F57A),size:12):const SizedBox.shrink();
-  });
- });
+ @override Widget build(BuildContext c)=>StreamBuilder<DocumentSnapshot<Map<String,dynamic>>>(stream:db.collection('users').doc(uid).snapshots(),builder:(c,u)=>StreamBuilder<DocumentSnapshot<Map<String,dynamic>>>(stream:receiptRef(threadId,uid).snapshots(),builder:(c,r){
+ final seen=r.data?.data()?['at'] as Timestamp?;final username=u.data?.data()?['username']?.toString()??'';
+ return StreamBuilder<QuerySnapshot<Map<String,dynamic>>>(stream:collection.orderBy('createdAt',descending:true).limit(100).snapshots(),builder:(c,s){
+ final unread=s.data?.docs.where((d){final t=d.data()['createdAt'];return d.data()['authorId']!=uid&&t is Timestamp&&(seen==null||t.compareTo(seen)>0);}).toList()??[];
+ final count=unread.where((d){final m=d.data();final names=mentionNames(m['text']?.toString()??'');return m['replyAuthorId']==uid||names.contains(username)||(m['everyoneMention']==true&&names.contains('everyone'));}).length;
+ return Row(mainAxisSize:MainAxisSize.min,children:[if(unread.isNotEmpty)const Icon(Icons.circle,color:Color(0xFF39F57A),size:10),if(count>0)Container(margin:const EdgeInsets.only(left:3),padding:const EdgeInsets.symmetric(horizontal:5,vertical:2),decoration:BoxDecoration(color:Colors.redAccent,borderRadius:BorderRadius.circular(12)),child:Text('$count',style:const TextStyle(fontSize:10,color:Colors.white)))]);
+ });}));
 }
-class ServerUnreadDot extends StatelessWidget{
+class ServerUnreadDot extends StatefulWidget{
  final String serverId,uid;const ServerUnreadDot({super.key,required this.serverId,required this.uid});
- @override Widget build(BuildContext c)=>StreamBuilder<QuerySnapshot<Map<String,dynamic>>>(stream:db.collection('servers').doc(serverId).collection('channels').snapshots(),builder:(c,s){
-  if(s.hasError || s.data?.docs.isEmpty != false)return const SizedBox.shrink();
-  return SizedBox(width:12,height:12,child:Stack(children:[for(final ch in s.data!.docs)ThreadUnreadDot(threadId:'server:$serverId:${ch.id}',uid:uid,collection:ch.reference.collection('messages'))]));
- });
+ @override State<ServerUnreadDot> createState()=>_ServerUnreadDotState();
+}
+class _ServerUnreadDotState extends State<ServerUnreadDot>{
+ StreamSubscription<QuerySnapshot<Map<String,dynamic>>>? channels;StreamSubscription<DocumentSnapshot<Map<String,dynamic>>>? user;
+ final messageSubs=<String,StreamSubscription<QuerySnapshot<Map<String,dynamic>>>>{};final receiptSubs=<String,StreamSubscription<DocumentSnapshot<Map<String,dynamic>>>>{};
+ final receipts=<String,Timestamp?>{};final items=<String,List<QueryDocumentSnapshot<Map<String,dynamic>>>>{};String username='';
+ @override void initState(){super.initState();user=db.collection('users').doc(widget.uid).snapshots().listen((u){if(mounted)setState(()=>username=u.data()?['username']?.toString()??'');});channels=db.collection('servers').doc(widget.serverId).collection('channels').snapshots().listen((s){if(!mounted)return;final ids=s.docs.map((d)=>d.id).toSet();for(final id in messageSubs.keys.toList()){if(!ids.contains(id)){messageSubs.remove(id)?.cancel();receiptSubs.remove(id)?.cancel();items.remove(id);receipts.remove(id);}}for(final ch in s.docs){messageSubs.putIfAbsent(ch.id,()=>ch.reference.collection('messages').orderBy('createdAt',descending:true).limit(100).snapshots().listen((m){if(mounted)setState(()=>items[ch.id]=m.docs);}));receiptSubs.putIfAbsent(ch.id,()=>receiptRef('server:${widget.serverId}:${ch.id}',widget.uid).snapshots().listen((r){if(mounted)setState(()=>receipts[ch.id]=r.data()?['at'] as Timestamp?);}));}setState((){});},onError:(Object _){});}
+ @override void dispose(){channels?.cancel();user?.cancel();for(final s in messageSubs.values){s.cancel();}for(final s in receiptSubs.values){s.cancel();}super.dispose();}
+ @override Widget build(BuildContext c){var unread=false,count=0;for(final e in items.entries){final seen=receipts[e.key];for(final d in e.value){final m=d.data();final t=m['createdAt'];if(m['authorId']==widget.uid||t is! Timestamp||(seen!=null&&t.compareTo(seen)<=0))continue;unread=true;final names=mentionNames(m['text']?.toString()??'');if(m['replyAuthorId']==widget.uid||names.contains(username)||(m['everyoneMention']==true&&names.contains('everyone')))count++;}}return Row(mainAxisSize:MainAxisSize.min,children:[if(unread)const Icon(Icons.circle,color:Color(0xFF39F57A),size:10),if(count>0)Container(padding:const EdgeInsets.symmetric(horizontal:4,vertical:2),decoration:BoxDecoration(color:Colors.redAccent,borderRadius:BorderRadius.circular(12)),child:Text(count>99?'99+':'$count',style:const TextStyle(fontSize:10,color:Colors.white)))]);}
 }
 class DmPreview extends StatelessWidget{
  final String id,uid;const DmPreview({super.key,required this.id,required this.uid});
@@ -1782,8 +1812,8 @@ class DmRequestsPage extends StatelessWidget {
 }
 
 class DmPermissionGate extends StatelessWidget {
-  final String id, uid, other;
-  const DmPermissionGate({super.key, required this.id, required this.uid, required this.other});
+  final String id, uid, other; final String? initialMessageId;
+  const DmPermissionGate({super.key, required this.id, required this.uid, required this.other,this.initialMessageId});
   @override
   Widget build(BuildContext context) => StreamBuilder<DocumentSnapshot<Map<String, dynamic>>>(
     stream: db.collection('users').doc(uid).collection('following').doc(other).snapshots(),
@@ -1793,7 +1823,7 @@ class DmPermissionGate extends StatelessWidget {
         if (mine.hasError || theirs.hasError) return const Center(child: Text('Nao foi possivel verificar a amizade.'));
         if (!mine.hasData || !theirs.hasData) return const Center(child: CircularProgressIndicator());
         if (mine.data!.exists && theirs.data!.exists) {
-          return MessageThread(collection: db.collection('dms').doc(id).collection('messages'), uid: uid, threadId: 'dm:$id');
+          return MessageThread(collection: db.collection('dms').doc(id).collection('messages'), uid: uid, threadId: 'dm:$id',initialMessageId:initialMessageId);
         }
         return StreamBuilder<DocumentSnapshot<Map<String, dynamic>>>(
           stream: db.collection('dmRequests').doc(id).snapshots(),
@@ -1802,7 +1832,7 @@ class DmPermissionGate extends StatelessWidget {
             if (!request.hasData) return const Center(child: CircularProgressIndicator());
             final data = request.data!.data();
             if (data?['status'] == 'accepted') {
-              return MessageThread(collection: db.collection('dms').doc(id).collection('messages'), uid: uid, threadId: 'dm:$id');
+              return MessageThread(collection: db.collection('dms').doc(id).collection('messages'), uid: uid, threadId: 'dm:$id',initialMessageId:initialMessageId);
             }
             if (data?['status'] == 'pending' && data?['to'] == uid) {
               return Center(child: Column(mainAxisSize: MainAxisSize.min, children: [
@@ -1850,26 +1880,128 @@ class TypingLabel extends StatefulWidget {
  @override State<TypingLabel> createState()=>_TypingLabelState();
 }
 class _TypingLabelState extends State<TypingLabel>{
- Timer? timer;late Stream<QuerySnapshot<Map<String,dynamic>>> stream;
- @override void initState(){super.initState();stream=widget.collection.snapshots();timer=Timer.periodic(const Duration(milliseconds:700),(_){if(mounted)setState((){});});}
+ Timer? timer;late Stream<QuerySnapshot<Map<String,dynamic>>> stream;int frame=0;
+ final names=<String,String>{};final loading=<String>{};
+ @override void initState(){super.initState();stream=widget.collection.snapshots();timer=Timer.periodic(const Duration(milliseconds:400),(_){if(mounted)setState(()=>frame=(frame+1)%3);});}
  @override void dispose(){timer?.cancel();super.dispose();}
- @override Widget build(BuildContext c)=>StreamBuilder<QuerySnapshot<Map<String,dynamic>>>(stream:stream,builder:(c,s){final ids=s.data?.docs.where((d){final t=d.data()['at'];return d.id!=widget.uid&&t is Timestamp&&DateTime.now().difference(t.toDate()).inMilliseconds<4000;}).map((d)=>d.id).toList()??[];return SizedBox(height:24,child:ids.isEmpty?null:Row(children:[const SizedBox(width:12),if(ids.length==1)Flexible(child:UserDisplayName(uid:ids.first))else Text('${ids.length} pessoas'),Text(ids.length==1?' está digitando...':' estão digitando...')]));});
+ Future<void> load(String id)async{if(names.containsKey(id)||!loading.add(id))return;try{final d=(await db.collection('users').doc(id).get()).data()??{};if(mounted)setState(()=>names[id]=userLabel(d));}catch(_){}finally{loading.remove(id);}}
+ @override Widget build(BuildContext c)=>StreamBuilder<QuerySnapshot<Map<String,dynamic>>>(stream:stream,builder:(c,s){final ids=s.data?.docs.where((d){final t=d.data()['at'];return d.id!=widget.uid&&t is Timestamp&&DateTime.now().difference(t.toDate())<const Duration(seconds:4);}).map((d)=>d.id).toList()??[];if(ids.length<=3){for(final id in ids){if(!names.containsKey(id))unawaited(load(id));}}final n=ids.map((id)=>names[id]??'Alguém').toList();final text=switch(n.length){0=>'',1=>'${n[0]} está digitando',2=>'${n[0]} e ${n[1]} estão digitando',3=>'${n[0]}, ${n[1]} e ${n[2]} estão digitando',_=>'Muitas pessoas estão digitando'};return SizedBox(height:24,child:ids.isEmpty?null:Padding(padding:const EdgeInsets.symmetric(horizontal:12),child:Row(children:[Flexible(child:Text(text,overflow:TextOverflow.ellipsis,style:const TextStyle(fontSize:12))),const SizedBox(width:3),for(var i=0;i<3;i++)AnimatedOpacity(opacity:frame==i?1:.35,duration:const Duration(milliseconds:200),child:const Text('•'))])));});
 }
 const meowEmojis=['😀','😂','😍','😭','😎','🥰','😡','🤔','😴','😺','❤️','💜','👍','👎','🔥','🎉','✨','💀','👀','🙏','🐱','🐶','🌸','🍕','🎮','💯'];
-Uri expressionUrl(Map<String,dynamic> d,{String? message})=>Uri.https(imageHost,'/functions/v1/meow-expressoes',{'server':d['serverId'].toString(),'id':d['id'].toString(),'kind':d['kind'].toString(),if(message!=null)'message':message});
+Uri expressionUrl(Map<String,dynamic> d,{String? message,String? reaction})=>Uri.https(imageHost,'/functions/v1/meow-expressoes',{'server':d['serverId'].toString(),'id':d['id'].toString(),'kind':d['kind'].toString(),if(message!=null)'message':message,if(reaction!=null)'reaction':reaction});
 class ExpressionImage extends StatelessWidget{
- final Map<String,dynamic> data;final String? message;final double? size;
- const ExpressionImage({super.key,required this.data,this.message,this.size});
- @override Widget build(BuildContext c){final n=size??(data['kind']=='sticker'?144.0:48.0);return SizedBox(width:n,height:n,child:FutureBuilder<Uint8List?>(future:PrivateMediaCache.get(expressionUrl(data,message:message)),builder:(c,s)=>s.data==null?const Icon(Icons.image_outlined):Image.memory(s.data!,fit:BoxFit.contain,errorBuilder:(c,e,st)=>const Icon(Icons.broken_image))));}
+ final Map<String,dynamic> data;final String? message,reaction;final double? size;
+ const ExpressionImage({super.key,required this.data,this.message,this.reaction,this.size});
+ @override Widget build(BuildContext c){final n=size??(data['kind']=='sticker'?144.0:48.0);return SizedBox(width:n,height:n,child:FutureBuilder<Uint8List?>(future:PrivateMediaCache.get(expressionUrl(data,message:message,reaction:reaction)),builder:(c,s)=>s.data==null?const Icon(Icons.image_outlined):Image.memory(s.data!,fit:BoxFit.contain,errorBuilder:(c,e,st)=>const Icon(Icons.broken_image))));}
 }
-Future<Object?> pickExpression(BuildContext context)=>showModalBottomSheet<Object>(context:context,isScrollControlled:true,builder:(c)=>SafeArea(child:SizedBox(height:420,child:DefaultTabController(length:3,child:Column(children:[const TabBar(tabs:[Tab(text:'Emojis'),Tab(text:'Personalizados'),Tab(text:'Figurinhas')]),Expanded(child:TabBarView(children:[GridView.count(crossAxisCount:6,children:[for(final e in meowEmojis)TextButton(onPressed:()=>Navigator.pop(c,e),child:Text(e,style:const TextStyle(fontSize:26)))]),for(final kind in ['emoji','sticker'])StreamBuilder<QuerySnapshot<Map<String,dynamic>>>(stream:db.collection('servers').where('members',arrayContains:myUid).snapshots(),builder:(c,s)=>ListView(children:[for(final server in s.data?.docs??[])Column(crossAxisAlignment:CrossAxisAlignment.start,children:[ListTile(title:Text(server.data()['name']?.toString()??'Servidor')),StreamBuilder<QuerySnapshot<Map<String,dynamic>>>(stream:server.reference.collection('expressions').where('active',isEqualTo:true).snapshots(),builder:(c,x)=>Wrap(children:[for(final item in x.data?.docs??[])if(item.data()['kind']==kind)InkWell(onTap:()=>Navigator.pop(c,<String,dynamic>{'serverId':server.id,'id':item.id,'kind':kind}),child:Padding(padding:const EdgeInsets.all(6),child:ExpressionImage(data:item.data(),size:kind=='emoji'?48:88)))]))])]))]))])))));
+Future<Object?> pickExpression(BuildContext context,{bool reactionOnly=false})=>showModalBottomSheet<Object>(context:context,isScrollControlled:true,builder:(c)=>SafeArea(child:SizedBox(height:420,child:DefaultTabController(length:reactionOnly?2:3,child:Column(children:[TabBar(tabs:[const Tab(text:'Emojis'),const Tab(text:'Personalizados'),if(!reactionOnly)const Tab(text:'Figurinhas')]),Expanded(child:TabBarView(children:[GridView.count(crossAxisCount:6,children:[for(final e in meowEmojis)TextButton(onPressed:()=>Navigator.pop(c,e),child:Text(e,style:const TextStyle(fontSize:26)))]),for(final kind in ['emoji',if(!reactionOnly)'sticker'])StreamBuilder<QuerySnapshot<Map<String,dynamic>>>(stream:db.collection('servers').where('members',arrayContains:myUid).snapshots(),builder:(c,s)=>ListView(children:[for(final server in s.data?.docs??[])Column(crossAxisAlignment:CrossAxisAlignment.start,children:[ListTile(title:Text(server.data()['name']?.toString()??'Servidor')),StreamBuilder<QuerySnapshot<Map<String,dynamic>>>(stream:server.reference.collection('expressions').where('active',isEqualTo:true).snapshots(),builder:(c,x)=>Wrap(children:[for(final item in x.data?.docs??[])if(item.data()['kind']==kind)InkWell(onTap:()=>Navigator.pop(c,<String,dynamic>{'serverId':server.id,'id':item.id,'kind':kind}),child:Padding(padding:const EdgeInsets.all(6),child:ExpressionImage(data:item.data(),size:kind=='emoji'?48:88)))]))])]))]))])))));
 class ExpressionSettings extends StatelessWidget{
  final String server;const ExpressionSettings({super.key,required this.server});
  CollectionReference<Map<String,dynamic>> get catalog=>db.collection('servers').doc(server).collection('expressions');
  Future<void> add(BuildContext c,String kind)async{try{final name=await showTextPrompt(c,'Nome','');if(name==null||name.length<2||name.length>32||!c.mounted)return;final f=await files.openFile(acceptedTypeGroups:const [files.XTypeGroup(label:'Imagens',extensions:['png','jpg','jpeg','gif','webp'])]);if(f==null)return;if(await f.length()>5000000)throw Exception('Limite de 5 MB.');final uri=Uri.https(imageHost,'/functions/v1/meow-expressoes',{'server':server,'kind':kind,'name':name});final response=await http.post(uri,headers:await authHeaders(),body:await f.readAsBytes()).timeout(const Duration(seconds:120));if(response.statusCode!=201)throw Exception(response.body);final d=Map<String,dynamic>.from(jsonDecode(response.body) as Map);await catalog.doc(d['id'].toString()).set({...d,'active':true,'createdAt':FieldValue.serverTimestamp()});if(c.mounted)notice(c,'Imagem adicionada.');}catch(e){if(c.mounted)notice(c,e);}}
  @override Widget build(BuildContext c)=>Scaffold(appBar:AppBar(title:const Text('Emojis e figurinhas')),body:Column(children:[Wrap(children:[TextButton(onPressed:()=>add(c,'emoji'),child:const Text('Adicionar emoji')),TextButton(onPressed:()=>add(c,'sticker'),child:const Text('Adicionar figurinha'))]),Expanded(child:StreamBuilder<QuerySnapshot<Map<String,dynamic>>>(stream:catalog.where('active',isEqualTo:true).snapshots(),builder:(c,s)=>ListView(children:[for(final d in s.data?.docs??[])ListTile(leading:ExpressionImage(data:d.data(),size:48),title:Text(d.data()['name'].toString()),trailing:PopupMenuButton<String>(onSelected:(v)async{try{if(v=='delete'){await d.reference.update({'active':false});}else{final name=await showTextPrompt(c,'Renomear',d.data()['name'].toString());if(name!=null&&name.length>=2&&name.length<=32)await d.reference.update({'name':name});}}catch(e){if(c.mounted)notice(c,e);}},itemBuilder:(_)=>const [PopupMenuItem(value:'rename',child:Text('Renomear')),PopupMenuItem(value:'delete',child:Text('Remover'))]))])))]));
 }
+String reactionKey(Map<String,dynamic> d){final e=d['expression'];return e is Map?'custom:${e['serverId']}:${e['id']}':'emoji:${d['emoji']}';}
+Future<void> addReaction(BuildContext c,DocumentReference<Map<String,dynamic>> ref,String uid)async{final selected=await pickExpression(c,reactionOnly:true);if(selected==null||!c.mounted)return;try{final data=<String,dynamic>{'at':FieldValue.serverTimestamp(),if(selected is String)'emoji':selected,if(selected is Map<String,dynamic>)'expression':selected};final own=ref.collection('reactions').doc(uid);final old=(await own.get()).data();if(old!=null&&reactionKey(old)==reactionKey(data)){await own.delete();}else{await own.set(data);}}catch(e){if(c.mounted)notice(c,e);}}
 class ReactionBar extends StatelessWidget{
  final DocumentReference<Map<String,dynamic>> ref;final String uid;const ReactionBar({super.key,required this.ref,required this.uid});
- @override Widget build(BuildContext c)=>StreamBuilder<QuerySnapshot<Map<String,dynamic>>>(stream:ref.collection('reactions').snapshots(),builder:(c,s){final counts=<String,int>{};String? mine;for(final d in s.data?.docs??[]){final e=d.data()['emoji'].toString();counts[e]=(counts[e]??0)+1;if(d.id==uid)mine=e;}return Wrap(crossAxisAlignment:WrapCrossAlignment.center,children:[for(final e in counts.entries)TextButton(onPressed:()async{try{if(mine==e.key){await ref.collection('reactions').doc(uid).delete();}else{await ref.collection('reactions').doc(uid).set({'emoji':e.key,'at':FieldValue.serverTimestamp()});}}catch(e){if(c.mounted)notice(c,e);}},child:Text('${e.key} ${e.value}',style:const TextStyle(fontSize:24))),IconButton(visualDensity:VisualDensity.compact,iconSize:18,icon:const Icon(Icons.add_reaction_outlined),onPressed:()async{final e=await showModalBottomSheet<String>(context:c,builder:(x)=>SafeArea(child:Wrap(children:[for(final e in meowEmojis)TextButton(onPressed:()=>Navigator.pop(x,e),child:Text(e,style:const TextStyle(fontSize:24)))])));if(e!=null){try{await ref.collection('reactions').doc(uid).set({'emoji':e,'at':FieldValue.serverTimestamp()});}catch(e){if(c.mounted)notice(c,e);}}})]);});
+ @override Widget build(BuildContext c)=>StreamBuilder<QuerySnapshot<Map<String,dynamic>>>(stream:ref.collection('reactions').snapshots(),builder:(c,s){final groups=<String,List<QueryDocumentSnapshot<Map<String,dynamic>>>>{};for(final d in s.data?.docs??[]){groups.putIfAbsent(reactionKey(d.data()),()=>[]).add(d);}if(groups.isEmpty)return const SizedBox.shrink();return Padding(padding:const EdgeInsets.only(top:4),child:Wrap(spacing:5,runSpacing:4,children:[for(final g in groups.values)Builder(builder:(c){final data=g.first.data();final mine=g.any((d)=>d.id==uid);return InkWell(borderRadius:BorderRadius.circular(7),onTap:()async{try{final own=ref.collection('reactions').doc(uid);if(mine){await own.delete();}else{await own.set({'at':FieldValue.serverTimestamp(),if(data['expression'] is Map)'expression':data['expression'] else 'emoji':data['emoji']});}}catch(e){if(c.mounted)notice(c,e);}},child:Container(padding:const EdgeInsets.symmetric(horizontal:7,vertical:3),decoration:BoxDecoration(color:mine?purple.withOpacity(.22):panel,borderRadius:BorderRadius.circular(7),border:Border.all(color:mine?purple:Colors.white12)),child:Row(mainAxisSize:MainAxisSize.min,children:[if(data['expression'] is Map)ExpressionImage(data:Map<String,dynamic>.from(data['expression']),message:ref.path,reaction:g.first.id,size:20)else Text(data['emoji']?.toString()??'',style:const TextStyle(fontSize:20)),const SizedBox(width:4),Text('${g.length}',style:const TextStyle(fontSize:12))])));})]));});
 }
+
+bool validMessagePath(String p)=>RegExp(r'^(dms/[\w-]+|servers/[\w-]+/channels/[\w-]+)/messages/[\w-]+$').hasMatch(p);
+String threadFromPath(String p){final x=p.split('/');return x.first=='dms'?'dm:${x[1]}':'server:${x[1]}:${x[3]}';}
+Set<String> mentionNames(String text)=>RegExp(r'(?:^|\s)@([a-zA-Z0-9_]+)').allMatches(text).map((m)=>m.group(1)!.toLowerCase()).toSet();
+String fileSizeLabel(int n)=>n>=1048576?'${(n/1048576).toStringAsFixed(1)} MiB':n>=1024?'${(n/1024).toStringAsFixed(1)} KiB':'$n B';
+class MeowNotificationBanner extends StatelessWidget {
+ final String sender,title,subtitle,preview;final VoidCallback onDismiss,onTap;
+ const MeowNotificationBanner({super.key,required this.sender,required this.title,required this.subtitle,required this.preview,required this.onDismiss,required this.onTap});
+ @override Widget build(BuildContext c)=>TweenAnimationBuilder<double>(tween:Tween(begin:0,end:1),duration:const Duration(milliseconds:220),builder:(c,v,child)=>Transform.translate(offset:Offset(0,-25*(1-v)),child:Opacity(opacity:v,child:child)),child:Dismissible(key:ValueKey('$sender$preview'),direction:DismissDirection.horizontal,onDismissed:(_)=>onDismiss(),child:Material(elevation:10,color:panel,borderRadius:BorderRadius.circular(16),child:InkWell(onTap:onTap,borderRadius:BorderRadius.circular(16),child:Padding(padding:const EdgeInsets.all(12),child:Row(children:[PrivateImage(scope:'profile',id:sender,slot:'avatar',size:44),const SizedBox(width:10),Expanded(child:Column(crossAxisAlignment:CrossAxisAlignment.start,mainAxisSize:MainAxisSize.min,children:[Text(title,style:const TextStyle(fontWeight:FontWeight.bold,color:Colors.white)),Text(subtitle,style:const TextStyle(fontSize:12,color:Colors.white70)),Text(preview,maxLines:2,overflow:TextOverflow.ellipsis,style:const TextStyle(color:Colors.white))])),IconButton(onPressed:onDismiss,icon:const Icon(Icons.close,color:Colors.white70))]))))));
+}
+class MuteButton extends StatelessWidget {
+ final String thread;const MuteButton({super.key,required this.thread});
+ @override Widget build(BuildContext c){final ref=db.collection('users').doc(myUid).collection('mutedThreads').doc(base64Url.encode(utf8.encode(thread)).replaceAll('=',''));return StreamBuilder<DocumentSnapshot<Map<String,dynamic>>>(stream:ref.snapshots(),builder:(c,s){final muted=s.data?.exists==true;return IconButton(tooltip:muted?'Ativar notificações':'Silenciar conversa',icon:Icon(muted?Icons.notifications_off:Icons.notifications_none),onPressed:()async{try{if(muted){await ref.delete();}else{await ref.set({'thread':thread});}}catch(e){if(c.mounted)notice(c,e);}});});}
+}
+class UnreadDmRail extends StatelessWidget {
+ final String uid;const UnreadDmRail({super.key,required this.uid});
+ @override Widget build(BuildContext c)=>StreamBuilder<QuerySnapshot<Map<String,dynamic>>>(stream:db.collection('dms').where('members',arrayContains:uid).snapshots(),builder:(c,s)=>Column(children:[for(final d in s.data?.docs??[])UnreadDmRailItem(key:ValueKey(d.id),uid:uid,dm:d),if(s.data?.docs.isNotEmpty==true)const Divider(indent:20,endIndent:20,height:10)]));
+}
+class UnreadDmRailItem extends StatelessWidget {
+ final String uid;final QueryDocumentSnapshot<Map<String,dynamic>> dm;const UnreadDmRailItem({super.key,required this.uid,required this.dm});
+ @override Widget build(BuildContext c){final others=List<String>.from(dm.data()['members']??[]).where((x)=>x!=uid);if(others.isEmpty)return const SizedBox.shrink();final other=others.first;return StreamBuilder<DocumentSnapshot<Map<String,dynamic>>>(stream:receiptRef('dm:${dm.id}',uid).snapshots(),builder:(c,r)=>StreamBuilder<QuerySnapshot<Map<String,dynamic>>>(stream:dm.reference.collection('messages').orderBy('createdAt',descending:true).limit(30).snapshots(),builder:(c,s){final seen=r.data?.data()?['at'];final unread=s.data?.docs.any((d){final t=d.data()['createdAt'];return d.data()['authorId']!=uid&&t is Timestamp&&(seen is! Timestamp||t.compareTo(seen)>0);})??false;if(!unread)return const SizedBox.shrink();return Padding(padding:const EdgeInsets.symmetric(vertical:4),child:IconButton(onPressed:()=>Navigator.push(c,MaterialPageRoute(builder:(_)=>DmChatPage(id:dm.id,other:other,uid:uid))),icon:Stack(clipBehavior:Clip.none,children:[PrivateImage(scope:'profile',id:other,slot:'avatar',size:48),const Positioned(bottom:0,right:0,child:Icon(Icons.circle,color:Color(0xFF39F57A),size:13))]))); }));}
+}
+class ServerMembers extends StatefulWidget {
+ final String server;const ServerMembers({super.key,required this.server});
+ @override State<ServerMembers> createState()=>_ServerMembersState();
+}
+class _ServerMembersState extends State<ServerMembers>{
+ final users=<String,Map<String,dynamic>>{};final subs=<String,StreamSubscription<DocumentSnapshot<Map<String,dynamic>>>>{};StreamSubscription<DocumentSnapshot<Map<String,dynamic>>>? serverSub;Timer? timer;
+ @override void initState(){super.initState();serverSub=db.collection('servers').doc(widget.server).snapshots().listen((s){if(!mounted)return;final ids=List<String>.from(s.data()?['members']??[]).toSet();for(final id in subs.keys.toList()){if(!ids.contains(id)){subs.remove(id)?.cancel();users.remove(id);}}for(final id in ids){users.putIfAbsent(id,()=>{});subs.putIfAbsent(id,()=>db.collection('users').doc(id).snapshots().listen((u){if(mounted)setState(()=>users[id]=u.data()??{});}));}setState((){});});timer=Timer.periodic(const Duration(seconds:15),(_){if(mounted)setState((){});});}
+ @override void dispose(){timer?.cancel();serverSub?.cancel();for(final s in subs.values){s.cancel();}super.dispose();}
+ @override Widget build(BuildContext c){final online=users.entries.where((e)=>currentPresence(e.value)!='offline').toList()..sort((a,b)=>userLabel(a.value).compareTo(userLabel(b.value)));final offline=users.entries.where((e)=>currentPresence(e.value)=='offline').toList()..sort((a,b)=>userLabel(a.value).compareTo(userLabel(b.value)));return SafeArea(child:Column(children:[ListTile(title:const Text('Membros',style:TextStyle(fontSize:20,fontWeight:FontWeight.bold)),trailing:IconButton(onPressed:()=>Navigator.pop(c),icon:const Icon(Icons.close))),Expanded(child:ListView(children:[for(final group in [online,offline])...[Padding(padding:const EdgeInsets.all(12),child:Text('${identical(group,online)?'ONLINE':'OFFLINE'} — ${group.length}',style:const TextStyle(fontSize:12,color:Colors.white70))),for(final e in group)ListTile(leading:ProfileAvatar(uid:e.key),title:Text(userLabel(e.value)),subtitle:Text('@${e.value['username']??''}'),onTap:()=>openProfile(c,e.key))]]))]));}
+}
+class FriendsPreview extends StatelessWidget {
+ final String uid;final Color background,ink;const FriendsPreview({super.key,required this.uid,required this.background,required this.ink});
+ Future<List<String>> mutual(List<QueryDocumentSnapshot<Map<String,dynamic>>> docs)async{final checks=await Future.wait(docs.map((d)=>db.collection('users').doc(d.id).collection('following').doc(uid).get()));return checks.where((d)=>d.exists).map((d)=>d.reference.parent.parent!.id).toList();}
+ @override Widget build(BuildContext c)=>StreamBuilder<QuerySnapshot<Map<String,dynamic>>>(stream:db.collection('users').doc(uid).collection('following').snapshots(),builder:(c,s)=>FutureBuilder<List<String>>(future:mutual(s.data?.docs??[]),builder:(c,f){final ids=f.data??[];final preview=ids.take(6).toList();return InkWell(borderRadius:BorderRadius.circular(14),onTap:()=>Navigator.push(c,MaterialPageRoute(builder:(_)=>uid==myUid?FriendsPage(uid:uid):RelationshipListPage(uid:uid,kind:'friends'))),child:Container(padding:const EdgeInsets.all(12),decoration:BoxDecoration(color:background,borderRadius:BorderRadius.circular(14)),child:Row(children:[Expanded(child:Column(crossAxisAlignment:CrossAxisAlignment.start,children:[Text('Amigos (${ids.length})',style:TextStyle(fontWeight:FontWeight.bold,color:ink)),if(preview.isNotEmpty)...[const SizedBox(height:8),SizedBox(height:35,width:35.0+(preview.length-1)*25.0,child:Stack(children:[for(var i=0;i<preview.length;i++)Positioned(left:i*25.0,child:PrivateImage(scope:'profile',id:preview[i],slot:'avatar',size:35))]))]])),Icon(Icons.chevron_right,color:ink)])));}));
+}
+class MeowTabs extends StatefulWidget {
+ final int index;final List<Widget> children;const MeowTabs({super.key,required this.index,required this.children});
+ @override State<MeowTabs> createState()=>_MeowTabsState();
+}
+class _MeowTabsState extends State<MeowTabs> with SingleTickerProviderStateMixin {
+ late AnimationController controller;int direction=1;
+ @override void initState(){super.initState();controller=AnimationController(vsync:this,duration:const Duration(milliseconds:200),value:1);}
+ @override void didUpdateWidget(covariant MeowTabs old){super.didUpdateWidget(old);if(old.index!=widget.index){direction=widget.index>old.index?1:-1;controller.forward(from:0);}}
+ @override void dispose(){controller.dispose();super.dispose();}
+ @override Widget build(BuildContext c)=>AnimatedBuilder(animation:controller,builder:(c,child){final v=Curves.easeOutCubic.transform(controller.value);return ClipRect(child:Transform.translate(offset:Offset(direction*(1-v)*22,0),child:Opacity(opacity:.75+.25*v,child:child)));},child:IndexedStack(index:widget.index,children:[for(var i=0;i<widget.children.length;i++)TickerMode(enabled:i==widget.index,child:widget.children[i])]));
+}
+class ChannelSlide extends StatefulWidget {
+ final bool open;final ValueChanged<bool> onChange;final Widget list,chat;const ChannelSlide({super.key,required this.open,required this.onChange,required this.list,required this.chat});
+ @override State<ChannelSlide> createState()=>_ChannelSlideState();
+}
+class _ChannelSlideState extends State<ChannelSlide> with SingleTickerProviderStateMixin {
+ late AnimationController controller;
+ @override void initState(){super.initState();controller=AnimationController(vsync:this,duration:const Duration(milliseconds:210),value:widget.open?1:0);}
+ @override void didUpdateWidget(covariant ChannelSlide old){super.didUpdateWidget(old);if(old.open!=widget.open)controller.animateTo(widget.open?1:0,curve:Curves.easeOutCubic);}
+ @override void dispose(){controller.dispose();super.dispose();}
+ void end(DragEndDetails d){final v=d.primaryVelocity??0;final open=v>350?true:v< -350?false:controller.value>.5;widget.onChange(open);controller.animateTo(open?1:0,curve:Curves.easeOutCubic);}
+ @override Widget build(BuildContext c)=>LayoutBuilder(builder:(c,b)=>AnimatedBuilder(animation:controller,builder:(c,_){final x=controller.value*b.maxWidth;return ClipRect(child:Stack(children:[Positioned.fill(child:IgnorePointer(ignoring:!widget.open,child:GestureDetector(onHorizontalDragStart:(_)=>controller.stop(),onHorizontalDragUpdate:(d)=>controller.value=(controller.value+(d.primaryDelta??0)/b.maxWidth).clamp(0.0,1.0).toDouble(),onHorizontalDragEnd:end,onHorizontalDragCancel:()=>controller.animateTo(widget.open?1:0),child:widget.list))),Positioned(left:x,width:b.maxWidth,top:0,bottom:0,child:Material(color:bg,child:IgnorePointer(ignoring:widget.open,child:widget.chat))),if(!widget.open)Positioned(left:x,top:48,bottom:0,width:18,child:GestureDetector(behavior:HitTestBehavior.translucent,onHorizontalDragStart:(_)=>controller.stop(),onHorizontalDragUpdate:(d)=>controller.value=(controller.value+(d.primaryDelta??0)/b.maxWidth).clamp(0.0,1.0).toDouble(),onHorizontalDragEnd:end,onHorizontalDragCancel:()=>controller.animateTo(0))) ]));}));
+}
+class ReplySwipe extends StatefulWidget {
+ final Widget child;final VoidCallback onReply;const ReplySwipe({super.key,required this.child,required this.onReply});
+ @override State<ReplySwipe> createState()=>_ReplySwipeState();
+}
+class _ReplySwipeState extends State<ReplySwipe>{double x=0;bool dragging=false,haptic=false;@override Widget build(BuildContext c)=>GestureDetector(onHorizontalDragStart:(_){setState(()=>dragging=true);},onHorizontalDragUpdate:(d){setState(()=>x=(x+(d.primaryDelta??0)*.65).clamp(0.0,90.0).toDouble());if(x>=55&&!haptic){haptic=true;HapticFeedback.selectionClick();}},onHorizontalDragEnd:(_){if(x>=55)widget.onReply();setState((){x=0;dragging=false;haptic=false;});},onHorizontalDragCancel:()=>setState((){x=0;dragging=false;haptic=false;}),child:Stack(alignment:Alignment.centerLeft,children:[if(x>5)Padding(padding:const EdgeInsets.only(left:8),child:Icon(Icons.reply,color:x>=55?purple:Colors.white54)),AnimatedContainer(duration:dragging?Duration.zero:const Duration(milliseconds:160),transform:Matrix4.translationValues(x,0,0),child:widget.child)]));}
+class MeowMessageText extends StatelessWidget {
+ final String text;final Map<String,Map<String,dynamic>> people;const MeowMessageText({super.key,required this.text,required this.people});
+ bool emoji(String c)=>RegExp(r'[\u{1F000}-\u{1FAFF}\u{2600}-\u{27BF}]',unicode:true).hasMatch(c);
+ @override Widget build(BuildContext c){final graphemes=text.characters.where((g)=>g.trim().isNotEmpty).toList();final only=graphemes.isNotEmpty&&graphemes.length<=5&&graphemes.every(emoji);if(only)return Text(text,style:const TextStyle(fontSize:48));final spans=<InlineSpan>[];final matcher=RegExp(r'(?<![a-zA-Z0-9_])@([a-zA-Z0-9_]+)');void plain(String t){for(final g in t.characters){spans.add(TextSpan(text:g,style:emoji(g)?const TextStyle(fontSize:26):null));}}var last=0;for(final m in matcher.allMatches(text)){plain(text.substring(last,m.start));final name=m.group(1)!.toLowerCase();final found=people.entries.where((e)=>e.value['username']==name);if(found.isNotEmpty){final id=found.first.key;spans.add(WidgetSpan(alignment:PlaceholderAlignment.middle,child:InkWell(onTap:()=>openProfile(c,id),child:Container(padding:const EdgeInsets.symmetric(horizontal:2),decoration:BoxDecoration(color:purple.withOpacity(.18),borderRadius:BorderRadius.circular(4)),child:Text(m.group(0)!,style:const TextStyle(color:Color(0xFFC4B5FD),fontWeight:FontWeight.w600))))));}else{spans.add(TextSpan(text:m.group(0),style:name=='everyone'?const TextStyle(color:Color(0xFFC4B5FD)):null));}last=m.end;}plain(text.substring(last));return Text.rich(TextSpan(children:spans));}
+}
+Future<void> saveMeowFile(BuildContext c,Uint8List bytes,String name,bool image)async{
+ if(image){await Gal.putImageBytes(bytes,name:name);if(c.mounted)notice(c,'Imagem salva na galeria.');return;}
+ final dot=name.lastIndexOf('.');final ext=dot>0?name.substring(dot+1):'';final stem=dot>0?name.substring(0,dot):name;
+ final result=await FileSaver.instance.saveAs(name:stem,bytes:bytes,ext:ext,mimeType:MimeType.other);
+ if(result!=null&&c.mounted)notice(c,'Arquivo exportado.');
+}
+class MeowImageViewer extends StatefulWidget {
+ final Uint8List bytes;final String name;const MeowImageViewer({super.key,required this.bytes,required this.name});
+ @override State<MeowImageViewer> createState()=>_MeowImageViewerState();
+}
+class _MeowImageViewerState extends State<MeowImageViewer>{final controller=TransformationController();bool saving=false;@override void dispose(){controller.dispose();super.dispose();}@override Widget build(BuildContext c)=>Scaffold(backgroundColor:Colors.black,appBar:AppBar(backgroundColor:Colors.black,title:Text(widget.name,maxLines:1,overflow:TextOverflow.ellipsis),actions:[IconButton(onPressed:saving?null:()async{setState(()=>saving=true);try{await saveMeowFile(c,widget.bytes,widget.name,true);}catch(e){if(c.mounted)notice(c,e);}finally{if(mounted)setState(()=>saving=false);}},icon:const Icon(Icons.download))]),body:Center(child:GestureDetector(onDoubleTap:()=>setState(()=>controller.value=controller.value.getMaxScaleOnAxis()>1?Matrix4.identity():(Matrix4.identity()..scale(2.0))),child:InteractiveViewer(transformationController:controller,minScale:1,maxScale:5,child:Image.memory(widget.bytes,fit:BoxFit.contain,gaplessPlayback:true)))));}
+// Crop the original decoded pixels using a fixed frame and user-controlled transform.
+class MeowCropPage extends StatefulWidget {
+ final Uint8List bytes;final double aspect;final bool circle;const MeowCropPage({super.key,required this.bytes,required this.aspect,required this.circle});
+ @override State<MeowCropPage> createState()=>_MeowCropPageState();
+}
+class _MeowCropPageState extends State<MeowCropPage>{
+ ui.Image? image;double zoom=1,startZoom=1;Offset offset=Offset.zero,startOffset=Offset.zero,startPoint=Offset.zero;int turns=0;bool busy=false;Size frame=Size.zero;
+ @override void initState(){super.initState();decode();}
+ Future<void> decode()async{try{final codec=await ui.instantiateImageCodec(widget.bytes);final f=await codec.getNextFrame();codec.dispose();if(mounted)setState(()=>image=f.image);else f.image.dispose();}catch(e){if(mounted)notice(context,'Não foi possível editar esta imagem.');}}
+ @override void dispose(){image?.dispose();super.dispose();}
+ double baseScale(){final i=image!;final w=turns.isOdd?i.height:i.width;final h=turns.isOdd?i.width:i.height;return max(frame.width/w,frame.height/h);}
+ Offset bounded(Offset p){final i=image!;final scale=baseScale()*zoom;final w=(turns.isOdd?i.height:i.width)*scale;final h=(turns.isOdd?i.width:i.height)*scale;final x=max(0.0,(w-frame.width)/2);final y=max(0.0,(h-frame.height)/2);return Offset(p.dx.clamp(-x,x).toDouble(),p.dy.clamp(-y,y).toDouble());}
+ Future<void> confirm()async{if(image==null||busy||frame.isEmpty)return;setState(()=>busy=true);try{final rec=ui.PictureRecorder();final canvas=Canvas(rec);final outScale=min(2048.0/max(frame.width,frame.height),1/(baseScale()*zoom));final w=max(1,(frame.width*outScale).round());final h=max(1,(frame.height*outScale).round());canvas.scale(w/frame.width,h/frame.height);paintCrop(canvas,frame,image!,turns,baseScale()*zoom,offset);final pic=rec.endRecording();final output=await pic.toImage(w,h);final data=await output.toByteData(format:ui.ImageByteFormat.png);output.dispose();pic.dispose();if(data==null)throw Exception('Recorte indisponível');if(mounted)Navigator.pop(context,data.buffer.asUint8List(data.offsetInBytes,data.lengthInBytes));}catch(e){if(mounted)notice(context,e);}finally{if(mounted)setState(()=>busy=false);}}
+ @override Widget build(BuildContext c)=>Scaffold(appBar:AppBar(title:const Text('Ajustar imagem'),actions:[TextButton(onPressed:busy?null:()=>Navigator.pop(c,widget.bytes),child:const Text('Pular')),IconButton(tooltip:'Confirmar recorte',onPressed:busy||image==null?null:confirm,icon:const Icon(Icons.check))]),body:Column(children:[Expanded(child:Center(child:LayoutBuilder(builder:(c,b){if(image==null)return const Text('Carregando imagem…');final w=min(b.maxWidth-24,(b.maxHeight-24)*widget.aspect);frame=Size(max(1.0,w),max(1.0,w/widget.aspect));return GestureDetector(onScaleStart:(d){startZoom=zoom;startOffset=offset;startPoint=d.localFocalPoint;},onScaleUpdate:(d)=>setState((){zoom=(startZoom*d.scale).clamp(1.0,6.0).toDouble();offset=bounded(startOffset+d.localFocalPoint-startPoint);}),child:ClipRRect(borderRadius:BorderRadius.circular(widget.circle?frame.width/2:8),child:CustomPaint(size:frame,painter:CropPainter(image!,turns,baseScale()*zoom,offset))));}))),const Text('Arraste e use dois dedos para aproximar'),Slider(value:zoom,min:1,max:6,onChanged:image==null?null:(v)=>setState((){zoom=v;offset=bounded(offset);})),SafeArea(top:false,child:Row(mainAxisAlignment:MainAxisAlignment.center,children:[IconButton(tooltip:'Girar',onPressed:busy||image==null?null:()=>setState((){turns=(turns+1)%4;zoom=1;offset=Offset.zero;}),icon:const Icon(Icons.rotate_right)),TextButton(onPressed:busy?null:()=>Navigator.pop(c),child:const Text('Cancelar')),FilledButton(onPressed:busy||image==null?null:confirm,child:const Text('Confirmar'))]))]));
+}
+void paintCrop(Canvas c,Size size,ui.Image image,int turns,double scale,Offset offset){c.save();c.clipRect(Offset.zero&size);c.translate(size.width/2+offset.dx,size.height/2+offset.dy);c.rotate(turns*pi/2);c.scale(scale);c.drawImage(image,Offset(-image.width/2,-image.height/2),Paint()..filterQuality=FilterQuality.high);c.restore();}
+class CropPainter extends CustomPainter{final ui.Image image;final int turns;final double scale;final Offset offset;CropPainter(this.image,this.turns,this.scale,this.offset);@override void paint(Canvas canvas,Size size)=>paintCrop(canvas,size,image,turns,scale,offset);@override bool shouldRepaint(covariant CropPainter old)=>old.image!=image||old.turns!=turns||old.scale!=scale||old.offset!=offset;}
