@@ -3,8 +3,8 @@ import 'dart:convert';
 import 'dart:math';
 import 'dart:typed_data';
 import 'package:cloud_firestore/cloud_firestore.dart';
-import 'package:file_selector/file_selector.dart' as files;
 import 'package:flutter/cupertino.dart';
+import 'package:file_selector/file_selector.dart' as files;
 import 'package:firebase_auth/firebase_auth.dart';
 import 'package:firebase_core/firebase_core.dart';
 import 'package:firebase_messaging/firebase_messaging.dart';
@@ -264,7 +264,6 @@ class _PrivateImageState extends State<PrivateImage> {
   Future<Uint8List?> fetch() => PrivateMediaCache.get(widget.url);
   void refresh(){
     if(changedImage.value==widget.url&&mounted){
-      PrivateMediaCache.invalidate(widget.url);
       setState(()=>future=fetch());
     }
 }
@@ -329,7 +328,7 @@ class _ChangeImageState extends State<ChangeImage> {
       extensions:['jpg', 'jpeg', 'png', 'webp', 'gif']
 )]);
       if(f==null)return;
-      final limit=widget.slot=='banner'?bannerLimit:avatarLimit;
+      final limit=widget.slot=='avatar'?avatarLimit:bannerLimit;
       if(await f.length()>limit)throw Exception('Limite de ${limit~/1048576} MiB.');
         // Preserva o tipo original do arquivo (inclusive GIF animado).
       final extension = f.name.split('.').last.toLowerCase();
@@ -347,6 +346,8 @@ class _ChangeImageState extends State<ChangeImage> {
 ).timeout(const Duration(seconds:120));
       if(r.statusCode!=200)throw Exception('Upload falhou: ${r.statusCode} ${r.body}');
       if(widget.scope=='profile'&&widget.slot=='banner')await db.collection('users').doc(widget.id).update({'bannerHidden':false});
+      if(widget.scope=='profile'&&widget.slot=='background')await db.collection('users').doc(widget.id).update({'backgroundEnabled':true});
+      PrivateMediaCache.invalidate(mediaUrl(widget.scope,widget.id,widget.slot));
       changedImage.value=null;
       changedImage.value=mediaUrl(widget.scope, widget.id, widget.slot);
       if(mounted)notice(context, 'Imagem atualizada!');
@@ -408,13 +409,14 @@ class ProfileAvatar extends StatelessWidget {
 )]
 ));
 }
-void openProfile(BuildContext context, String uid){
+Future<void> openProfile(BuildContext context, String uid) async {
   if(uid.isEmpty)return;
-    showModalBottomSheet<void>(context:context, isScrollControlled:true, useSafeArea:true, backgroundColor:panel,
+    final action=await showModalBottomSheet<String>(context:context, isScrollControlled:true, useSafeArea:true, backgroundColor:panel,
       builder:(c)=>DraggableScrollableSheet(expand:false, initialChildSize:.82, maxChildSize:.96, builder:(c,
     scroll
 )=>ProfilePage(uid:uid, expanded:true, scrollController:scroll))
 );
+ if(action=='dm' && context.mounted) await openDm(context,uid);
 }
 
 
@@ -509,10 +511,10 @@ class ProfilePage extends StatelessWidget {
     final username=d['username']?.toString()??'meow';
     final own=uid==FirebaseAuth.instance.currentUser?.uid;
     final p=d['presence']?.toString()??'offline';
-      return Container(decoration:d['bannerHidden']==true?BoxDecoration(gradient:profileGradient(d)):null,child:ListView(controller:scrollController, children:[Stack(clipBehavior:Clip.none, children:[ProfileBanner(uid:uid,data:d), Positioned(left:18, bottom:-44, child:Container(padding:const EdgeInsets.all(4), decoration:BoxDecoration(color:d['bannerHidden']==true?Colors.transparent:panel,
+      return Container(decoration:BoxDecoration(gradient:profileGradient(d)),child:Stack(children:[if(d['backgroundEnabled']==true) Positioned.fill(top:d['bannerHidden']==true?0:180,child:ProfileBackground(uid:uid)),ListView(controller:scrollController, children:[Stack(clipBehavior:Clip.none, children:[ProfileBanner(uid:uid,data:d), Positioned(left:18, bottom:-44, child:Container(padding:const EdgeInsets.all(4), decoration:BoxDecoration(color:d['bannerHidden']==true?Colors.transparent:panel,
     shape:BoxShape.circle
 ), child:PrivateImage(scope:'profile', id:uid, slot:'avatar', size:88)))]), const SizedBox(height:55),
-        Container(decoration:d['bannerHidden']==true?null:BoxDecoration(gradient:profileGradient(d)),padding:const EdgeInsets.all(18), child:Column(crossAxisAlignment:CrossAxisAlignment.start,
+        Container(padding:const EdgeInsets.all(18), child:Column(crossAxisAlignment:CrossAxisAlignment.start,
           children:[Text(d['displayName']?.toString()??username, style:const TextStyle(fontSize:24, fontWeight:FontWeight.bold)),
           Text('@$username', style:const TextStyle(color:Colors.white60)), if((d['pronouns']?.toString()??'').isNotEmpty)Text(d['pronouns'].toString(),style:const TextStyle(color:Colors.white70)), const SizedBox(height:12), RelationshipCounters(uid:uid), if(!own)FollowButton(target:uid), 
             const SizedBox(height:8), Row(children:[Icon(Icons.circle, size:12, color:presenceColor(own?p:(p=='invisible'?'offline':p))),
@@ -526,15 +528,12 @@ class ProfilePage extends StatelessWidget {
             icon:const Icon(Icons.edit), label:const Text('Editar perfil e status')
 )
 ), if(!own)SizedBox(width:double.infinity, child:FilledButton.icon(onPressed:()async{
-            final navigator = Navigator.of(c);
-            final safeContext = navigator.context;
-            if (expanded) navigator.pop();
-            await openDm(safeContext, uid);
+            if(expanded){Navigator.pop(c,'dm');}else{await openDm(c,uid);}
 }
 , icon:const Icon(Icons.message), label:const Text('Enviar mensagem'))), if(own&&!expanded)TextButton.icon(onPressed:()=>Navigator.push(c,MaterialPageRoute(builder:(_)=>const AppSettingsPage())),icon:const Icon(Icons.settings),label:const Text('Configurações do aplicativo')), 
 ]
 ))
-]));
+])]));
 }
 );
 }
@@ -630,9 +629,9 @@ class _EditProfilePageState extends State<EditProfilePage> {
           custom.text=d['customStatus']?.toString()??'';
           presence=presenceLabels.containsKey(d['presence'])?d['presence'].toString():'online';
 }
-          return ListView(children:[Stack(clipBehavior:Clip.none, children:[ProfileBanner(uid:widget.uid,data:d), Positioned(right:10,top:10,child:Row(mainAxisSize:MainAxisSize.min,children:[ChangeImage('profile',widget.uid,'banner','Trocar banner',iconOnly:true),IconButton.filledTonal(tooltip:'Remover banner',onPressed:()async{await db.collection('users').doc(widget.uid).update({'bannerHidden':true});},icon:const Icon(Icons.hide_image))])), Positioned(left:18, bottom:-45, child:Stack(alignment:Alignment.bottomRight, children:[PrivateImage(scope:'profile',
+          return ListView(children:[Stack(clipBehavior:Clip.none, children:[const SizedBox(height:235,width:double.infinity),ProfileBanner(uid:widget.uid,data:d), Positioned(right:10,top:10,child:Row(mainAxisSize:MainAxisSize.min,children:[ChangeImage('profile',widget.uid,'banner','Trocar banner',iconOnly:true),IconButton.filledTonal(tooltip:'Remover banner',onPressed:()async{await db.collection('users').doc(widget.uid).update({'bannerHidden':true});},icon:const Icon(Icons.hide_image))])), Positioned(left:18, bottom:10, child:Stack(alignment:Alignment.bottomRight, children:[PrivateImage(scope:'profile',
         id:widget.uid, slot:'avatar', size:90
-), ChangeImage('profile', widget.uid, 'avatar', 'Trocar foto', iconOnly:true)]))]), const SizedBox(height:64),
+), ChangeImage('profile', widget.uid, 'avatar', 'Trocar foto', iconOnly:true)]))]), const SizedBox(height:8),
             Padding(padding:const EdgeInsets.all(18), child:Column(children:[TextField(controller:name, maxLength:15,
           decoration:const InputDecoration(labelText:'Nome de exibição')
 ), const SizedBox(height:10), TextField(controller:pronouns, maxLength:40, decoration:const InputDecoration(labelText:'Pronomes')),
@@ -643,7 +642,7 @@ class _EditProfilePageState extends State<EditProfilePage> {
               onChanged:(v){
                 if(v!=null)setState(()=>presence=v);
 }
-), const SizedBox(height:12), ProfileThemeEditor(uid:widget.uid),const SizedBox(height:20), SizedBox(width:double.infinity, child:FilledButton(onPressed:busy?null:save,
+), const SizedBox(height:12), ProfileThemeEditor(uid:widget.uid),ChangeImage('profile',widget.uid,'background','Trocar fundo da bio'),if(d['backgroundEnabled']==true) TextButton(onPressed:()async{try{await db.collection('users').doc(widget.uid).update({'backgroundEnabled':false});}catch(e){if(c.mounted)notice(c,e);}},child:const Text('Remover fundo')),const SizedBox(height:20), SizedBox(width:double.infinity, child:FilledButton(onPressed:busy?null:save,
             child:Text(busy?'Salvando...':'Salvar alterações')
 )),
 ]))
@@ -694,7 +693,7 @@ class ServerSettingsPage extends StatelessWidget {
           return ListView(children:[PrivateImage(scope:'server', id:id, slot:'banner', size:160), const SizedBox(height:16),
             Center(child:PrivateImage(scope:'server', id:id, slot:'avatar', size:88)), Padding(padding:const EdgeInsets.all(18),
               child:Column(children:[Text(d['name']?.toString()??'Servidor', style:const TextStyle(fontSize:22)),
-                const SizedBox(height:18), if(owner) OutlinedButton.icon(icon:const Icon(Icons.edit),label:const Text('Renomear servidor'),onPressed:()async{final v=await showTextPrompt(c,'Nome do servidor',d['name']?.toString()??'');if(v!=null&&v.isNotEmpty)await db.collection('servers').doc(id).update({'name':v});}), const SizedBox(height:12), if(owner) ListTile(title:const Text('Organizar categorias e canais'),trailing:const Icon(Icons.chevron_right),onTap:()=>Navigator.push(c,MaterialPageRoute(builder:(_)=>ServerOrganizationPage(id:id)))), if(owner) ChangeImage('server', id, 'avatar', 'Trocar ícone (8 MiB)'),if(owner) ChangeImage('server',id,'banner','Trocar banner (15 MiB)'),if(owner) OutlinedButton.icon(onPressed:()=>confirmServerDelete(c,id),icon:const Icon(Icons.delete),label:const Text('Excluir servidor')),if(!owner)OutlinedButton.icon(onPressed:()=>confirmLeaveServer(c,id),icon:const Icon(Icons.logout),label:const Text('Sair do servidor'))
+                const SizedBox(height:18), if(owner) OutlinedButton.icon(icon:const Icon(Icons.edit),label:const Text('Renomear servidor'),onPressed:()async{final v=await showTextPrompt(c,'Nome do servidor',d['name']?.toString()??'');if(v!=null&&v.isNotEmpty)await db.collection('servers').doc(id).update({'name':v});}), const SizedBox(height:12), if(owner) ListTile(title:const Text('Organizar categorias e canais'),trailing:const Icon(Icons.chevron_right),onTap:()=>Navigator.push(c,MaterialPageRoute(builder:(_)=>ServerOrganizationPage(id:id)))), if(owner||(d['adminIds'] is List&&(d['adminIds'] as List).contains(myUid)))ListTile(title:const Text('Emojis e figurinhas'),onTap:()=>Navigator.push(c,MaterialPageRoute(builder:(_)=>ExpressionSettings(server:id)))),if(owner) ChangeImage('server', id, 'avatar', 'Trocar ícone (8 MiB)'),if(owner) ChangeImage('server',id,'banner','Trocar banner (15 MiB)'),if(owner) OutlinedButton.icon(onPressed:()=>confirmServerDelete(c,id),icon:const Icon(Icons.delete),label:const Text('Excluir servidor')),if(!owner)OutlinedButton.icon(onPressed:()=>confirmLeaveServer(c,id),icon:const Icon(Icons.logout),label:const Text('Sair do servidor'))
 ])
 )
 ]);
@@ -944,7 +943,7 @@ class _SocialHomeState extends State<SocialHome> with WidgetsBindingObserver {
       if(mounted)notice(context, e);
 }
 }
-    Widget rail()=>SizedBox(width:68, child:ColoredBox(color:const Color(0xFF0B0C11), child:Column(children:[IconButton(onPressed:createServer,
+    Widget rail()=>SizedBox(width:76, child:ColoredBox(color:const Color(0xFF0B0C11), child:Column(children:[IconButton(onPressed:createServer,
   icon:const Icon(Icons.add_circle, color:purple)
 ), IconButton(onPressed:joinInvite, icon:const Icon(Icons.group_add)), Expanded(child:StreamBuilder<QuerySnapshot<Map<String,
       dynamic>>>(stream:db.collection('servers').where('members', arrayContains:myUid).snapshots(), builder:(c,
@@ -955,7 +954,7 @@ class _SocialHomeState extends State<SocialHome> with WidgetsBindingObserver {
         channelId=null;
         showingChannels=true;
 }
-), icon:Stack(clipBehavior:Clip.none,children:[PrivateImage(scope:'server', id:d.id, slot:'avatar', size:36),Positioned(right:-2,bottom:-2,child:ServerUnreadDot(serverId:d.id,uid:myUid))]))
+), icon:Stack(clipBehavior:Clip.none,children:[PrivateImage(scope:'server', id:d.id, slot:'avatar', size:48),Positioned(right:-2,bottom:-2,child:ServerUnreadDot(serverId:d.id,uid:myUid))]))
 )]))
 )])));
   Widget channelList(List<QueryDocumentSnapshot<Map<String, dynamic>>> docs){
@@ -998,7 +997,7 @@ class _SocialHomeState extends State<SocialHome> with WidgetsBindingObserver {
           if(v>250&&!showingChannels)setState(()=>showingChannels=true);
           if(v< -250&&showingChannels&&active!=null)setState(()=>showingChannels=false);
 }
-, child:AnimatedSwitcher(duration:const Duration(milliseconds:240),switchInCurve:Curves.easeOutCubic,switchOutCurve:Curves.easeInCubic,transitionBuilder:(child,animation)=>FadeTransition(opacity:animation,child:child), child:showingChannels?Row(key:const ValueKey('list'),
+, child:AnimatedSwitcher(duration:const Duration(milliseconds:240),switchInCurve:Curves.easeOutCubic,switchOutCurve:Curves.easeInCubic,transitionBuilder:(child,animation)=>FadeTransition(opacity:animation,child:SlideTransition(position:Tween<Offset>(begin:const Offset(.12,0),end:Offset.zero).animate(animation),child:child)), child:showingChannels?Row(key:const ValueKey('list'),
             children:[rail(), Expanded(child:ColoredBox(color:panel, child:Column(children:[ServerHeader(id:serverId!),
               Row(children:[const Expanded(child:Padding(padding:EdgeInsets.all(12), child:Text('Canais', style:TextStyle(fontSize:18)))),
                 IconButton(onPressed:createChannel, icon:const Icon(Icons.add)), IconButton(onPressed:createInvite,
@@ -1051,8 +1050,7 @@ Future<void> openDm(BuildContext context, String other) async {
     final otherUser = await db.collection('users').doc(other).get();
     if (!otherUser.exists) throw Exception('Usuario nao encontrado.');
     final dm = db.collection('dms').doc(id);
-    final existingDm = await dm.get();
-    if (!existingDm.exists) await dm.set({'members': [me, other]});
+    await db.runTransaction((tx) async {final existingDm=await tx.get(dm);if(!existingDm.exists)tx.set(dm,{'members':[me,other]..sort()});});
     final follows = await db.collection('users').doc(me).collection('following').doc(other).get();
     final followed = await db.collection('users').doc(other).collection('following').doc(me).get();
     if (!(follows.exists && followed.exists)) {
@@ -1182,10 +1180,17 @@ class _MessageThreadState extends State<MessageThread> {
   final input=TextEditingController();
   bool sending=false;
   Timestamp? lastMarkedMessage;
+  Timer? typingTimer;
+  DateTime? lastTyping;
+  DocumentReference<Map<String,dynamic>> get typingRef=>widget.collection.parent!.collection('typing').doc(widget.uid);
+  Future<void> stopTyping() async {typingTimer?.cancel();lastTyping=null;try{await typingRef.delete();}catch(_){} }
+  void typingChanged(String value){if(value.trim().isEmpty){stopTyping();return;}final now=DateTime.now();if(lastTyping==null||now.difference(lastTyping!).inMilliseconds>1500){lastTyping=now;typingRef.set({'at':FieldValue.serverTimestamp()}).catchError((Object _){});}typingTimer?.cancel();typingTimer=Timer(const Duration(seconds:3),stopTyping);}
+
   String? replyId,
   replyText,
   replyAuthor;
   @override void dispose(){
+    stopTyping();
     input.dispose();
     super.dispose();
 }
@@ -1200,11 +1205,11 @@ class _MessageThreadState extends State<MessageThread> {
 }
   Future<void> send({
     Map<String,
-    dynamic>? attachment
+    dynamic>? attachment, Map<String,dynamic>? expression
 }
 )async{
     final text=input.text.trim();
-    if((text.isEmpty&&attachment==null)||sending)return;
+    if((text.isEmpty&&attachment==null&&expression==null)||sending)return;
     setState(()=>sending=true);
     try{
       final u=(await db.collection('users').doc(widget.uid).get()).data()??{
@@ -1227,8 +1232,10 @@ class _MessageThreadState extends State<MessageThread> {
 );
 }
       if(attachment!=null)data['attachment']=attachment;
+      if(expression!=null)data['expression']=expression;
       await widget.collection.add(data);
       input.clear();
+      await stopTyping();
       if(mounted)setState((){
         replyId=null;
         replyText=null;
@@ -1428,7 +1435,7 @@ class _MessageThreadState extends State<MessageThread> {
               child:Row(crossAxisAlignment:CrossAxisAlignment.start, children:[grouped?const SizedBox(width:40):ProfileAvatar(uid:author), const SizedBox(width:10),
                 Expanded(child:Column(crossAxisAlignment:CrossAxisAlignment.start, children:[if(!grouped)Row(children:[Flexible(child:InkWell(onTap:()=>openProfile(c,author),child:Text(d['author']?.toString()??'Usuário',style:const TextStyle(fontWeight:FontWeight.bold,color:purple)))),const SizedBox(width:8),Text(when,style:const TextStyle(fontSize:11,color:Colors.white54))]), if(d['replyToId']!=null)Text('↳ ${d['replyAuthor']??''}: ${d['replyText']??''}', maxLines:2,
               overflow:TextOverflow.ellipsis, style:const TextStyle(color:Colors.white60, fontSize:12)
-), if((d['text']?.toString()??'').isNotEmpty)Text(d['text'].toString()), if(attachment is Map&&attachment['id'] is String)AttachmentView(attachment:attachment),
+), if((d['text']?.toString()??'').isNotEmpty)Text(d['text'].toString()), if(attachment is Map&&attachment['id'] is String)AttachmentView(attachment:attachment),if(d['expression'] is Map) ExpressionImage(data:Map<String,dynamic>.from(d['expression'] as Map),message:doc.reference.path),ReactionBar(ref:doc.reference,uid:widget.uid),
               if(d['editedAt']!=null)const Text('(editada)', style:TextStyle(fontSize:11, color:Colors.white54))
 ]))
 ])
@@ -1437,7 +1444,7 @@ class _MessageThreadState extends State<MessageThread> {
 );
 }
 )
-), if(replyId!=null)ListTile(dense:true, title:Text('Respondendo a $replyAuthor: $replyText', maxLines:1,
+), TypingLabel(collection:widget.collection.parent!.collection('typing'),uid:widget.uid), if(replyId!=null)ListTile(dense:true, title:Text('Respondendo a $replyAuthor: $replyText', maxLines:1,
   overflow:TextOverflow.ellipsis
 ), trailing:IconButton(icon:const Icon(Icons.close), onPressed:()=>setState((){
     replyId=null;
@@ -1448,7 +1455,7 @@ class _MessageThreadState extends State<MessageThread> {
   onPressed:(sending||uploading)?null:attach, icon:Icon(uploading?Icons.hourglass_top:Icons.add_circle_outline)
 ), Expanded(child:TextField(controller:input, maxLength:2000, maxLines:4, minLines:1, decoration:const InputDecoration(hintText:'Mensagem',
   counterText:''
-), onSubmitted:(_)=>send())), IconButton(onPressed:sending?null:()=>send(), icon:const Icon(Icons.send,
+), onChanged:typingChanged,onSubmitted:(_)=>send())), IconButton(tooltip:'Emojis e figurinhas',icon:const Icon(Icons.emoji_emotions_outlined),onPressed:()async{final v=await pickExpression(context);if(!mounted||v==null)return;if(v is String){input.text+=v;typingChanged(input.text);}else if(v is Map<String,dynamic>){await send(expression:v);}}), IconButton(onPressed:sending?null:()=>send(), icon:const Icon(Icons.send,
   color:purple
 ))])))]);
 }
@@ -1831,4 +1838,38 @@ Future<void> confirmServerDelete(BuildContext context,String id)async{
  final ok=await showDialog<bool>(context:context,builder:(c)=>AlertDialog(title:const Text('Excluir servidor?'),content:const Text('Esta ação é permanente e apagará canais e mensagens quando o backend concluir a exclusão.'),actions:[TextButton(onPressed:()=>Navigator.pop(c,false),child:const Text('Cancelar')),FilledButton(onPressed:()=>Navigator.pop(c,true),child:const Text('Excluir'))]));
  if(ok!=true)return;
  try{await db.collection('serverDeletionRequests').doc(id).set({'ownerId':myUid,'requestedAt':FieldValue.serverTimestamp()});if(context.mounted)notice(context,'Exclusão solicitada. Aguardando processamento do servidor.');}catch(e){if(context.mounted)notice(context,e);}
+}
+
+class ProfileBackground extends StatelessWidget {
+ final String uid; const ProfileBackground({super.key,required this.uid});
+ @override Widget build(BuildContext c)=>FutureBuilder<Uint8List?>(future:PrivateMediaCache.get(mediaUrl('profile',uid,'background')),builder:(c,s)=>s.data==null?const SizedBox.shrink():Stack(fit:StackFit.expand,children:[Image.memory(s.data!,fit:BoxFit.cover,errorBuilder:(c,e,st)=>const SizedBox.shrink()),const ColoredBox(color:Color(0x99000000))]));
+}
+class TypingLabel extends StatefulWidget {
+ final CollectionReference<Map<String,dynamic>> collection;final String uid;
+ const TypingLabel({super.key,required this.collection,required this.uid});
+ @override State<TypingLabel> createState()=>_TypingLabelState();
+}
+class _TypingLabelState extends State<TypingLabel>{
+ Timer? timer;late Stream<QuerySnapshot<Map<String,dynamic>>> stream;
+ @override void initState(){super.initState();stream=widget.collection.snapshots();timer=Timer.periodic(const Duration(milliseconds:700),(_){if(mounted)setState((){});});}
+ @override void dispose(){timer?.cancel();super.dispose();}
+ @override Widget build(BuildContext c)=>StreamBuilder<QuerySnapshot<Map<String,dynamic>>>(stream:stream,builder:(c,s){final ids=s.data?.docs.where((d){final t=d.data()['at'];return d.id!=widget.uid&&t is Timestamp&&DateTime.now().difference(t.toDate()).inMilliseconds<4000;}).map((d)=>d.id).toList()??[];return SizedBox(height:24,child:ids.isEmpty?null:Row(children:[const SizedBox(width:12),if(ids.length==1)Flexible(child:UserDisplayName(uid:ids.first))else Text('${ids.length} pessoas'),Text(ids.length==1?' está digitando...':' estão digitando...')]));});
+}
+const meowEmojis=['😀','😂','😍','😭','😎','🥰','😡','🤔','😴','😺','❤️','💜','👍','👎','🔥','🎉','✨','💀','👀','🙏','🐱','🐶','🌸','🍕','🎮','💯'];
+Uri expressionUrl(Map<String,dynamic> d,{String? message})=>Uri.https(imageHost,'/functions/v1/meow-expressoes',{'server':d['serverId'].toString(),'id':d['id'].toString(),'kind':d['kind'].toString(),if(message!=null)'message':message});
+class ExpressionImage extends StatelessWidget{
+ final Map<String,dynamic> data;final String? message;final double? size;
+ const ExpressionImage({super.key,required this.data,this.message,this.size});
+ @override Widget build(BuildContext c){final n=size??(data['kind']=='sticker'?144.0:48.0);return SizedBox(width:n,height:n,child:FutureBuilder<Uint8List?>(future:PrivateMediaCache.get(expressionUrl(data,message:message)),builder:(c,s)=>s.data==null?const Icon(Icons.image_outlined):Image.memory(s.data!,fit:BoxFit.contain,errorBuilder:(c,e,st)=>const Icon(Icons.broken_image))));}
+}
+Future<Object?> pickExpression(BuildContext context)=>showModalBottomSheet<Object>(context:context,isScrollControlled:true,builder:(c)=>SafeArea(child:SizedBox(height:420,child:DefaultTabController(length:3,child:Column(children:[const TabBar(tabs:[Tab(text:'Emojis'),Tab(text:'Personalizados'),Tab(text:'Figurinhas')]),Expanded(child:TabBarView(children:[GridView.count(crossAxisCount:6,children:[for(final e in meowEmojis)TextButton(onPressed:()=>Navigator.pop(c,e),child:Text(e,style:const TextStyle(fontSize:26)))]),for(final kind in ['emoji','sticker'])StreamBuilder<QuerySnapshot<Map<String,dynamic>>>(stream:db.collection('servers').where('members',arrayContains:myUid).snapshots(),builder:(c,s)=>ListView(children:[for(final server in s.data?.docs??[])Column(crossAxisAlignment:CrossAxisAlignment.start,children:[ListTile(title:Text(server.data()['name']?.toString()??'Servidor')),StreamBuilder<QuerySnapshot<Map<String,dynamic>>>(stream:server.reference.collection('expressions').where('active',isEqualTo:true).snapshots(),builder:(c,x)=>Wrap(children:[for(final item in x.data?.docs??[])if(item.data()['kind']==kind)InkWell(onTap:()=>Navigator.pop(c,<String,dynamic>{'serverId':server.id,'id':item.id,'kind':kind}),child:Padding(padding:const EdgeInsets.all(6),child:ExpressionImage(data:item.data(),size:kind=='emoji'?48:88)))]))])]))]))])))));
+class ExpressionSettings extends StatelessWidget{
+ final String server;const ExpressionSettings({super.key,required this.server});
+ CollectionReference<Map<String,dynamic>> get catalog=>db.collection('servers').doc(server).collection('expressions');
+ Future<void> add(BuildContext c,String kind)async{try{final name=await showTextPrompt(c,'Nome','');if(name==null||name.length<2||name.length>32||!c.mounted)return;final f=await files.openFile(acceptedTypeGroups:const [files.XTypeGroup(label:'Imagens',extensions:['png','jpg','jpeg','gif','webp'])]);if(f==null)return;if(await f.length()>5000000)throw Exception('Limite de 5 MB.');final uri=Uri.https(imageHost,'/functions/v1/meow-expressoes',{'server':server,'kind':kind,'name':name});final response=await http.post(uri,headers:await authHeaders(),body:await f.readAsBytes()).timeout(const Duration(seconds:120));if(response.statusCode!=201)throw Exception(response.body);final d=Map<String,dynamic>.from(jsonDecode(response.body) as Map);await catalog.doc(d['id'].toString()).set({...d,'active':true,'createdAt':FieldValue.serverTimestamp()});if(c.mounted)notice(c,'Imagem adicionada.');}catch(e){if(c.mounted)notice(c,e);}}
+ @override Widget build(BuildContext c)=>Scaffold(appBar:AppBar(title:const Text('Emojis e figurinhas')),body:Column(children:[Wrap(children:[TextButton(onPressed:()=>add(c,'emoji'),child:const Text('Adicionar emoji')),TextButton(onPressed:()=>add(c,'sticker'),child:const Text('Adicionar figurinha'))]),Expanded(child:StreamBuilder<QuerySnapshot<Map<String,dynamic>>>(stream:catalog.where('active',isEqualTo:true).snapshots(),builder:(c,s)=>ListView(children:[for(final d in s.data?.docs??[])ListTile(leading:ExpressionImage(data:d.data(),size:48),title:Text(d.data()['name'].toString()),trailing:PopupMenuButton<String>(onSelected:(v)async{try{if(v=='delete'){await d.reference.update({'active':false});}else{final name=await showTextPrompt(c,'Renomear',d.data()['name'].toString());if(name!=null&&name.length>=2&&name.length<=32)await d.reference.update({'name':name});}}catch(e){if(c.mounted)notice(c,e);}},itemBuilder:(_)=>const [PopupMenuItem(value:'rename',child:Text('Renomear')),PopupMenuItem(value:'delete',child:Text('Remover'))]))])))]));
+}
+class ReactionBar extends StatelessWidget{
+ final DocumentReference<Map<String,dynamic>> ref;final String uid;const ReactionBar({super.key,required this.ref,required this.uid});
+ @override Widget build(BuildContext c)=>StreamBuilder<QuerySnapshot<Map<String,dynamic>>>(stream:ref.collection('reactions').snapshots(),builder:(c,s){final counts=<String,int>{};String? mine;for(final d in s.data?.docs??[]){final e=d.data()['emoji'].toString();counts[e]=(counts[e]??0)+1;if(d.id==uid)mine=e;}return Wrap(crossAxisAlignment:WrapCrossAlignment.center,children:[for(final e in counts.entries)TextButton(onPressed:()async{try{if(mine==e.key){await ref.collection('reactions').doc(uid).delete();}else{await ref.collection('reactions').doc(uid).set({'emoji':e.key,'at':FieldValue.serverTimestamp()});}}catch(e){if(c.mounted)notice(c,e);}},child:Text('${e.key} ${e.value}',style:const TextStyle(fontSize:24))),IconButton(visualDensity:VisualDensity.compact,iconSize:18,icon:const Icon(Icons.add_reaction_outlined),onPressed:()async{final e=await showModalBottomSheet<String>(context:c,builder:(x)=>SafeArea(child:Wrap(children:[for(final e in meowEmojis)TextButton(onPressed:()=>Navigator.pop(x,e),child:Text(e,style:const TextStyle(fontSize:24)))])));if(e!=null){try{await ref.collection('reactions').doc(uid).set({'emoji':e,'at':FieldValue.serverTimestamp()});}catch(e){if(c.mounted)notice(c,e);}}})]);});
 }
