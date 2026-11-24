@@ -1,7 +1,7 @@
 name: meow
 description: Meow - chat privado para amigos
 publish_to: 'none'
-version: 0.6.0+6
+version: 0.7.0+7
 environment:
   sdk: '>=3.4.0 <4.0.0'
 dependencies:
@@ -15,6 +15,10 @@ dependencies:
   file_selector: ^1.0.3
   http: ^1.2.2
   package_info_plus: ^8.0.0
+  gal: ^2.3.2
+  file_saver: 0.2.14
+  characters: ^1.3.0
+  scrollable_positioned_list: ^0.3.8
 dev_dependencies:
   flutter_launcher_icons: ^0.14.4
 flutter_launcher_icons:
