@@ -16,15 +16,25 @@ jobs:
         uses: actions/setup-java@v4
         with:
           distribution: temurin
-          java-version: '17'
+          java-version: '21'
 
       - name: Instalar Flutter
         uses: subosito/flutter-action@v2
         with:
           channel: stable
 
+      - name: Configurar JDK 21 para Flutter e Gradle
+        run: |
+          flutter config --jdk-dir="$JAVA_HOME"
+          java -version
+          flutter --version
+
       - name: Preparar projeto Android
         run: flutter create --platforms=android --project-name=meow .
+
+      - name: Verificar Java utilizado pelo Gradle
+        working-directory: android
+        run: bash ./gradlew --version
 
       - name: Configurar permissoes Android do Meow
         run: |
