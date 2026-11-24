@@ -26,6 +26,23 @@ jobs:
       - name: Preparar projeto Android
         run: flutter create --platforms=android --project-name=meow .
 
+      - name: Configurar permissoes Android do Meow
+        run: |
+          python3 - <<'PYCODE'
+          from pathlib import Path
+          path = Path('android/app/src/main/AndroidManifest.xml')
+          text = path.read_text()
+          permissions = [
+              ('android.permission.INTERNET', ''),
+              ('android.permission.POST_NOTIFICATIONS', ''),
+              ('android.permission.WRITE_EXTERNAL_STORAGE', ' android:maxSdkVersion="28"'),
+          ]
+          for name, extra in permissions:
+              if name not in text:
+                  text = text.replace('<application', f'<uses-permission android:name="{name}"{extra} />\n    <application', 1)
+          path.write_text(text)
+          PYCODE
+
       - name: Instalar dependencias
         run: flutter pub get
 
