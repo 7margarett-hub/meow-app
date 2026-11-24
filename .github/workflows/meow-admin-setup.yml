@@ -23,50 +23,100 @@ jobs:
           node <<'NODE'
           const admin = require('firebase-admin');
 
-          async function main() {
-            const credentials = JSON.parse(
-              process.env.FIREBASE_ADMIN_SETUP
-            );
+          let stage = 'Validar secrets';
 
+          async function main() {
+            const raw = process.env.FIREBASE_ADMIN_SETUP;
             const uid = process.env.MEOW_ADMIN_UID?.trim();
 
+            if (!raw || !raw.trim()) {
+              throw new Error('SECRET_FIREBASE_AUSENTE');
+            }
+
             if (!uid) {
-              throw new Error('UID administrativo ausente.');
+              throw new Error('SECRET_UID_AUSENTE');
+            }
+
+            console.log('Secrets encontrados.');
+
+            stage = 'Validar JSON';
+
+            let credentials;
+
+            try {
+              credentials = JSON.parse(raw);
+            } catch {
+              throw new Error('JSON_INVALIDO');
             }
 
             if (credentials.project_id !== 'meow-app-8ac5e') {
-              throw new Error('Projeto Firebase incorreto.');
+              throw new Error('PROJETO_INCORRETO');
             }
 
             if (credentials.client_email !==
                 'meow-admin-setup@meow-app-8ac5e.iam.gserviceaccount.com') {
-              throw new Error('Conta de serviço incorreta.');
+              throw new Error('CONTA_SERVICO_INCORRETA');
             }
+
+            if (typeof credentials.private_key !== 'string' ||
+                !credentials.private_key.includes('BEGIN PRIVATE KEY')) {
+              throw new Error('CHAVE_PRIVADA_INVALIDA');
+            }
+
+            console.log('Credencial validada.');
+
+            stage = 'Inicializar Firebase';
 
             admin.initializeApp({
               credential: admin.credential.cert(credentials)
             });
 
             const auth = admin.auth();
+
+            stage = 'Localizar usuario';
+
             const user = await auth.getUser(uid);
+
+            console.log('Usuario localizado.');
+
+            stage = 'Atribuir permissao';
 
             await auth.setCustomUserClaims(uid, {
               ...(user.customClaims || {}),
               meowAdmin: true
             });
 
+            stage = 'Confirmar permissao';
+
             const updated = await auth.getUser(uid);
 
             if (updated.customClaims?.meowAdmin !== true) {
-              throw new Error('Permissão não confirmada.');
+              throw new Error('PERMISSAO_NAO_CONFIRMADA');
             }
 
             console.log('MEOW_ADMIN_SETUP: SUCCESS');
           }
 
           main().catch(error => {
-            console.error('MEOW_ADMIN_SETUP: FAILED',
-              error.code || 'setup-error');
+            const safeErrors = [
+              'SECRET_FIREBASE_AUSENTE',
+              'SECRET_UID_AUSENTE',
+              'JSON_INVALIDO',
+              'PROJETO_INCORRETO',
+              'CONTA_SERVICO_INCORRETA',
+              'CHAVE_PRIVADA_INVALIDA',
+              'PERMISSAO_NAO_CONFIRMADA'
+            ];
+
+            const code = typeof error.code === 'string' &&
+              /^auth\/[a-z-]+$/.test(error.code)
+                ? error.code
+                : safeErrors.includes(error.message)
+                  ? error.message
+                  : 'ERRO_INTERNO';
+
+            console.error('ETAPA: ' + stage);
+            console.error('ERRO: ' + code);
             process.exit(1);
           });
           NODE
