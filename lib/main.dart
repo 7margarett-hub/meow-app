@@ -986,7 +986,7 @@ class ServerSettingsPage extends StatelessWidget {
     required this.id
 }
 );
-    @override Widget build(BuildContext c)=>Scaffold(appBar:AppBar(title:const Text('Configurações do servidor')),
+    @override Widget build(BuildContext pageContext)=>Scaffold(appBar:AppBar(title:const Text('Configurações do servidor')),
       body:StreamBuilder<DocumentSnapshot<Map<String, dynamic>>>(stream:db.collection('servers').doc(id).meowSnapshots(),
       builder:(c, s){
         if(s.hasError)return Center(child:Text('Erro ao carregar servidor: ${s.error}'));
@@ -995,10 +995,18 @@ class ServerSettingsPage extends StatelessWidget {
 }
 ;
         final owner=d['ownerId']==myUid;
+        if(!s.data!.exists)return const Center(child:Text('Servidor indisponível.'));
+        if(d['deleting']==true)return Center(child:Padding(padding:const EdgeInsets.all(24),child:Column(
+          mainAxisSize:MainAxisSize.min,children:[const Text('Servidor em processo de exclusão.',textAlign:TextAlign.center),
+          if(owner)FilledButton(onPressed:()async{
+            final done=await confirmServerDelete(pageContext,id,resume:true);
+            if(done&&pageContext.mounted&&ModalRoute.of(pageContext)?.isCurrent==true)Navigator.pop(pageContext);
+          },child:const Text('Retomar exclusão'))],
+        )));
           return ListView(children:[PrivateImage(scope:'server', id:id, slot:'banner', size:160), const SizedBox(height:16),
             Center(child:PrivateImage(scope:'server', id:id, slot:'avatar', size:88)), Padding(padding:const EdgeInsets.all(18),
               child:Column(children:[Text(d['name']?.toString()??'Servidor', style:const TextStyle(fontSize:22)),
-                const SizedBox(height:18), if(owner) OutlinedButton.icon(icon:const Icon(Icons.edit),label:const Text('Renomear servidor'),onPressed:()async{final v=await showTextPrompt(c,'Nome do servidor',d['name']?.toString()??'');if(v!=null&&v.isNotEmpty)await db.collection('servers').doc(id).update({'name':v});}), const SizedBox(height:12), if(owner) ListTile(title:const Text('Organizar categorias e canais'),trailing:const Icon(Icons.chevron_right),onTap:()=>Navigator.push(c,MaterialPageRoute(builder:(_)=>ServerOrganizationPage(id:id)))), if(owner||(d['adminIds'] is List&&(d['adminIds'] as List).contains(myUid)))ListTile(title:const Text('Emojis e figurinhas'),onTap:()=>Navigator.push(c,MaterialPageRoute(builder:(_)=>ExpressionSettings(server:id)))),if(owner) SwitchListTile(title:const Text('Permitir @everyone a todos os membros'),value:d['everyoneEnabled']==true,onChanged:(v)async{try{await db.collection('servers').doc(id).update({'everyoneEnabled':v});}catch(e){if(c.mounted)notice(c,e);}}),if(owner) ChangeImage('server', id, 'avatar', 'Trocar ícone (8 MiB)'),if(owner) ChangeImage('server',id,'banner','Trocar banner (15 MiB)'),if(owner) OutlinedButton.icon(onPressed:()=>confirmServerDelete(c,id),icon:const Icon(Icons.delete),label:const Text('Excluir servidor')),if(!owner)OutlinedButton.icon(onPressed:()=>confirmLeaveServer(c,id),icon:const Icon(Icons.logout),label:const Text('Sair do servidor'))
+                const SizedBox(height:18), if(owner) OutlinedButton.icon(icon:const Icon(Icons.edit),label:const Text('Renomear servidor'),onPressed:()async{final v=await showTextPrompt(c,'Nome do servidor',d['name']?.toString()??'');if(v!=null&&v.isNotEmpty)await db.collection('servers').doc(id).update({'name':v});}), const SizedBox(height:12), if(owner) ListTile(title:const Text('Organizar categorias e canais'),trailing:const Icon(Icons.chevron_right),onTap:()=>Navigator.push(c,MaterialPageRoute(builder:(_)=>ServerOrganizationPage(id:id)))), if(owner||(d['adminIds'] is List&&(d['adminIds'] as List).contains(myUid)))ListTile(title:const Text('Emojis e figurinhas'),onTap:()=>Navigator.push(c,MaterialPageRoute(builder:(_)=>ExpressionSettings(server:id)))),if(owner) SwitchListTile(title:const Text('Permitir @everyone a todos os membros'),value:d['everyoneEnabled']==true,onChanged:(v)async{try{await db.collection('servers').doc(id).update({'everyoneEnabled':v});}catch(e){if(c.mounted)notice(c,e);}}),if(owner) ChangeImage('server', id, 'avatar', 'Trocar ícone (8 MiB)'),if(owner) ChangeImage('server',id,'banner','Trocar banner (15 MiB)'),if(owner) OutlinedButton.icon(onPressed:()async{final done=await confirmServerDelete(pageContext,id);if(done&&pageContext.mounted&&ModalRoute.of(pageContext)?.isCurrent==true)Navigator.pop(pageContext);},icon:const Icon(Icons.delete),label:const Text('Excluir servidor')),if(!owner)OutlinedButton.icon(onPressed:()=>confirmLeaveServer(c,id),icon:const Icon(Icons.logout),label:const Text('Sair do servidor'))
 ])
 )
 ]);
@@ -1301,7 +1309,7 @@ class _SocialHomeState extends State<SocialHome> with WidgetsBindingObserver {
         channelId=null;
         showingChannels=true;
 }
-), icon:Stack(clipBehavior:Clip.none,children:[PrivateImage(scope:'server', id:d.id, slot:'avatar', size:48),Positioned(right:-2,bottom:-2,child:ServerUnreadDot(key:ValueKey(d.id),serverId:d.id,uid:myUid))]))
+), icon:Stack(clipBehavior:Clip.none,children:[PrivateImage(scope:'server', id:d.id, slot:'avatar', size:48),if(d.data()['deleting']==true)const Positioned(right:-2,bottom:-2,child:Icon(Icons.hourglass_top,size:16,color:Colors.amber))else Positioned(right:-2,bottom:-2,child:ServerUnreadDot(key:ValueKey(d.id),serverId:d.id,uid:myUid))]))
 )]))
 )])));
   Widget channelList(List<QueryDocumentSnapshot<Map<String, dynamic>>> docs){
@@ -1329,12 +1337,46 @@ class _SocialHomeState extends State<SocialHome> with WidgetsBindingObserver {
 )
 )]]);
 }
+  // Keep navigation usable if a server becomes unavailable while its chat is open.
+  void restoreServerNavigation(String selected){
+    if(showingChannels)return;
+    WidgetsBinding.instance.addPostFrameCallback((_){
+      if(mounted&&serverId==selected&&!showingChannels)setState(()=>showingChannels=true);
+    });
+  }
   Widget serverContent(){
-    if(serverId==null)return Row(children:[rail(), const Expanded(child:Center(child:Text('Crie um servidor ou entre com um convite.')))]);
+    final selected=serverId;
+    if(selected==null)return Row(children:[rail(), const Expanded(child:Center(child:Text('Crie um servidor ou entre com um convite.')))]);
+    return MeowStreamBuilder<QuerySnapshot<Map<String,dynamic>>>(
+      key:ValueKey('membership:$selected'),
+      stream:db.collection('servers').where('members',arrayContains:myUid).meowSnapshots(),
+      builder:(c,s){
+        if(s.hasError){restoreServerNavigation(selected);return Row(children:[rail(),const Expanded(child:Center(child:Text('Não foi possível carregar os servidores.')))]);}
+        if(!s.hasData)return Row(children:[rail(),const Expanded(child:Center(child:CircularProgressIndicator()))]);
+        final matches=s.data!.docs.where((d)=>d.id==selected);
+        if(matches.isEmpty){
+          restoreServerNavigation(selected);
+          return Row(children:[rail(),const Expanded(child:Center(child:Padding(padding:EdgeInsets.all(16),child:Text('Servidor indisponível. Selecione outro servidor.',textAlign:TextAlign.center))))]);
+        }
+        final data=matches.first.data();
+        if(data['deleting']==true){
+          restoreServerNavigation(selected);
+          return Row(children:[rail(),Expanded(child:Center(child:Padding(padding:const EdgeInsets.all(16),child:Column(
+            mainAxisSize:MainAxisSize.min,children:[const Text('Servidor em processo de exclusão.',textAlign:TextAlign.center),
+            if(data['ownerId']==myUid)FilledButton(onPressed:()async{
+              await confirmServerDelete(c,selected,resume:true);
+            },child:const Text('Retomar exclusão'))],
+          ))))]);
+        }
+        return activeServerContent(selected);
+      },
+    );
+  }
+  Widget activeServerContent(String selected){
     return MeowStreamBuilder<QuerySnapshot<Map<String,
-      dynamic>>>(key:ValueKey(serverId), stream:db.collection('servers').doc(serverId).collection('channels').meowSnapshots(),
+      dynamic>>>(key:ValueKey(selected), stream:db.collection('servers').doc(selected).collection('channels').meowSnapshots(),
       builder:(c, s){
-        if(s.hasError)return Center(child:Text('Erro: ${s.error}'));
+        if(s.hasError){restoreServerNavigation(selected);return Row(children:[rail(),const Expanded(child:Center(child:Text('Canais indisponíveis. Selecione outro servidor.')))]);}
         final docs=s.data?.docs??[];
         final active=docs.any((d)=>d.id==channelId)?channelId:(docs.isEmpty?null:docs.first.id);
         final activeDoc=docs.where((d)=>d.id==active);
@@ -2320,10 +2362,122 @@ Future<void> confirmLeaveServer(BuildContext context,String id)async{
  if(ok!=true)return;
  try{await db.collection('servers').doc(id).update({'members':FieldValue.arrayRemove([myUid])});if(context.mounted)Navigator.pop(context);}catch(e){if(context.mounted)notice(context,e);}
 }
-Future<void> confirmServerDelete(BuildContext context,String id)async{
- final ok=await showDialog<bool>(context:context,builder:(c)=>AlertDialog(title:const Text('Excluir servidor?'),content:const Text('Esta ação é permanente e apagará canais e mensagens quando o backend concluir a exclusão.'),actions:[TextButton(onPressed:()=>Navigator.pop(c,false),child:const Text('Cancelar')),FilledButton(onPressed:()=>Navigator.pop(c,true),child:const Text('Excluir'))]));
- if(ok!=true)return;
- try{await db.collection('serverDeletionRequests').doc(id).set({'ownerId':myUid,'requestedAt':FieldValue.serverTimestamp()});if(context.mounted)notice(context,'Exclusão solicitada. Aguardando processamento do servidor.');}catch(e){if(context.mounted)notice(context,e);}
+// 0.8.1: deletion is exclusively performed by the authenticated backend.
+Future<Map<String,dynamic>> meowServerAction(String id,String action,String uid) async {
+ final user=FirebaseAuth.instance.currentUser;
+ if(user==null||user.uid!=uid)throw Exception('Sessão alterada.');
+ final token=await user.getIdToken();
+ if(token==null||FirebaseAuth.instance.currentUser?.uid!=uid)throw Exception('Entre novamente no Meow.');
+ final response=await http.post(
+   Uri.https(imageHost,'/functions/v1/meow-servidores'),
+   headers:{'Authorization':'Bearer $token','Content-Type':'application/json'},
+   body:jsonEncode({'action':action,'serverId':id,if(action=='delete')'confirm':id}),
+ ).timeout(const Duration(seconds:90));
+ if(FirebaseAuth.instance.currentUser?.uid!=uid)throw Exception('Sessão alterada.');
+ dynamic decoded;
+ try{decoded=jsonDecode(response.body);}catch(_){decoded=null;}
+ if(response.statusCode!=200&&response.statusCode!=202){
+   final detail=decoded is Map&&decoded['error'] is String?decoded['error'] as String:'Serviço de exclusão indisponível.';
+   throw Exception('$detail (HTTP ${response.statusCode})');
+ }
+ if(decoded is! Map<String,dynamic>||decoded['ok']!=true||decoded['deleted'] is! bool){
+   throw Exception('Resposta inválida do serviço de exclusão.');
+ }
+ if(action=='delete'&&((response.statusCode==200&&decoded['deleted']!=true)||
+   (response.statusCode==202&&(decoded['deleted']!=false||decoded['retryAfterMs'] is! int)))){
+   throw Exception('Não foi possível confirmar o progresso da exclusão.');
+ }
+ if(action=='inspect'&&response.statusCode!=200)throw Exception('Resposta de inspeção inválida.');
+ return decoded;
+}
+
+Future<bool> confirmServerDelete(BuildContext context,String id,{bool resume=false}) async {
+ final uid=FirebaseAuth.instance.currentUser?.uid;
+ if(uid==null)return false;
+ final ok=await showDialog<bool>(context:context,builder:(c)=>AlertDialog(
+   title:Text(resume?'Retomar exclusão?':'Excluir servidor?'),
+   content:Text(resume?'A exclusão já foi iniciada. Continue até a confirmação do servidor.':
+     'Esta ação é permanente. Os canais, mensagens, convites e arquivos deste servidor serão apagados. Imagens personalizadas usadas em outras conversas poderão ficar indisponíveis.'),
+   actions:[TextButton(onPressed:()=>Navigator.pop(c,false),child:const Text('Cancelar')),
+     FilledButton(onPressed:()=>Navigator.pop(c,true),child:Text(resume?'Retomar':'Excluir'))],
+ ));
+ if(ok!=true||!context.mounted||FirebaseAuth.instance.currentUser?.uid!=uid)return false;
+ final done=await showDialog<bool>(context:context,barrierDismissible:false,
+   builder:(_)=>_MeowServerDeleteDialog(id:id,uid:uid));
+ if(done==true){
+   PrivateMediaCache.invalidate(mediaUrl('server',id,'avatar'));
+   PrivateMediaCache.invalidate(mediaUrl('server',id,'banner'));
+   if(context.mounted)notice(context,'Servidor excluído definitivamente.');
+ }
+ return done==true;
+}
+
+class _MeowServerDeleteDialog extends StatefulWidget {
+ final String id,uid;
+ const _MeowServerDeleteDialog({required this.id,required this.uid});
+ @override State<_MeowServerDeleteDialog> createState()=>_MeowServerDeleteDialogState();
+}
+class _MeowServerDeleteDialogState extends State<_MeowServerDeleteDialog> {
+ bool running=true,stopped=false;
+ String status='Verificando permissões…';
+ String? error;
+ bool get active=>mounted&&!stopped&&FirebaseAuth.instance.currentUser?.uid==widget.uid;
+ @override void initState(){super.initState();unawaited(process());}
+ @override void dispose(){stopped=true;super.dispose();}
+ void complete(){if(!active)return;stopped=true;Navigator.pop(context,true);}
+ Future<void> process() async {
+   if(!active)return;
+   setState((){running=true;error=null;status='Verificando permissões…';});
+   try{
+     final info=await meowServerAction(widget.id,'inspect',widget.uid);
+     if(!active)return;
+     if(info['deleted']==true){complete();return;}
+     if(info['owner']!=true)throw Exception('Somente o proprietário pode excluir o servidor.');
+     if(info['enabled']!=true)throw Exception('A exclusão de servidores ainda está desativada no backend.');
+     while(active){
+       setState(()=>status='Processando exclusão…');
+       final result=await meowServerAction(widget.id,'delete',widget.uid);
+       if(!active)return;
+       if(result['deleted']==true){complete();return;}
+       final stage=result['stage'];
+       final rawDelay=result['retryAfterMs'] as int;
+       final delay=Duration(milliseconds:max(250,rawDelay));
+       final clock=Stopwatch()..start();
+       while(active&&clock.elapsed<delay){
+         final remaining=delay-clock.elapsed;
+         final seconds=(remaining.inMilliseconds/1000).ceil();
+         final label=switch(stage){
+           'locked'||'draining'=>'Aguardando uploads em andamento: ${seconds}s',
+           'storage'=>'Removendo arquivos do servidor…',
+           'documents'=>'Removendo canais e mensagens…',
+           'invites'=>'Removendo convites…',
+           _=>'Finalizando exclusão…',
+         };
+         if(status!=label)setState(()=>status=label);
+         await Future<void>.delayed(Duration(milliseconds:min(1000,max(1,remaining.inMilliseconds))));
+       }
+     }
+   }catch(e){
+     if(active)setState((){running=false;error=e.toString().replaceFirst('Exception: ','');});
+   }finally{
+     if(mounted&&!stopped&&FirebaseAuth.instance.currentUser?.uid!=widget.uid){
+       setState((){running=false;error='Sessão alterada. Feche esta tela.';});
+     }
+   }
+ }
+ @override Widget build(BuildContext c)=>PopScope(
+   onPopInvokedWithResult:(didPop,_) {if(didPop)stopped=true;},
+   child:AlertDialog(title:const Text('Excluir servidor'),content:Column(
+     mainAxisSize:MainAxisSize.min,crossAxisAlignment:CrossAxisAlignment.start,children:[
+       if(running)...[const LinearProgressIndicator(),const SizedBox(height:16),Text(status)],
+       if(error!=null)Text(error!),
+       const SizedBox(height:12),
+       const Text('Se a exclusão já começou, sair desta tela não a cancela. Você poderá retomá-la depois.'),
+     ]),actions:[
+       TextButton(onPressed:(){stopped=true;Navigator.pop(c,false);},child:const Text('Continuar depois')),
+       if(!running)FilledButton(onPressed:active?()=>unawaited(process()):null,child:const Text('Tentar novamente')),
+     ]),
+ );
 }
 
 class ProfileBackground extends StatefulWidget {
@@ -2428,7 +2582,90 @@ class _ExpressionImageState extends State<ExpressionImage> {
  @override void didUpdateWidget(covariant ExpressionImage old){super.didUpdateWidget(old);if(old.url!=widget.url)future=PrivateMediaCache.get(widget.url);}
  @override Widget build(BuildContext c){final n=widget.size??(widget.data['kind']=='sticker'?144.0:48.0);return SizedBox(width:n,height:n,child:FutureBuilder<Uint8List?>(future:future,builder:(c,s)=>s.data==null?const Icon(Icons.image_outlined):meowPreview(c,s.data!,width:n,height:n,fit:BoxFit.contain,errorBuilder:(c,e,st)=>const Icon(Icons.broken_image))));}
 }
-Future<Object?> pickExpression(BuildContext context,{bool reactionOnly=false})=>showModalBottomSheet<Object>(context:context,isScrollControlled:true,builder:(c)=>SafeArea(child:SizedBox(height:420,child:DefaultTabController(length:reactionOnly?2:3,child:Column(children:[TabBar(tabs:[const Tab(text:'Emojis'),const Tab(text:'Personalizados'),if(!reactionOnly)const Tab(text:'Figurinhas')]),Expanded(child:TabBarView(children:[GridView.count(crossAxisCount:6,children:[for(final e in meowEmojis)TextButton(onPressed:()=>Navigator.pop(c,e),child:Text(e,style:const TextStyle(fontSize:26)))]),for(final kind in ['emoji',if(!reactionOnly)'sticker'])MeowStreamBuilder<QuerySnapshot<Map<String,dynamic>>>(stream:db.collection('servers').where('members',arrayContains:myUid).meowSnapshots(),builder:(c,s)=>ListView(children:[for(final server in s.data?.docs??[])Column(crossAxisAlignment:CrossAxisAlignment.start,children:[ListTile(title:Text(server.data()['name']?.toString()??'Servidor')),MeowStreamBuilder<QuerySnapshot<Map<String,dynamic>>>(stream:server.reference.collection('expressions').where('active',isEqualTo:true).meowSnapshots(),builder:(c,x)=>Wrap(children:[for(final item in x.data?.docs??[])if(item.data()['kind']==kind)InkWell(onTap:()=>Navigator.pop(c,<String,dynamic>{'serverId':server.id,'id':item.id,'kind':kind}),child:Padding(padding:const EdgeInsets.all(6),child:ExpressionImage(data:item.data(),size:kind=='emoji'?48:88)))]))])]))]))])))));
+// 0.8.1: a bounded, explicit dark sheet. Load the catalogue independently
+// of hidden-tab TickerMode and keep one shared future for both custom tabs.
+Future<Object?> pickExpression(BuildContext context,{bool reactionOnly=false})=>
+ showModalBottomSheet<Object>(context:context,isScrollControlled:true,backgroundColor:panel,
+   builder:(c)=>SafeArea(top:false,child:SizedBox(
+     height:min(420.0,MediaQuery.sizeOf(c).height*.72),
+     child:_MeowExpressionPicker(reactionOnly:reactionOnly,uid:myUid),
+   )),
+ );
+
+class _MeowExpressionGroup {
+ final String id,name;
+ final List<QueryDocumentSnapshot<Map<String,dynamic>>> items;
+ final bool failed;
+ const _MeowExpressionGroup(this.id,this.name,this.items,{this.failed=false});
+}
+class _MeowExpressionPicker extends StatefulWidget {
+ final bool reactionOnly;
+ final String uid;
+ const _MeowExpressionPicker({required this.reactionOnly,required this.uid});
+ @override State<_MeowExpressionPicker> createState()=>_MeowExpressionPickerState();
+}
+class _MeowExpressionPickerState extends State<_MeowExpressionPicker> {
+ late Future<List<_MeowExpressionGroup>> catalog;
+ @override void initState(){super.initState();catalog=load();}
+ Future<List<_MeowExpressionGroup>> load() async {
+   if(FirebaseAuth.instance.currentUser?.uid!=widget.uid)throw Exception('Sessão alterada.');
+   final servers=await db.collection('servers').where('members',arrayContains:widget.uid)
+     .get(const GetOptions(source:Source.server)).timeout(const Duration(seconds:15));
+   final groups=await Future.wait(servers.docs.where((d)=>d.data()['deleting']!=true).map((server)async{
+     final name=server.data()['name']?.toString()??'Servidor';
+     try{
+       final expressions=await server.reference.collection('expressions').where('active',isEqualTo:true)
+         .get(const GetOptions(source:Source.server)).timeout(const Duration(seconds:15));
+       return _MeowExpressionGroup(server.id,name,expressions.docs);
+     }catch(_){return _MeowExpressionGroup(server.id,name,[],failed:true);}
+   }));
+   if(FirebaseAuth.instance.currentUser?.uid!=widget.uid)throw Exception('Sessão alterada.');
+   return groups;
+ }
+ void retry(){setState(()=>catalog=load());}
+ Widget emptyOrError(String label,{bool error=false})=>Center(child:SingleChildScrollView(child:Padding(
+   padding:const EdgeInsets.all(20),child:Column(mainAxisSize:MainAxisSize.min,children:[
+     Icon(error?Icons.cloud_off:Icons.emoji_emotions_outlined,color:Colors.white54,size:32),
+     const SizedBox(height:8),Text(label,textAlign:TextAlign.center,style:const TextStyle(color:Colors.white70)),
+     if(error)TextButton(onPressed:retry,child:const Text('Tentar novamente')),
+   ]),
+ )));
+ Widget custom(String kind)=>FutureBuilder<List<_MeowExpressionGroup>>(future:catalog,builder:(c,s){
+   if(s.connectionState!=ConnectionState.done)return const Center(child:CircularProgressIndicator());
+   if(s.hasError)return emptyOrError('Não foi possível carregar as expressões.',error:true);
+   final groups=s.data??[];
+   final visible=groups.where((g)=>g.failed||g.items.any((item)=>item.data()['kind']==kind)).toList();
+   if(visible.isEmpty)return emptyOrError(kind=='emoji'?'Nenhum emoji personalizado disponível.':'Nenhuma figurinha disponível.');
+   return ListView.builder(padding:const EdgeInsets.fromLTRB(12,8,12,16),itemCount:visible.length,itemBuilder:(c,index){
+     final group=visible[index];
+     return Column(crossAxisAlignment:CrossAxisAlignment.start,children:[
+       ListTile(contentPadding:EdgeInsets.zero,title:Text(group.name,maxLines:1,overflow:TextOverflow.ellipsis)),
+       if(group.failed)ListTile(contentPadding:EdgeInsets.zero,title:const Text('Não foi possível carregar este servidor.'),
+         trailing:IconButton(tooltip:'Tentar novamente',onPressed:retry,icon:const Icon(Icons.refresh)))
+       else Wrap(spacing:4,runSpacing:4,children:[
+         for(final item in group.items.where((d)=>d.data()['kind']==kind))
+           InkWell(key:ValueKey(item.id),borderRadius:BorderRadius.circular(8),
+             onTap:(){if(FirebaseAuth.instance.currentUser?.uid==widget.uid)Navigator.pop(c,<String,dynamic>{'serverId':group.id,'id':item.id,'kind':kind});},
+             child:Padding(padding:const EdgeInsets.all(6),child:ExpressionImage(
+               data:{'serverId':group.id,'id':item.id,'kind':kind},size:kind=='emoji'?48.0:88.0,
+             )),
+           ),
+       ]),
+     ]);
+   });
+ });
+ @override Widget build(BuildContext c)=>Material(color:panel,child:DefaultTabController(
+   length:widget.reactionOnly?2:3,child:Column(children:[
+     TabBar(tabs:[const Tab(text:'Emojis'),const Tab(text:'Personalizados'),if(!widget.reactionOnly)const Tab(text:'Figurinhas')]),
+     Expanded(child:TabBarView(children:[
+       GridView.count(crossAxisCount:6,padding:const EdgeInsets.all(6),children:[
+         for(final e in meowEmojis)TextButton(onPressed:()=>Navigator.pop(c,e),child:Text(e,style:const TextStyle(fontSize:26))),
+       ]),
+       custom('emoji'),if(!widget.reactionOnly)custom('sticker'),
+     ])),
+   ]),
+ ));
+}
 class ExpressionSettings extends StatelessWidget{
  final String server;const ExpressionSettings({super.key,required this.server});
  CollectionReference<Map<String,dynamic>> get catalog=>db.collection('servers').doc(server).collection('expressions');
