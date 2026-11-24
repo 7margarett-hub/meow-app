@@ -1,0 +1,72 @@
+
+name: Meow Admin Setup
+
+on:
+  workflow_dispatch:
+
+permissions: {}
+
+jobs:
+  setup-admin:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - name: Instalar Firebase Admin SDK
+        run: npm install --no-save --ignore-scripts firebase-admin@13.4.0
+
+      - name: Configurar administrador Meow
+        env:
+          FIREBASE_ADMIN_SETUP: ${{ secrets.FIREBASE_ADMIN_SETUP }}
+          MEOW_ADMIN_UID: ${{ secrets.MEOW_ADMIN_UID }}
+        run: |
+          node <<'NODE'
+          const admin = require('firebase-admin');
+
+          async function main() {
+            const credentials = JSON.parse(
+              process.env.FIREBASE_ADMIN_SETUP
+            );
+
+            const uid = process.env.MEOW_ADMIN_UID?.trim();
+
+            if (!uid) {
+              throw new Error('UID administrativo ausente.');
+            }
+
+            if (credentials.project_id !== 'meow-app-8ac5e') {
+              throw new Error('Projeto Firebase incorreto.');
+            }
+
+            if (credentials.client_email !==
+                'meow-admin-setup@meow-app-8ac5e.iam.gserviceaccount.com') {
+              throw new Error('Conta de serviço incorreta.');
+            }
+
+            admin.initializeApp({
+              credential: admin.credential.cert(credentials)
+            });
+
+            const auth = admin.auth();
+            const user = await auth.getUser(uid);
+
+            await auth.setCustomUserClaims(uid, {
+              ...(user.customClaims || {}),
+              meowAdmin: true
+            });
+
+            const updated = await auth.getUser(uid);
+
+            if (updated.customClaims?.meowAdmin !== true) {
+              throw new Error('Permissão não confirmada.');
+            }
+
+            console.log('MEOW_ADMIN_SETUP: SUCCESS');
+          }
+
+          main().catch(error => {
+            console.error('MEOW_ADMIN_SETUP: FAILED',
+              error.code || 'setup-error');
+            process.exit(1);
+          });
+          NODE
