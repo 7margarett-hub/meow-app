@@ -3357,7 +3357,7 @@ class MeowAccountDrawer extends StatelessWidget {
 }
 class MeowUnreadMark extends StatelessWidget{
  final bool unread;const MeowUnreadMark({super.key,required this.unread});
- @override Widget build(BuildContext c)=>SizedBox(width:10,height:10,child:unread?const Semantics(label:'Mensagens não lidas',child:DecoratedBox(decoration:BoxDecoration(color:Color(0xFF39F57A),shape:BoxShape.circle))):null);
+ @override Widget build(BuildContext c)=>SizedBox(width:10,height:10,child:unread?Semantics(label:'Mensagens não lidas',child:const DecoratedBox(decoration:BoxDecoration(color:Color(0xFF39F57A),shape:BoxShape.circle))):null);
 }
 class _SectionThread {
  final CollectionReference<Map<String,dynamic>> collection;
