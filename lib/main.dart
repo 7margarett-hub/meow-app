@@ -5,6 +5,7 @@ import 'dart:io';
 import 'package:path_provider/path_provider.dart';
 import 'package:video_player/video_player.dart';
 import 'package:get_thumbnail_video/video_thumbnail.dart';
+import 'package:get_thumbnail_video/index.dart' show ImageFormat;
 import 'package:shared_preferences/shared_preferences.dart';
 import 'dart:typed_data';
 import 'dart:ui' as ui;
@@ -1269,7 +1270,7 @@ class _SocialHomeState extends State<SocialHome> with WidgetsBindingObserver {
     try{final user=FirebaseAuth.instance.currentUser;if(user==null)return;await db.collection('users').doc(user.uid).update({'lastSeen':FieldValue.serverTimestamp(),if(closed)'presenceClosedAt':FieldValue.serverTimestamp()});}catch(_){}
   }
   @override void didChangeAppLifecycleState(AppLifecycleState state){
-    final wasActive=appActive;appActive=state==AppLifecycleState.resumed;
+    appActive=state==AppLifecycleState.resumed;
     if(appActive){unawaited(touchPresence());unawaited(MeowCacheMaintenance.maybeClean());final elapsed=pausedAt==null?Duration.zero:DateTime.now().difference(pausedAt!);pausedAt=null;if(elapsed>const Duration(seconds:3))unawaited(db.enableNetwork());}
     else if(state==AppLifecycleState.paused||state==AppLifecycleState.hidden||state==AppLifecycleState.detached){if(pausedAt==null){pausedAt=DateTime.now();unawaited(touchPresence(closed:true));}}
     syncNativeThread();
@@ -2522,8 +2523,6 @@ class _ProfileThemeEditorState extends State<ProfileThemeEditor>{
    FilledButton(onPressed:saving?null:()async{setState(()=>saving=true);try{if(mounted)notice(context,'Use Editar perfil para salvar o tema.');}catch(e){if(mounted)notice(context,e);}finally{if(mounted)setState(()=>saving=false);}},child:Text(saving?'Salvando...':'Salvar tema')),
   ]);
  });
-}
-extension MeowColorEditor on _ProfileThemeEditorState {
  Future<void> pick(int index) async {
   final original=index==0?first:second;
   final result=await showDialog<Color>(context:context,builder:(c)=>MeowColorWheelDialog(initial:original));
@@ -2705,6 +2704,48 @@ class DmPermissionGate extends StatelessWidget {
  }));
 }
 
+Future<void> confirmLeaveServer(BuildContext context,String id)async{
+ final ok=await showDialog<bool>(context:context,builder:(c)=>AlertDialog(title:const Text('Sair do servidor?'),actions:[TextButton(onPressed:()=>Navigator.pop(c,false),child:const Text('Cancelar')),FilledButton(onPressed:()=>Navigator.pop(c,true),child:const Text('Sair'))]));
+ if(ok!=true)return;
+ try{await db.collection('servers').doc(id).update({'members':FieldValue.arrayRemove([myUid])});if(context.mounted)Navigator.pop(context);}catch(e){if(context.mounted)notice(context,e);}
+}
+// 0.8.1: deletion is exclusively performed by the authenticated backend.
+Future<Map<String,dynamic>> meowServerAction(String id,String action,String uid) async {
+ final user=FirebaseAuth.instance.currentUser;
+ if(user==null||user.uid!=uid)throw Exception('Sessão alterada.');
+ final token=await user.getIdToken();
+ if(token==null||FirebaseAuth.instance.currentUser?.uid!=uid)throw Exception('Entre novamente no Meow.');
+ final response=await http.post(
+   Uri.https(imageHost,'/functions/v1/meow-servidores'),
+   headers:{'Authorization':'Bearer $token','Content-Type':'application/json'},
+   body:jsonEncode({'action':action,'serverId':id,if(action=='delete')'confirm':id}),
+ ).timeout(const Duration(seconds:90));
+ if(FirebaseAuth.instance.currentUser?.uid!=uid)throw Exception('Sessão alterada.');
+ dynamic decoded;
+ try{decoded=jsonDecode(response.body);}catch(_){decoded=null;}
+ if(response.statusCode!=200&&response.statusCode!=202){
+   final detail=decoded is Map&&decoded['error'] is String?decoded['error'] as String:'Serviço de exclusão indisponível.';
+   throw Exception('$detail (HTTP ${response.statusCode})');
+ }
+ if(decoded is! Map<String,dynamic>||decoded['ok']!=true||decoded['deleted'] is! bool){
+   throw Exception('Resposta inválida do serviço de exclusão.');
+ }
+ if(action=='delete'&&((response.statusCode==200&&decoded['deleted']!=true)||
+   (response.statusCode==202&&(decoded['deleted']!=false||decoded['retryAfterMs'] is! int)))){
+   throw Exception('Não foi possível confirmar o progresso da exclusão.');
+ }
+ if(action=='inspect'&&response.statusCode!=200)throw Exception('Resposta de inspeção inválida.');
+ return decoded;
+}
+
+Future<bool> confirmServerDelete(BuildContext context,String id,{bool resume=false}) async {
+ final uid=FirebaseAuth.instance.currentUser?.uid;if(uid==null)return false;
+ final ok=await showDialog<bool>(context:context,builder:(c)=>AlertDialog(title:Text(resume?'Retomar exclusão?':'Excluir servidor?'),content:Text(resume?'Continuar a limpeza dos dados?':'Esta ação é permanente. O servidor será retirado da lista assim que o backend confirmar o bloqueio. A limpeza dos dados continuará depois.'),actions:[TextButton(onPressed:()=>Navigator.pop(c,false),child:const Text('Cancelar')),FilledButton(onPressed:()=>Navigator.pop(c,true),child:Text(resume?'Retomar':'Excluir'))]));
+ if(ok!=true||!context.mounted||FirebaseAuth.instance.currentUser?.uid!=uid)return false;
+ final result=await showDialog<bool>(context:context,barrierDismissible:false,builder:(_)=>_MeowServerDeleteDialog(id:id,uid:uid));
+ if(result==true&&context.mounted)notice(context,'Exclusão iniciada. O servidor não está mais disponível.');
+ return result==true;
+}
 class MeowDeletionQueue {
  static final _running=<String>{};
  static final errors=ValueNotifier<Map<String,String>>({});
