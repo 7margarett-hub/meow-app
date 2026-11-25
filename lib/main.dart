@@ -18,6 +18,7 @@ import 'package:flutter/services.dart';
 import 'package:package_info_plus/package_info_plus.dart';
 import 'package:http/http.dart' as http;
 import 'package:image_picker/image_picker.dart';
+import 'package:url_launcher/url_launcher.dart';
 const bg = Color(0xFF111218), panel = Color(0xFF1C1D28), purple = Color(0xFF8B5CF6);
 const avatarLimit = 8 * 1024 * 1024, bannerLimit = 15 * 1024 * 1024, attachmentLimit = 25 * 1024 * 1024;
 const imageHost = 'ffxsvctvcsldumxnkiob.supabase.co';
@@ -26,6 +27,8 @@ final db = FirebaseFirestore.instance;
 final meowNavigator = GlobalKey<NavigatorState>();
 final meowRouteObserver = RouteObserver<ModalRoute<dynamic>>();
 final activeThread = ValueNotifier<String?>(null);
+const _meowNativeNotifications=MethodChannel('meow/notifications');
+Future<T?> _nativeNotification<T>(String method,[Object? args])async{try{return await _meowNativeNotifications.invokeMethod<T>(method,args);}on MissingPluginException{return null;}on PlatformException catch(e){debugPrint('Meow notificações nativas: ${e.code}');return null;}}
 String userLabel(Map<String,dynamic> d) {
   final n=d['displayName']?.toString().trim()??'';
   return n.isNotEmpty?n:'Usuário';
@@ -59,7 +62,7 @@ Future<void> meowAccountAction(Map<String,dynamic> body) async {
     headers:{...await authHeaders(),'Content-Type':'application/json'},
     body:jsonEncode(body)).timeout(const Duration(seconds:30));
   if(FirebaseAuth.instance.currentUser?.uid!=uid)throw Exception('Sessão alterada.');
-  if(response.statusCode!=200)throw Exception('Serviço de contas indisponível (HTTP ${response.statusCode}).');
+  if(response.statusCode!=200)throw Exception('Serviço de contas recusou a operação (HTTP ${response.statusCode}).');
   final result=jsonDecode(response.body);
   if(result is! Map||result['ok']!=true)throw Exception('Não foi possível confirmar a operação.');
 }
@@ -82,7 +85,8 @@ Future<void> logoutMeow(BuildContext c) async {
     if(token!=null)await db.collection('users').doc(uid).collection('devices').doc(token).delete();
     try {await f.deleteToken();}catch(_){}
   }catch(e){if(c.mounted)notice(c,'Não foi possível desregistrar as notificações: $e');return;}
-  PrivateMediaCache.clear();MeowStreams.clear();activeThread.value=null;
+  await _nativeNotification<void>('clearSession',myUid);
+   PrivateMediaCache.clear();MeowStreams.clear();activeThread.value=null;
   meowNavigator.currentState?.popUntil((route)=>route.isFirst);
   await FirebaseAuth.instance.signOut();
 }
@@ -341,15 +345,28 @@ class _MeowIdentityGateState extends State<MeowIdentityGate> {
   late Future<void> ready;
   @override void initState(){super.initState();ready=prepare();}
   Future<void> prepare() async {
-    final ref=db.collection('users').doc(widget.uid);
+    final uid=widget.uid;
+    final ref=db.collection('users').doc(uid);
     final existing=await ref.get().timeout(const Duration(seconds:15));
-    if(existing.exists&&meowSerial(existing.data()).isNotEmpty&&
-       !(existing.data()??{}).containsKey('username'))return;
-    await meowAccountAction({'action':'ensure'});
-    final updated=await ref.get(const GetOptions(source:Source.server)).timeout(const Duration(seconds:15));
-    if(!updated.exists||meowSerial(updated.data()).isEmpty||
-       (updated.data()??{}).containsKey('username'))throw Exception('Cadastro público ainda não migrado.');
+    if(!(existing.exists&&meowSerial(existing.data()).isNotEmpty&&!(existing.data()??{}).containsKey('username'))){
+      await meowAccountAction({'action':'ensure'});
+      final updated=await ref.get(const GetOptions(source:Source.server)).timeout(const Duration(seconds:15));
+      if(!updated.exists||meowSerial(updated.data()).isEmpty||(updated.data()??{}).containsKey('username'))throw Exception('Cadastro público ainda não migrado.');
+    }
+    final draft=_meowSignup;
+    if(draft==null||privateLoginName(uid)!=draft.login)return;
+    if(FirebaseAuth.instance.currentUser?.uid!=uid)throw Exception('Sessão alterada.');
+    await ref.update({'displayName':draft.displayName}).timeout(const Duration(seconds:20));
+    if(draft.bytes!=null){
+      final headers=await authHeaders();
+      if(FirebaseAuth.instance.currentUser?.uid!=uid)throw Exception('Sessão alterada.');
+      final response=await http.put(mediaUrl('profile',uid,'avatar'),headers:{...headers,'Content-Type':draft.mime!},body:draft.bytes!).timeout(const Duration(seconds:90));
+      if(response.statusCode!=200)throw Exception('Não foi possível enviar sua foto (HTTP ${response.statusCode}).');
+      PrivateMediaCache.invalidate(mediaUrl('profile',uid,'avatar'));
+    }
+    if(identical(_meowSignup,draft))_meowSignup=null;
   }
+
   @override Widget build(BuildContext c)=>FutureBuilder<void>(future:ready,builder:(c,s){
     if(s.connectionState!=ConnectionState.done)return const LoadingCat();
     if(!s.hasError)return const SocialHome();
@@ -357,8 +374,9 @@ class _MeowIdentityGateState extends State<MeowIdentityGate> {
       mainAxisSize:MainAxisSize.min,children:[const Icon(Icons.cloud_off,size:48),
       const SizedBox(height:12),const Text('Não foi possível preparar seu ID Meow.',textAlign:TextAlign.center),
       const Text('Sua conta continua existente. Verifique a conexão e tente novamente.',textAlign:TextAlign.center),
+       if(_meowSignup?.bytes!=null)TextButton(onPressed:(){_meowSignup?.bytes=null;setState(()=>ready=prepare());},child:const Text('Continuar sem foto')), 
       const SizedBox(height:12),FilledButton(onPressed:()=>setState(()=>ready=prepare()),child:const Text('Tentar novamente')),
-      TextButton(onPressed:()async{PrivateMediaCache.clear();MeowStreams.clear();await FirebaseAuth.instance.signOut();},child:const Text('Sair da conta'))
+      TextButton(onPressed:()async{_meowSignup=null;PrivateMediaCache.clear();MeowStreams.clear();await FirebaseAuth.instance.signOut();},child:const Text('Sair da conta'))
     ]))));
   });
 }
@@ -375,59 +393,71 @@ class LoadingCat extends StatelessWidget {
   );
 }
 
+class _MeowSignupDraft {
+ final String login,displayName; Uint8List? bytes; final String? mime;
+ _MeowSignupDraft(this.login,this.displayName,this.bytes,this.mime);
+}
+_MeowSignupDraft? _meowSignup;
 class LoginPage extends StatefulWidget {
-  const LoginPage({
-    super.key
+ const LoginPage({super.key});
+ @override State<LoginPage> createState()=>_LoginPageState();
 }
-);
-  @override State<LoginPage> createState()=>_LoginPageState();
-}
-
 class _LoginPageState extends State<LoginPage> {
-  final name=TextEditingController(),
-  password=TextEditingController();
-  bool register=false,
-  busy=false;
-  @override void dispose(){
-    name.dispose();
-    password.dispose();
-    super.dispose();
-}
-  Future<void> submit() async {
-    final n=cleanName(name.text);
-    if (!RegExp(r'^[a-z0-9_]{3,20}$').hasMatch(n)) {
-      notice(context, 'Usuário: 3 a 20 letras, números ou _.');
-      return;
-}
-    if(password.text.length<8){
-      notice(context, 'A senha precisa de 8 caracteres.');
-      return;
-}
-    setState(()=>busy=true);
-    try {
-      if(register){
-        await FirebaseAuth.instance.createUserWithEmailAndPassword(email:loginEmail(n), password:password.text);
-        // MeowIdentityGate provisions the public profile through the trusted backend.
-        // Never store the login name in a publicly readable Firestore document.
-}else{
-        await FirebaseAuth.instance.signInWithEmailAndPassword(email:loginEmail(n), password:password.text);
-}
-}catch(e){
-      if(mounted)notice(context, e);
-}
-    if(mounted)setState(()=>busy=false);
-}
-    @override Widget build(BuildContext c)=>Scaffold(body:Center(child:SingleChildScrollView(padding:const EdgeInsets.all(24),
-      child:ConstrainedBox(constraints:const BoxConstraints(maxWidth:420), child:Column(mainAxisSize:MainAxisSize.min,
-        children:[const Image(image:AssetImage('assets/meow_foreground.png'), width:88, height:88), const SizedBox(height:18), Text(register?'Criar conta Meow':'Entrar no Meow',
-      style:const TextStyle(fontSize:24, fontWeight:FontWeight.bold)
-), const SizedBox(height:22), TextField(controller:name, decoration:const InputDecoration(labelText:'Usuário')),
-        const SizedBox(height:12), TextField(controller:password, obscureText:true, decoration:const InputDecoration(labelText:'Senha')),
-        const SizedBox(height:14), FilledButton(onPressed:busy?null:submit, child:Text(busy?'Aguarde...':register?'Criar conta':'Entrar')),
-        TextButton(onPressed:()=>setState(()=>register=!register), child:Text(register?'Já tenho conta':'Criar conta')),
-]
-))
-)));
+ final name=TextEditingController(),display=TextEditingController(),password=TextEditingController(),confirm=TextEditingController();
+ int step=0; // Welcome, login, signup identity, signup password.
+ bool busy=false,hide=true,hideConfirm=true;
+ Uint8List? photo;String? mime;String? error;
+ @override void dispose(){name.dispose();display.dispose();password.dispose();confirm.dispose();super.dispose();}
+ void go(int next){if(busy)return;FocusManager.instance.primaryFocus?.unfocus();setState((){step=next;error=null;hide=true;hideConfirm=true;});}
+ void back(){if(step==3){go(2);}else{go(0);}}
+ bool validLogin()=>RegExp(r'^[a-z0-9_]{3,20}$').hasMatch(cleanName(name.text));
+ void next(){if(display.text.trim().isEmpty||display.text.trim().length>15){setState(()=>error='Informe um nome de exibição de até 15 caracteres.');return;}if(!validLogin()){setState(()=>error='Usuário: 3 a 20 letras, números ou _.');return;}go(3);}
+ Future<void> choosePhoto()async{
+  if(busy)return;
+  setState(()=>busy=true);
+  try{
+   final source=await showModalBottomSheet<String>(context:context,builder:(c)=>SafeArea(child:Column(mainAxisSize:MainAxisSize.min,children:[ListTile(leading:const Icon(Icons.photo_library),title:const Text('Galeria'),onTap:()=>Navigator.pop(c,'gallery')),ListTile(leading:const Icon(Icons.folder),title:const Text('Arquivos / GIF original'),onTap:()=>Navigator.pop(c,'file'))])));
+   if(!mounted||source==null)return;
+   final file=source=='gallery'?await ImagePicker().pickImage(source:ImageSource.gallery,requestFullMetadata:false):await files.openFile(acceptedTypeGroups:const [files.XTypeGroup(label:'Imagens',extensions:['png','jpg','jpeg','webp','gif'])]);
+   if(file==null||!mounted)return;
+   final type=const {'png':'image/png','jpg':'image/jpeg','jpeg':'image/jpeg','webp':'image/webp','gif':'image/gif'}[file.name.split('.').last.toLowerCase()];
+   if(type==null||await file.length()>avatarLimit)throw Exception('Escolha PNG, JPG, WebP ou GIF de até 8 MiB.');
+   final bytes=await file.readAsBytes();if(bytes.isEmpty||bytes.length>avatarLimit)throw Exception('Imagem inválida.');
+   final codec=await ui.instantiateImageCodec(bytes);codec.dispose();
+   if(mounted)setState((){photo=bytes;mime=type;error=null;});
+  }catch(e){if(mounted)setState(()=>error=e.toString().replaceFirst('Exception: ',''));}finally{if(mounted)setState(()=>busy=false);}
+ }
+ Future<void> submit()async{
+  if(busy)return;
+  final signup=step==3;
+  if(!validLogin()){setState(()=>error='Usuário: 3 a 20 letras, números ou _.');return;}
+  if(password.text.length<8){setState(()=>error='A senha precisa de pelo menos 8 caracteres.');return;}
+  if(signup&&password.text!=confirm.text){setState(()=>error='As senhas não coincidem.');return;}
+  if(signup&&(display.text.trim().isEmpty||display.text.trim().length>15)){go(2);return;}
+  final login=cleanName(name.text); final draft=signup?_MeowSignupDraft(login,display.text.trim(),photo,mime):null;
+  setState((){busy=true;error=null;});
+  _meowSignup=draft;
+  try{
+   if(signup){await FirebaseAuth.instance.createUserWithEmailAndPassword(email:loginEmail(login),password:password.text);}
+   else{await FirebaseAuth.instance.signInWithEmailAndPassword(email:loginEmail(login),password:password.text);}
+  }on FirebaseAuthException catch(e){
+   if(identical(_meowSignup,draft))_meowSignup=null;
+   if(mounted)setState((){if(signup&&e.code=='email-already-in-use'){step=2;error='Este nome de usuário não está disponível.';}else{error=switch(e.code){'wrong-password'||'invalid-credential'||'user-not-found'=>'Usuário ou senha inválidos.','weak-password'=>'Escolha uma senha mais forte.','too-many-requests'=>'Muitas tentativas. Tente mais tarde.','network-request-failed'=>'Verifique sua conexão.',_=>'Não foi possível acessar a conta. (${e.code})'};}});
+  }catch(_){if(identical(_meowSignup,draft))_meowSignup=null;if(mounted)setState(()=>error='Não foi possível acessar a conta. Tente novamente.');}
+  finally{if(mounted)setState(()=>busy=false);}
+ }
+ Widget passwordField(TextEditingController controller,String label,bool hidden,VoidCallback toggle)=>TextField(controller:controller,enabled:!busy,obscureText:hidden,autocorrect:false,enableSuggestions:false,decoration:InputDecoration(labelText:label,prefixIcon:const Icon(Icons.lock_outline),suffixIcon:IconButton(onPressed:toggle,icon:Icon(hidden?Icons.visibility_outlined:Icons.visibility_off_outlined))));
+ Widget loginField()=>TextField(controller:name,enabled:!busy,autocorrect:false,enableSuggestions:false,maxLength:20,decoration:const InputDecoration(labelText:'Nome de usuário',prefixIcon:Icon(Icons.person_outline),counterText:''));
+ @override Widget build(BuildContext c)=>PopScope(canPop:step==0&&!busy,onPopInvokedWithResult:(didPop,_) {if(!didPop&&!busy)back();},child:Scaffold(
+  appBar:step==0?null:AppBar(automaticallyImplyLeading:false,leading:IconButton(onPressed:busy?null:back,icon:const Icon(Icons.arrow_back)),title:Text(step==1?'Entrar':step==2?'Etapa 1 de 2':'Etapa 2 de 2')),
+  body:SafeArea(child:Center(child:SingleChildScrollView(padding:const EdgeInsets.all(24),child:ConstrainedBox(constraints:const BoxConstraints(maxWidth:420),child:Column(crossAxisAlignment:CrossAxisAlignment.stretch,mainAxisSize:MainAxisSize.min,children:[
+   if(step==0||step==1)...[const Center(child:Image(image:AssetImage('assets/meow_foreground.png'),width:110,height:110)),const SizedBox(height:16),Text(step==0?'MEOW SOCIAL':'Bem-vindo de volta!',textAlign:TextAlign.center,style:const TextStyle(fontSize:27,fontWeight:FontWeight.bold)),const SizedBox(height:12)],
+   if(step==0)...[const Text('Converse. Conecte-se. Personalize.',textAlign:TextAlign.center,style:TextStyle(color:Colors.white70)),const SizedBox(height:44),const Text('Seu espaço, seus amigos.',textAlign:TextAlign.center,style:TextStyle(fontSize:19)),const SizedBox(height:24),FilledButton(onPressed:()=>go(2),child:const Text('Criar conta')),OutlinedButton(onPressed:()=>go(1),child:const Text('Já tenho uma conta'))],
+   if(step==1)...[const SizedBox(height:12),loginField(),const SizedBox(height:12),passwordField(password,'Senha',hide,()=>setState(()=>hide=!hide)),const SizedBox(height:18),FilledButton(onPressed:busy?null:submit,child:const Text('Entrar')),TextButton(onPressed:busy?null:()=>go(2),child:const Text('Criar uma conta'))],
+   if(step==2)...[const Text('Boas-vindas à Meow!',textAlign:TextAlign.center,style:TextStyle(fontSize:24,fontWeight:FontWeight.bold)),const SizedBox(height:8),const Text('Personalize sua identidade.',textAlign:TextAlign.center),const SizedBox(height:20),Center(child:InkWell(onTap:busy?null:choosePhoto,customBorder:const CircleBorder(),child:Container(width:104,height:104,decoration:BoxDecoration(shape:BoxShape.circle,border:Border.all(color:purple,width:2)),child:ClipOval(child:photo==null?const Column(mainAxisAlignment:MainAxisAlignment.center,children:[Icon(Icons.camera_alt_outlined,color:purple,size:32),Text('Adicionar foto',style:TextStyle(fontSize:11))]):Image.memory(photo!,fit:BoxFit.cover,gaplessPlayback:true))))),if(photo!=null)TextButton(onPressed:busy?null:()=>setState((){photo=null;mime=null;}),child:const Text('Remover foto')),const SizedBox(height:20),TextField(controller:display,enabled:!busy,maxLength:15,decoration:const InputDecoration(labelText:'Nome de exibição')),const SizedBox(height:8),loginField(),const SizedBox(height:6),const Text('O nome de login é privado. Sua disponibilidade será verificada ao criar a conta.',style:TextStyle(fontSize:12,color:Colors.white54)),const SizedBox(height:12),FilledButton(onPressed:busy?null:next,child:const Text('Continuar'))],
+   if(step==3)...[const Text('Crie sua senha',textAlign:TextAlign.center,style:TextStyle(fontSize:24,fontWeight:FontWeight.bold)),const SizedBox(height:18),passwordField(password,'Senha (mínimo 8 caracteres)',hide,()=>setState(()=>hide=!hide)),const SizedBox(height:12),passwordField(confirm,'Confirmar senha',hideConfirm,()=>setState(()=>hideConfirm=!hideConfirm)),const SizedBox(height:18),FilledButton(onPressed:busy?null:submit,child:const Text('Criar conta'))],
+   if(busy)const Padding(padding:EdgeInsets.symmetric(vertical:12),child:LinearProgressIndicator()),if(error!=null)Padding(padding:const EdgeInsets.only(top:12),child:Text(error!,style:const TextStyle(color:Colors.redAccent),textAlign:TextAlign.center)),
+  ])))))));
 }
 
 // Restore the 0.7.0 image decoder. Original bytes and GIF frames stay intact.
@@ -804,7 +834,7 @@ class _MeowBadgeAdminPageState extends State<MeowBadgeAdminPage> {
    if(!mounted)return;
    setState((){target=updated;selected=meowBadges(updated.data()??{});});
    notice(context,'Insígnias atualizadas.');
-  }catch(_){if(mounted)notice(context,'Não foi possível alterar as insígnias. Confira as permissões e a conexão.');}
+  }catch(e){if(mounted)notice(context,'Não foi possível alterar as insígnias: $e');}
   finally{if(mounted)setState(()=>busy=false);}
  }
  @override Widget build(BuildContext c)=>Scaffold(appBar:AppBar(title:const Text('Gerenciar insígnias')),body:ListView(padding:const EdgeInsets.all(16),children:[
@@ -861,7 +891,7 @@ class _MeowProfileSectionsState extends State<MeowProfileSections>{
  int section=0;
  @override Widget build(BuildContext c)=>Column(crossAxisAlignment:CrossAxisAlignment.stretch,children:[
    Row(children:[for(var i=0;i<3;i++)Expanded(child:TextButton(onPressed:(){setState(()=>section=i);},child:Column(children:[Text(['Sobre','Amigos','Servidores'][i],style:TextStyle(fontWeight:section==i?FontWeight.bold:FontWeight.normal,color:widget.ink)),const SizedBox(height:4),Container(height:2,color:section==i?purple:Colors.transparent)])))]),const Divider(height:1),const SizedBox(height:12),
-   if(section==0)...[const Text('Sobre mim',style:TextStyle(fontWeight:FontWeight.bold)),const SizedBox(height:6),Text((widget.data['bio']?.toString()??'').isEmpty?'Sem biografia.':widget.data['bio'].toString()),const SizedBox(height:16),FriendsPreview(uid:widget.uid,background:widget.cardColor,ink:widget.ink),const SizedBox(height:16),Text(widget.uid==myUid?'Meus servidores':'Servidores em comum',style:const TextStyle(fontWeight:FontWeight.bold)),MeowCommonServers(uid:widget.uid)]
+   if(section==0)...[const Text('Sobre mim',style:TextStyle(fontWeight:FontWeight.bold)),const SizedBox(height:6),MeowMessageText(text:(widget.data['bio']?.toString()??'').isEmpty?'Sem biografia.':widget.data['bio'].toString(),people:const {}),const SizedBox(height:16),FriendsPreview(uid:widget.uid,background:widget.cardColor,ink:widget.ink),const SizedBox(height:16),Text(widget.uid==myUid?'Meus servidores':'Servidores em comum',style:const TextStyle(fontWeight:FontWeight.bold)),MeowCommonServers(uid:widget.uid)]
    else if(section==1)...[FriendsPreview(uid:widget.uid,background:widget.cardColor,ink:widget.ink),TextButton(onPressed:()=>Navigator.push(c,MaterialPageRoute(builder:(_)=>RelationshipListPage(uid:widget.uid,kind:'friends'))),child:const Text('Ver todos os amigos'))]
    else ...[Text(widget.uid==myUid?'Meus servidores':'Servidores em comum',style:const TextStyle(fontWeight:FontWeight.bold)),MeowCommonServers(uid:widget.uid)],
  ]);
@@ -880,6 +910,7 @@ class AppSettingsPage extends StatelessWidget {
   @override Widget build(BuildContext c)=>Scaffold(appBar:AppBar(title:const Text('Configurações')),
     body:ListView(children:[
       const Padding(padding:EdgeInsets.all(20),child:MeowTitle()),
+      const MeowPendingDeletions(),
       ListTile(leading:const Icon(Icons.person),title:const Text('Conta'),onTap:()=>Navigator.push(c,MaterialPageRoute(builder:(_)=>Scaffold(appBar:AppBar(title:const Text('Conta')),body:ListView(children:[
         ListTile(title:const Text('Nome de usuário (login)'),subtitle:SelectableText(privateLoginName(myUid)),leading:const Icon(Icons.lock_outline)),
         ListTile(title:const Text('Editar perfil'),onTap:()=>Navigator.push(c,MaterialPageRoute(builder:(_)=>EditProfilePage(uid:myUid)))),
@@ -897,7 +928,7 @@ class NotificationSettingsPage extends StatefulWidget {
 class _NotificationSettingsPageState extends State<NotificationSettingsPage> {
   @override Widget build(BuildContext c)=>Scaffold(appBar:AppBar(title:const Text('Notificações')),body:MeowStreamBuilder<DocumentSnapshot<Map<String,dynamic>>>(stream:db.collection('users').doc(myUid).collection('preferences').doc('notifications').meowSnapshots(),builder:(c,s){
     final d=s.data?.data()??{};final enabled=d['enabled']!=false;
-    return ListView(children:[SwitchListTile(title:const Text('Notificações da conta'),value:enabled,onChanged:(v)async{try{await db.collection('users').doc(myUid).collection('preferences').doc('notifications').set({'enabled':v},SetOptions(merge:true));if(v)await FirebaseMessaging.instance.requestPermission();}catch(e){if(c.mounted)notice(c,e);}}),const ListTile(title:Text('Silenciar conversas'),subtitle:Text('Use o sino no cabeçalho de um canal ou DM.')),const ListTile(title:Text('Privacidade'),subtitle:Text('O conteúdo das mensagens fica oculto na notificação do sistema.'))]);
+    return ListView(children:[SwitchListTile(title:const Text('Notificações da conta'),value:enabled,onChanged:(v)async{try{await db.collection('users').doc(myUid).collection('preferences').doc('notifications').set({'enabled':v},SetOptions(merge:true));if(v)await FirebaseMessaging.instance.requestPermission();}catch(e){if(c.mounted)notice(c,e);}}),const ListTile(title:Text('Silenciar conversas'),subtitle:Text('Use o sino no cabeçalho de um canal ou DM.')),const ListTile(title:Text('Privacidade'),subtitle:Text('As notificações mostram o remetente e uma prévia. Controle a exibição na tela bloqueada nas configurações do aparelho.'))]);
   }));
 }
 class EditProfilePage extends StatefulWidget {
@@ -1120,13 +1151,22 @@ class _SocialHomeState extends State<SocialHome> with WidgetsBindingObserver {
   StreamSubscription<RemoteMessage>? foregroundSub,openedSub;
   OverlayEntry? notificationOverlay; Timer? notificationTimer;
   final seenNotifications=<String>{};
+  String? lastOpenedNotification; DateTime? lastOpenedAt;
   Timer? presenceTimer;
+  StreamSubscription<QuerySnapshot<Map<String,dynamic>>>? deletionSub;
   bool appActive = true;
   @override void initState(){
     super.initState();
     WidgetsBinding.instance.addObserver(this);
     initNotifications();
     touchPresence();
+    final uid=myUid;
+    deletionSub=db.collection('servers').where('members',arrayContains:uid).meowSnapshots().listen((snapshot){
+      if(!mounted||FirebaseAuth.instance.currentUser?.uid!=uid)return;
+      for(final d in snapshot.docs){final data=d.data();if(data['deleting']==true&&data['ownerId']==uid)MeowDeletionQueue.resume(uid,d.id);}
+      final selected=serverId;
+      if(selected!=null&&!snapshot.metadata.isFromCache&&!snapshot.docs.any((d)=>d.id==selected&&d.data()['deleting']!=true))setState((){serverId=null;channelId=null;showingChannels=true;});
+    },onError:(Object e){debugPrint('Meow exclusões pendentes: $e');});
     presenceTimer = Timer.periodic(const Duration(seconds: 45), (_) {
       if (appActive) touchPresence();
     });
@@ -1144,18 +1184,34 @@ class _SocialHomeState extends State<SocialHome> with WidgetsBindingObserver {
   @override void didChangeAppLifecycleState(AppLifecycleState state){
     appActive = state == AppLifecycleState.resumed;
     if (appActive) touchPresence();
+    syncNativeThread();
 }
   Future<void> initNotifications()async{
     try{
       final fcm=FirebaseMessaging.instance;final registeredUid=myUid;
       await fcm.requestPermission(alert:true, badge:true, sound:true);
       if(!mounted)return;
+      _meowNativeNotifications.setMethodCallHandler((call) async {
+        if(!mounted||FirebaseAuth.instance.currentUser?.uid!=registeredUid)return;
+        if(call.method=='openNotification'&&call.arguments is Map){
+          final data=Map<String,dynamic>.from(call.arguments as Map);
+          await openNotification(RemoteMessage(data:data));
+        }
+      });
+      activeThread.addListener(syncNativeThread);
+      await _nativeNotification<void>('setSession',registeredUid);
+      if(!mounted||FirebaseAuth.instance.currentUser?.uid!=registeredUid)return;
+      final nativeInitial=await _nativeNotification<Map<dynamic,dynamic>>('getInitialNotification');
+      if(!mounted||FirebaseAuth.instance.currentUser?.uid!=registeredUid)return;
+      syncNativeThread();
+      if(nativeInitial!=null)WidgetsBinding.instance.addPostFrameCallback((_){if(mounted)openNotification(RemoteMessage(data:Map<String,dynamic>.from(nativeInitial)));});
       foregroundSub=FirebaseMessaging.onMessage.listen(showNotification);
       openedSub=FirebaseMessaging.onMessageOpenedApp.listen(openNotification);
       final initial=await fcm.getInitialMessage();
       if(initial!=null&&mounted)WidgetsBinding.instance.addPostFrameCallback((_){if(mounted)openNotification(initial);});
       final token=await fcm.getToken();
-      if(token!=null)await db.collection('users').doc(myUid).collection('devices').doc(token).set({
+      if(!mounted||FirebaseAuth.instance.currentUser?.uid!=registeredUid)return;
+      if(token!=null)await db.collection('users').doc(registeredUid).collection('devices').doc(token).set({
         'token':token,
         'updatedAt':FieldValue.serverTimestamp()
 }
@@ -1179,9 +1235,11 @@ class _SocialHomeState extends State<SocialHome> with WidgetsBindingObserver {
   @override void dispose(){
     WidgetsBinding.instance.removeObserver(this);
     tokenSub?.cancel(); foregroundSub?.cancel(); openedSub?.cancel(); dismissNotification();
-    presenceTimer?.cancel();
+    activeThread.removeListener(syncNativeThread);_meowNativeNotifications.setMethodCallHandler(null);
+    presenceTimer?.cancel();deletionSub?.cancel();
     super.dispose();
 }
+  void syncNativeThread(){unawaited(_nativeNotification<void>('setActiveThread',{'recipientId':FirebaseAuth.instance.currentUser?.uid,'threadKey':appActive?activeThread.value:null}));}
   void dismissNotification(){notificationTimer?.cancel();notificationOverlay?.remove();notificationOverlay=null;}
   Future<void> showNotification(RemoteMessage message) async {
     final path=message.data['messagePath']??'';
@@ -1195,7 +1253,7 @@ class _SocialHomeState extends State<SocialHome> with WidgetsBindingObserver {
       final text=(d['text']?.toString()??'').trim();
       if(!mounted||activeThread.value==threadFromPath(path))return;
       dismissNotification();
-      notificationOverlay=OverlayEntry(builder:(c)=>Positioned(top:MediaQuery.paddingOf(c).top+8,left:12,right:12,child:MeowNotificationBanner(key:ValueKey(path),sender:sender,title:userLabel(u),subtitle:message.data['kind']=='reply'?'Respondeu à sua mensagem':message.data['kind']=='mention'?'Mencionou você':path.startsWith('dms/')?'Mensagem privada':'Mensagem no servidor',preview:text.isEmpty?'Nova mensagem':text,onDismiss:dismissNotification,onTap:(){dismissNotification();openNotification(message);} )));
+      notificationOverlay=OverlayEntry(builder:(c)=>Positioned(top:MediaQuery.paddingOf(c).top+8,left:12,right:12,child:MeowNotificationBanner(key:ValueKey(path),sender:sender,title:userLabel(u),subtitle:message.data['kind']=='reply'?'Respondeu à sua mensagem':message.data['kind']=='mention'?'Mencionou você':path.startsWith('dms/')?'Mensagem privada':'Mensagem no servidor',preview:text.isEmpty?(message.data['notificationBody']?.toString()??'Nova mensagem'):text,onDismiss:dismissNotification,onTap:(){dismissNotification();openNotification(message);} )));
       final overlay=meowNavigator.currentState?.overlay;if(overlay==null){notificationOverlay=null;return;}
       overlay.insert(notificationOverlay!);notificationTimer=Timer(const Duration(seconds:5),dismissNotification);
     }catch(_){}
@@ -1203,6 +1261,8 @@ class _SocialHomeState extends State<SocialHome> with WidgetsBindingObserver {
   Future<void> openNotification(RemoteMessage message) async {
     if(!mounted||message.data['recipientId']!=FirebaseAuth.instance.currentUser?.uid)return;
     final path=message.data['messagePath']??'';if(!validMessagePath(path))return;
+    final now=DateTime.now();if(lastOpenedNotification==path&&lastOpenedAt!=null&&now.difference(lastOpenedAt!)<const Duration(seconds:2))return;
+    lastOpenedNotification=path;lastOpenedAt=now;
     try{
       final snap=await db.doc(path).get();if(!snap.exists||!mounted)return;
       final parts=path.split('/');final nav=meowNavigator.currentState;if(nav==null)return;
@@ -1341,13 +1401,13 @@ class _SocialHomeState extends State<SocialHome> with WidgetsBindingObserver {
 ), IconButton(onPressed:joinInvite, icon:const Icon(Icons.group_add)), Expanded(child:MeowStreamBuilder<QuerySnapshot<Map<String,
       dynamic>>>(stream:db.collection('servers').where('members', arrayContains:myUid).meowSnapshots(), builder:(c,
     s
-)=>ListView(children:[UnreadDmRail(uid:myUid),for(final d in s.data?.docs??[])Padding(key:ValueKey(d.id),padding:const EdgeInsets.symmetric(vertical:5),
+)=>ListView(children:[UnreadDmRail(uid:myUid),for(final d in (s.data?.docs??[]).where((d)=>d.data()['deleting']!=true))Padding(key:ValueKey(d.id),padding:const EdgeInsets.symmetric(vertical:5),
       child:IconButton(tooltip:d.data()['name']?.toString()??'Servidor', onPressed:()=>setState((){
         serverId=d.id;
         channelId=null;
         showingChannels=true;
 }
-), icon:Stack(clipBehavior:Clip.none,children:[PrivateImage(scope:'server', id:d.id, slot:'avatar', size:48),if(d.data()['deleting']==true)const Positioned(right:-2,bottom:-2,child:Icon(Icons.hourglass_top,size:16,color:Colors.amber))else Positioned(right:-2,bottom:-2,child:ServerUnreadDot(key:ValueKey(d.id),serverId:d.id,uid:myUid))]))
+), icon:Stack(clipBehavior:Clip.none,children:[PrivateImage(scope:'server', id:d.id, slot:'avatar', size:48),Positioned(right:-2,bottom:-2,child:ServerUnreadDot(key:ValueKey(d.id),serverId:d.id,uid:myUid))]))
 )]))
 )])));
   Widget channelList(List<QueryDocumentSnapshot<Map<String, dynamic>>> docs){
@@ -1391,20 +1451,10 @@ class _SocialHomeState extends State<SocialHome> with WidgetsBindingObserver {
       builder:(c,s){
         if(s.hasError){restoreServerNavigation(selected);return Row(children:[rail(),const Expanded(child:Center(child:Text('Não foi possível carregar os servidores.')))]);}
         if(!s.hasData)return Row(children:[rail(),const Expanded(child:Center(child:CircularProgressIndicator()))]);
-        final matches=s.data!.docs.where((d)=>d.id==selected);
+        final matches=s.data!.docs.where((d)=>d.id==selected&&d.data()['deleting']!=true);
         if(matches.isEmpty){
           restoreServerNavigation(selected);
           return Row(children:[rail(),const Expanded(child:Center(child:Padding(padding:EdgeInsets.all(16),child:Text('Servidor indisponível. Selecione outro servidor.',textAlign:TextAlign.center))))]);
-        }
-        final data=matches.first.data();
-        if(data['deleting']==true){
-          restoreServerNavigation(selected);
-          return Row(children:[rail(),Expanded(child:Center(child:Padding(padding:const EdgeInsets.all(16),child:Column(
-            mainAxisSize:MainAxisSize.min,children:[const Text('Servidor em processo de exclusão.',textAlign:TextAlign.center),
-            if(data['ownerId']==myUid)FilledButton(onPressed:()async{
-              await confirmServerDelete(c,selected,resume:true);
-            },child:const Text('Retomar exclusão'))],
-          ))))]);
         }
         return activeServerContent(selected);
       },
@@ -1633,7 +1683,8 @@ class _MessageThreadState extends State<MessageThread> with RouteAware,WidgetsBi
   Widget mentionSuggestions(BuildContext c,double availableHeight){
     final q=mentionQuery;
     if(q==null||availableHeight<=0)return const SizedBox.shrink();
-    final suggestions=people.entries.where((e){final serial=meowSerial(e.value);return serial.isNotEmpty&&(userLabel(e.value).toLowerCase().contains(q)||serial.startsWith(q.replaceFirst('#','')));}).take(5).toList();
+    final matches=people.entries.where((e){final serial=meowSerial(e.value);return serial.isNotEmpty&&(userLabel(e.value).toLowerCase().contains(q)||serial.startsWith(q.replaceFirst('#','')));}).toList();
+    matches.sort((a,b)=>(a.key==widget.uid?0:1).compareTo(b.key==widget.uid?0:1));final suggestions=matches.take(5).toList();
     final showEveryone=widget.serverId!=null&&everyoneAllowed&&'everyone'.startsWith(q);
     if(!showEveryone&&suggestions.isEmpty)return const SizedBox.shrink();
     return ConstrainedBox(
@@ -1954,7 +2005,7 @@ class _MessageThreadState extends State<MessageThread> with RouteAware,WidgetsBi
           final mine=author==widget.uid;
           final name=people.containsKey(author)?userLabel(people[author]!):d['author']?.toString()??'Usuário';
           final messageContents=<Widget>[
-            if(d['replyToId']!=null)Container(padding:const EdgeInsets.only(left:6),decoration:const BoxDecoration(border:Border(left:BorderSide(color:Colors.white38,width:2))),child:Text('↳ ${d['replyAuthor']??''}: ${d['replyText']??''}',maxLines:2,overflow:TextOverflow.ellipsis,style:const TextStyle(color:Colors.white70,fontSize:12))),
+            if(d['replyToId']!=null)Container(padding:const EdgeInsets.only(left:6),decoration:const BoxDecoration(border:Border(left:BorderSide(color:Colors.white38,width:2))),child:DefaultTextStyle.merge(style:const TextStyle(color:Colors.white70,fontSize:12),child:MeowMessageText(text:'↳ ${d['replyAuthor']??''}: ${d['replyText']??''}',people:people,compact:true))),
             if((d['text']?.toString()??'').isNotEmpty)MeowMessageText(text:d['text'].toString(),people:people),
             if(attachment is Map&&attachment['id'] is String)AttachmentView(key:ValueKey(attachment['id']),attachment:attachment),
             if(d['expression'] is Map)ExpressionImage(data:Map<String,dynamic>.from(d['expression'] as Map),message:doc.reference.path,size:(d['expression'] as Map)['kind']=='emoji'&&(d['text']?.toString()??'').isNotEmpty?26.0:null),
@@ -2465,92 +2516,65 @@ Future<Map<String,dynamic>> meowServerAction(String id,String action,String uid)
 }
 
 Future<bool> confirmServerDelete(BuildContext context,String id,{bool resume=false}) async {
- final uid=FirebaseAuth.instance.currentUser?.uid;
- if(uid==null)return false;
- final ok=await showDialog<bool>(context:context,builder:(c)=>AlertDialog(
-   title:Text(resume?'Retomar exclusão?':'Excluir servidor?'),
-   content:Text(resume?'A exclusão já foi iniciada. Continue até a confirmação do servidor.':
-     'Esta ação é permanente. Os canais, mensagens, convites e arquivos deste servidor serão apagados. As expressões históricas serão preservadas pelo backend.'),
-   actions:[TextButton(onPressed:()=>Navigator.pop(c,false),child:const Text('Cancelar')),
-     FilledButton(onPressed:()=>Navigator.pop(c,true),child:Text(resume?'Retomar':'Excluir'))],
- ));
+ final uid=FirebaseAuth.instance.currentUser?.uid;if(uid==null)return false;
+ final ok=await showDialog<bool>(context:context,builder:(c)=>AlertDialog(title:Text(resume?'Retomar exclusão?':'Excluir servidor?'),content:Text(resume?'Continuar a limpeza dos dados?':'Esta ação é permanente. O servidor será retirado da lista assim que o backend confirmar o bloqueio. A limpeza dos dados continuará depois.'),actions:[TextButton(onPressed:()=>Navigator.pop(c,false),child:const Text('Cancelar')),FilledButton(onPressed:()=>Navigator.pop(c,true),child:Text(resume?'Retomar':'Excluir'))]));
  if(ok!=true||!context.mounted||FirebaseAuth.instance.currentUser?.uid!=uid)return false;
- final done=await showDialog<bool>(context:context,barrierDismissible:false,
-   builder:(_)=>_MeowServerDeleteDialog(id:id,uid:uid));
- if(done==true){
-   PrivateMediaCache.invalidate(mediaUrl('server',id,'avatar'));
-   PrivateMediaCache.invalidate(mediaUrl('server',id,'banner'));
-   if(context.mounted)notice(context,'Servidor excluído definitivamente.');
- }
- return done==true;
+ final result=await showDialog<bool>(context:context,barrierDismissible:false,builder:(_)=>_MeowServerDeleteDialog(id:id,uid:uid));
+ if(result==true&&context.mounted)notice(context,'Exclusão iniciada. O servidor não está mais disponível.');
+ return result==true;
 }
-
+class MeowDeletionQueue {
+ static final _running=<String>{};
+ static final errors=ValueNotifier<Map<String,String>>({});
+ static String key(String uid,String id)=>'$uid/$id';
+ static void resume(String uid,String id,{int delay=0}){
+  final k=key(uid,id);if(!_running.add(k))return;
+  unawaited(_run(uid,id,k,delay));
+ }
+ static Future<void> _run(String uid,String id,String k,int delay)async{
+  try{
+   var wait=delay;var failures=0;
+   while(FirebaseAuth.instance.currentUser?.uid==uid){
+    if(wait>0)await Future<void>.delayed(Duration(milliseconds:wait.clamp(0,180000).toInt()));
+    if(FirebaseAuth.instance.currentUser?.uid!=uid)return;
+    try{
+     final r=await meowServerAction(id,'delete',uid);failures=0;
+     if(errors.value.containsKey(k)){final next={...errors.value}..remove(k);errors.value=next;}
+     if(r['deleted']==true){PrivateMediaCache.invalidate(mediaUrl('server',id,'avatar'));PrivateMediaCache.invalidate(mediaUrl('server',id,'banner'));return;}
+     wait=(r['retryAfterMs'] as int).clamp(500,180000).toInt();
+    }catch(e){
+     if(FirebaseAuth.instance.currentUser?.uid!=uid)return;
+     errors.value={...errors.value,k:e.toString().replaceFirst('Exception: ','')};
+     if(++failures>=3)return;wait=3000*failures;
+    }
+   }
+  }finally{_running.remove(k);}
+ }
+}
+class MeowPendingDeletions extends StatelessWidget {
+ const MeowPendingDeletions({super.key});
+ @override Widget build(BuildContext c)=>MeowStreamBuilder<QuerySnapshot<Map<String,dynamic>>>(stream:db.collection('servers').where('members',arrayContains:myUid).meowSnapshots(),builder:(c,s){
+  final uid=myUid;final pending=(s.data?.docs??[]).where((d)=>d.data()['deleting']==true&&d.data()['ownerId']==uid).toList();
+  if(pending.isEmpty)return const SizedBox.shrink();
+  return ExpansionTile(leading:const Icon(Icons.delete_outline),title:Text('Exclusões pendentes (${pending.length})'),children:[for(final d in pending)ValueListenableBuilder<Map<String,String>>(valueListenable:MeowDeletionQueue.errors,builder:(c,errors,_)=>ListTile(title:Text(d.data()['name']?.toString()??'Servidor'),subtitle:Text(errors[MeowDeletionQueue.key(uid,d.id)]??'Limpeza dos dados em andamento.'),trailing:TextButton(onPressed:()=>MeowDeletionQueue.resume(uid,d.id),child:const Text('Retomar'))))]);
+ });
+}
 class _MeowServerDeleteDialog extends StatefulWidget {
- final String id,uid;
- const _MeowServerDeleteDialog({required this.id,required this.uid});
+ final String id,uid;const _MeowServerDeleteDialog({required this.id,required this.uid});
  @override State<_MeowServerDeleteDialog> createState()=>_MeowServerDeleteDialogState();
 }
-class _MeowServerDeleteDialogState extends State<_MeowServerDeleteDialog> {
- bool running=true,stopped=false;
- String status='Verificando permissões…';
- String? error;
- bool get active=>mounted&&!stopped&&FirebaseAuth.instance.currentUser?.uid==widget.uid;
- @override void initState(){super.initState();unawaited(process());}
- @override void dispose(){stopped=true;super.dispose();}
- void complete(){if(!active)return;stopped=true;Navigator.pop(context,true);}
- Future<void> process() async {
-   if(!active)return;
-   setState((){running=true;error=null;status='Verificando permissões…';});
-   try{
-     final info=await meowServerAction(widget.id,'inspect',widget.uid);
-     if(!active)return;
-     if(info['deleted']==true){complete();return;}
-     if(info['owner']!=true)throw Exception('Somente o proprietário pode excluir o servidor.');
-     if(info['enabled']!=true)throw Exception('A exclusão de servidores ainda está desativada no backend.');
-     while(active){
-       setState(()=>status='Processando exclusão…');
-       final result=await meowServerAction(widget.id,'delete',widget.uid);
-       if(!active)return;
-       if(result['deleted']==true){complete();return;}
-       final stage=result['stage'];
-       final rawDelay=result['retryAfterMs'] as int;
-       final delay=Duration(milliseconds:max(250,rawDelay));
-       final clock=Stopwatch()..start();
-       while(active&&clock.elapsed<delay){
-         final remaining=delay-clock.elapsed;
-         final seconds=(remaining.inMilliseconds/1000).ceil();
-         final label=switch(stage){
-           'locked'||'draining'=>'Aguardando uploads em andamento: ${seconds}s',
-           'storage'=>'Removendo arquivos do servidor…',
-           'documents'=>'Removendo canais e mensagens…',
-           'invites'=>'Removendo convites…',
-           _=>'Finalizando exclusão…',
-         };
-         if(status!=label)setState(()=>status=label);
-         await Future<void>.delayed(Duration(milliseconds:min(1000,max(1,remaining.inMilliseconds))));
-       }
-     }
-   }catch(e){
-     if(active)setState((){running=false;error=e.toString().replaceFirst('Exception: ','');});
-   }finally{
-     if(mounted&&!stopped&&FirebaseAuth.instance.currentUser?.uid!=widget.uid){
-       setState((){running=false;error='Sessão alterada. Feche esta tela.';});
-     }
-   }
+class _MeowServerDeleteDialogState extends State<_MeowServerDeleteDialog>{
+ bool busy=true;String? error;
+ @override void initState(){super.initState();unawaited(start());}
+ Future<void> start()async{
+  if(!mounted)return;setState((){busy=true;error=null;});
+  try{
+   final r=await meowServerAction(widget.id,'delete',widget.uid);
+   if(r['deleted']!=true){MeowDeletionQueue.resume(widget.uid,widget.id,delay:r['retryAfterMs'] as int);}else{PrivateMediaCache.invalidate(mediaUrl('server',widget.id,'avatar'));PrivateMediaCache.invalidate(mediaUrl('server',widget.id,'banner'));}
+   if(mounted)Navigator.pop(context,true);
+  }catch(e){if(mounted)setState((){busy=false;error=e.toString().replaceFirst('Exception: ','');});}
  }
- @override Widget build(BuildContext c)=>PopScope(
-   onPopInvokedWithResult:(didPop,_) {if(didPop)stopped=true;},
-   child:AlertDialog(title:const Text('Excluir servidor'),content:Column(
-     mainAxisSize:MainAxisSize.min,crossAxisAlignment:CrossAxisAlignment.start,children:[
-       if(running)...[const LinearProgressIndicator(),const SizedBox(height:16),Text(status)],
-       if(error!=null)Text(error!),
-       const SizedBox(height:12),
-       const Text('Se a exclusão já começou, sair desta tela não a cancela. Você poderá retomá-la depois.'),
-     ]),actions:[
-       TextButton(onPressed:(){stopped=true;Navigator.pop(c,false);},child:const Text('Continuar depois')),
-       if(!running)FilledButton(onPressed:active?()=>unawaited(process()):null,child:const Text('Tentar novamente')),
-     ]),
- );
+ @override Widget build(BuildContext c)=>PopScope(canPop:!busy,child:AlertDialog(title:const Text('Excluir servidor'),content:busy?const Column(mainAxisSize:MainAxisSize.min,children:[LinearProgressIndicator(),SizedBox(height:12),Text('Confirmando exclusão…')]):Text(error??'Não foi possível confirmar a exclusão.'),actions:[if(!busy)...[TextButton(onPressed:()=>Navigator.pop(c,false),child:const Text('Fechar')),FilledButton(onPressed:start,child:const Text('Tentar novamente'))]]));
 }
 
 class ProfileBackground extends StatefulWidget {
@@ -2849,13 +2873,139 @@ class ReplySwipe extends StatefulWidget {
  @override State<ReplySwipe> createState()=>_ReplySwipeState();
 }
 class _ReplySwipeState extends State<ReplySwipe>{double x=0;bool dragging=false,haptic=false;@override Widget build(BuildContext c)=>GestureDetector(onHorizontalDragStart:(_){setState(()=>dragging=true);},onHorizontalDragUpdate:(d){setState(()=>x=(x+(d.primaryDelta??0)*.65).clamp(0.0,90.0).toDouble());if(x>=55&&!haptic){haptic=true;HapticFeedback.selectionClick();}},onHorizontalDragEnd:(_){if(x>=55)widget.onReply();setState((){x=0;dragging=false;haptic=false;});},onHorizontalDragCancel:()=>setState((){x=0;dragging=false;haptic=false;}),child:Stack(alignment:Alignment.centerLeft,children:[if(x>5)Padding(padding:const EdgeInsets.only(left:8),child:Icon(Icons.reply,color:x>=55?purple:Colors.white54)),AnimatedContainer(duration:dragging?Duration.zero:const Duration(milliseconds:160),transform:Matrix4.translationValues(x,0,0),child:widget.child)]));}
+// Discord-style display formatting. Original text is retained for edits, copies and Firestore.
 class MeowMessageText extends StatelessWidget {
- final String text;final Map<String,Map<String,dynamic>> people;const MeowMessageText({super.key,required this.text,required this.people});
+ final String text;final Map<String,Map<String,dynamic>> people;final bool compact;
+ const MeowMessageText({super.key,required this.text,required this.people,this.compact=false});
  static final _emojiPattern=RegExp(r'[\u{1F000}-\u{1FAFF}\u{2600}-\u{27BF}]',unicode:true);
- static final _mentions=_meowMentionPattern;
  bool emoji(String c)=>_emojiPattern.hasMatch(c);
- @override Widget build(BuildContext c){if(!_emojiPattern.hasMatch(text)&&!text.contains('@'))return Text(text);final graphemes=text.characters.where((g)=>g.trim().isNotEmpty).toList();final only=graphemes.isNotEmpty&&graphemes.length<=5&&graphemes.every(emoji);if(only)return Text(text,style:const TextStyle(fontSize:48));final spans=<InlineSpan>[];final matcher=_mentions;void plain(String t){if(t.isEmpty)return;if(!_emojiPattern.hasMatch(t)){spans.add(TextSpan(text:t));return;}var buffer=StringBuffer();bool? large;void flush(){if(buffer.isNotEmpty){spans.add(TextSpan(text:buffer.toString(),style:large==true?const TextStyle(fontSize:26):null));buffer=StringBuffer();}}for(final g in t.characters){final next=emoji(g);if(large!=null&&large!=next)flush();large=next;buffer.write(g);}flush();}var last=0;for(final m in matcher.allMatches(text)){plain(text.substring(last,m.start));final name=m.group(1)!.toLowerCase();final found=people.entries.where((e)=>meowSerial(e.value).isNotEmpty&&name=='#${meowSerial(e.value)}');if(found.isNotEmpty){final id=found.first.key;spans.add(WidgetSpan(alignment:PlaceholderAlignment.middle,child:InkWell(onTap:()=>openProfile(c,id),child:Container(padding:const EdgeInsets.symmetric(horizontal:2),decoration:BoxDecoration(color:purple.withOpacity(.18),borderRadius:BorderRadius.circular(4)),child:Text('@${userLabel(found.first.value)}',style:const TextStyle(color:Color(0xFFC4B5FD),fontWeight:FontWeight.w600))))));}else{spans.add(TextSpan(text:m.group(0),style:name=='everyone'?const TextStyle(color:Color(0xFFC4B5FD)):null));}last=m.end;}plain(text.substring(last));return Text.rich(TextSpan(children:spans));}
+ static const _markers=['__***','__**','__*','***','**','__','~~','*','_'];
+ static final _customLink=RegExp(r'\[([^\]\n]+)\]\((https?://[^\s)]+)\)');
+ static final _rawLink=RegExp(r'https?://[^\s<>]+');
+ static final _wordChar=RegExp(r'[A-Za-z0-9]');
+ String closing(String marker)=>switch(marker){'__***'=>'***__','__**'=>'**__','__*'=>'*__',_=>marker};
+ TextStyle decorationFor(String marker,TextStyle base){
+  final decorations=<TextDecoration>[if(base.decoration!=null)base.decoration!,if(marker.startsWith('__'))TextDecoration.underline,if(marker=='~~')TextDecoration.lineThrough];
+  return base.copyWith(fontWeight:marker.contains('**')?FontWeight.bold:base.fontWeight,fontStyle:marker=='_'||marker=='*'||marker.endsWith('***')||marker=='__*'?FontStyle.italic:base.fontStyle,decoration:decorations.isEmpty?null:TextDecoration.combine(decorations));
+ }
+ int findClose(String source,String delimiter,int start){
+  var i=start;
+  while(i<source.length){
+   final pos=source.indexOf(delimiter,i);if(pos<0)return -1;
+   var slashes=0;for(var j=pos-1;j>=0&&source[j]=='\\';j--){slashes++;}
+   if(slashes.isEven)return pos;i=pos+delimiter.length;
+  }
+  return -1;
+ }
+ Future<void> openLink(BuildContext c,String url)async{
+  final uri=Uri.tryParse(url);
+  if(uri==null||!['https','http'].contains(uri.scheme.toLowerCase())||uri.host.isEmpty){notice(c,'Endereço inválido.');return;}
+  final ok=await showDialog<bool>(context:c,builder:(d)=>AlertDialog(title:const Text('Abrir link externo?'),content:SelectableText(uri.toString()),actions:[TextButton(onPressed:()=>Navigator.pop(d,false),child:const Text('Cancelar')),FilledButton(onPressed:()=>Navigator.pop(d,true),child:const Text('Abrir'))]));
+  if(ok!=true||!c.mounted)return;
+  try{if(!await launchUrl(uri,mode:LaunchMode.externalApplication)&&c.mounted)notice(c,'Não foi possível abrir o link.');}catch(_){if(c.mounted)notice(c,'Não foi possível abrir o link.');}
+ }
+ List<InlineSpan> inline(BuildContext c,String source,TextStyle style,{int depth=0}){
+  if(depth>12)return [TextSpan(text:source,style:style)];
+  final out=<InlineSpan>[];var buffer=StringBuffer();
+  void flush(){if(buffer.isEmpty)return;final str=buffer.toString();buffer=StringBuffer();if(compact||!_emojiPattern.hasMatch(str)){out.add(TextSpan(text:str,style:style));return;}
+   var current=StringBuffer();bool? large;void add(){if(current.isEmpty)return;out.add(TextSpan(text:current.toString(),style:large==true?style.copyWith(fontSize:26):style));current=StringBuffer();}
+   for(final g in str.characters){final next=emoji(g);if(large!=null&&large!=next)add();large=next;current.write(g);}add();
+  }
+  var i=0;
+  while(i<source.length){
+   if(source[i]=='\\'&&i+1<source.length&&r'\*_~`|#>[]().-!+'.contains(source[i+1])){buffer.write(source[i+1]);i+=2;continue;}
+   if(source[i]=='`'){
+    var n=1;while(i+n<source.length&&source[i+n]=='`')n++;
+    final delim=source.substring(i,i+n),end=findClose(source,delim,i+n);
+    if(end>i+n){flush();out.add(TextSpan(text:source.substring(i+n,end),style:style.copyWith(fontFamily:'monospace',backgroundColor:const Color(0xFF30303A),color:const Color(0xFFF4D4AA))));i=end+n;continue;}
+   }
+   if(source.startsWith('||',i)){
+    final end=findClose(source,'||',i+2);if(end>i+2){flush();final content=source.substring(i+2,end);if(compact){out.add(TextSpan(text:'[spoiler]',style:style));}else{out.add(WidgetSpan(alignment:PlaceholderAlignment.middle,child:MeowSpoiler(key:ValueKey('$i:$content'),child:Text.rich(TextSpan(children:inline(c,content,style,depth:depth+1))))));}i=end+2;continue;}
+   }
+   final link=_customLink.matchAsPrefix(source,i);
+   final raw=_rawLink.matchAsPrefix(source,i);
+   if(link!=null||raw!=null){
+    final match=link??raw!;final label=link?.group(1)??match.group(0)!;var url=link?.group(2)??label;var suffix='';
+    if(link==null){while(url.isNotEmpty&&'.,;:!?)]'.contains(url[url.length-1])){suffix=url[url.length-1]+suffix;url=url.substring(0,url.length-1);}}
+    if(url.isNotEmpty){flush();final title=link==null?url:label;final dest=url;final linkStyle=style.copyWith(color:const Color(0xFF93C5FD),decoration:TextDecoration.underline);
+     if(compact){out.add(TextSpan(text:title,style:linkStyle));}else{out.add(WidgetSpan(alignment:PlaceholderAlignment.middle,child:InkWell(onTap:()=>openLink(c,dest),child:Text(title,style:linkStyle))));}
+     if(suffix.isNotEmpty)out.add(TextSpan(text:suffix,style:style));i=match.end;continue;
+    }
+   }
+   final mention=_meowMentionPattern.matchAsPrefix(source,i);
+   if(mention!=null){
+    flush();final name=mention.group(1)!.toLowerCase();final found=people.entries.where((e)=>meowSerial(e.value).isNotEmpty&&name=='#${meowSerial(e.value)}');
+    if(found.isNotEmpty){final person=found.first;final title='@${userLabel(person.value)}';final mentionStyle=style.copyWith(color:const Color(0xFFC4B5FD),fontWeight:FontWeight.w600,backgroundColor:purple.withOpacity(.18));if(compact){out.add(TextSpan(text:title,style:mentionStyle));}else{out.add(WidgetSpan(alignment:PlaceholderAlignment.middle,child:InkWell(onTap:()=>openProfile(c,person.key),child:Text(title,style:mentionStyle))));}}
+    else{out.add(TextSpan(text:mention.group(0),style:name=='everyone'?style.copyWith(color:const Color(0xFFC4B5FD)):style));}
+    i=mention.end;continue;
+   }
+   var matched=false;
+   for(final marker in _markers){
+    if(!source.startsWith(marker,i))continue;
+    if(marker=='_'&&i>0&&_wordChar.hasMatch(source[i-1]))continue;
+    final start=i+marker.length;if(start>=source.length||source[start].trim().isEmpty)continue;
+    final close=closing(marker);var end=findClose(source,close,start);
+    if(end<=start||source[end-1].trim().isEmpty)continue;
+    // For a single marker, skip a doubled marker inside it, so *a **b** c* works.
+    if(marker.length==1){while(end>=0&&((end+1<source.length&&source[end+1]==marker)||(end>start&&source[end-1]==marker))){end=findClose(source,close,end+1);}if(end<=start)continue;}
+    flush();out.addAll(inline(c,source.substring(start,end),decorationFor(marker,style),depth:depth+1));i=end+close.length;matched=true;break;
+   }
+   if(matched)continue;
+   buffer.write(source[i]);i++;
+  }
+  flush();return out;
+ }
+ Widget rich(BuildContext c,String source,TextStyle style)=>Text.rich(TextSpan(children:inline(c,source,style)),maxLines:compact?2:null,overflow:compact?TextOverflow.ellipsis:TextOverflow.clip);
+ Widget quote(BuildContext c,String content,TextStyle style)=>Container(margin:const EdgeInsets.symmetric(vertical:3),padding:const EdgeInsets.only(left:9),decoration:const BoxDecoration(border:Border(left:BorderSide(width:3,color:Colors.white38))),child:rich(c,content,style));
+ @override Widget build(BuildContext c){
+  final style=DefaultTextStyle.of(c).style;
+  if(compact)return rich(c,text.replaceAll('\n',' '),style);
+  final graphemes=text.characters.where((g)=>g.trim().isNotEmpty).toList();
+  if(graphemes.isNotEmpty&&graphemes.length<=5&&graphemes.every(emoji))return Text(text,style:style.copyWith(fontSize:48));
+  final lines=text.replaceAll('\r\n','\n').split('\n');final blocks=<Widget>[];final plain=<String>[];
+  void flush(){if(plain.isEmpty)return;blocks.add(rich(c,plain.join('\n'),style));plain.clear();}
+  var i=0;
+  while(i<lines.length){
+   final line=lines[i];
+   if(line.startsWith('```')){
+    final first=line.substring(3);final same=first.indexOf('```');
+    if(same>=0){flush();blocks.add(MeowCodeBlock(code:first.substring(0,same),language:''));final remainder=first.substring(same+3);if(remainder.isNotEmpty)plain.add(remainder);i++;continue;}
+    var end=i+1;while(end<lines.length&&!lines[end].startsWith('```'))end++;
+    if(end<lines.length){flush();final lang=RegExp(r'^[\w+.#-]{0,24}$').hasMatch(first.trim())?first.trim():'';final code=[if(lang.isEmpty&&first.isNotEmpty)first,...lines.sublist(i+1,end)].join('\n');blocks.add(MeowCodeBlock(code:code,language:lang));final remainder=lines[end].substring(3);if(remainder.isNotEmpty)plain.add(remainder);i=end+1;continue;}
+   }
+   final heading=RegExp(r'^(#{1,3}|-#)\s+(.+)$').firstMatch(line);
+   if(heading!=null){flush();final marker=heading.group(1)!;final size=marker=='#'?24.0:marker=='##'?20.0:marker=='###'?17.0:12.0;blocks.add(Padding(padding:const EdgeInsets.symmetric(vertical:2),child:rich(c,heading.group(2)!,style.copyWith(fontSize:size,fontWeight:marker=='-#'?FontWeight.normal:FontWeight.bold,color:marker=='-#'?style.color?.withOpacity(.7):style.color))));i++;continue;}
+   if(line.startsWith('>>> ')){flush();blocks.add(quote(c,[line.substring(4),...lines.skip(i+1)].join('\n'),style));break;}
+   if(line.startsWith('> ')){flush();final q=<String>[];while(i<lines.length&&lines[i].startsWith('> ')){q.add(lines[i].substring(2));i++;}blocks.add(quote(c,q.join('\n'),style));continue;}
+   final list=RegExp(r'^(\s*)([-*+]|\d+[.)])\s+(.+)$').firstMatch(line);
+   if(list!=null){flush();final indent=min(4,list.group(1)!.replaceAll('\t','  ').length~/2);final marker=list.group(2)!;blocks.add(Padding(padding:EdgeInsets.only(left:indent*12.0,top:1,bottom:1),child:Row(crossAxisAlignment:CrossAxisAlignment.start,children:[Text(RegExp(r'^\d').hasMatch(marker)?'$marker ':'• ',style:style),Expanded(child:rich(c,list.group(3)!,style))])));i++;continue;}
+   plain.add(line);i++;
+  }
+  flush();if(blocks.length==1)return blocks.first;return Column(mainAxisSize:MainAxisSize.min,crossAxisAlignment:CrossAxisAlignment.start,children:blocks);
+ }
 }
+class MeowSpoiler extends StatefulWidget {
+ final Widget child;const MeowSpoiler({super.key,required this.child});
+ @override State<MeowSpoiler> createState()=>_MeowSpoilerState();
+}
+class _MeowSpoilerState extends State<MeowSpoiler>{
+ bool visible=false;
+ @override Widget build(BuildContext c)=>GestureDetector(onTap:()=>setState(()=>visible=!visible),child:Semantics(button:true,label:visible?'Ocultar spoiler':'Revelar spoiler',child:Container(padding:const EdgeInsets.symmetric(horizontal:4,vertical:1),decoration:BoxDecoration(color:visible?Colors.white12:const Color(0xFF55555E),borderRadius:BorderRadius.circular(4)),child:visible?widget.child:Stack(children:[ExcludeSemantics(child:Opacity(opacity:0,child:IgnorePointer(child:widget.child))),const Positioned.fill(child:Center(child:Text('Spoiler',style:TextStyle(fontSize:11,color:Colors.white70))))]))));
+}
+class MeowCodeBlock extends StatelessWidget {
+ final String code,language;const MeowCodeBlock({super.key,required this.code,required this.language});
+ List<InlineSpan> highlighted(){
+  const base=TextStyle(fontFamily:'monospace',fontSize:13,color:Color(0xFFE4E4E7));
+  if(language.isEmpty)return [TextSpan(text:code,style:base)];
+  final pattern=RegExp(r'''(//[^\n]*|/\*[\s\S]*?\*/|#[^\n]*|"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|\b(?:class|return|if|else|while|for|def|function|const|let|var|final|import|from|async|await|true|false|null|new|void|int|String|print|public|private|try|catch|throw|switch|case|break|continue)\b|\b\d+(?:\.\d+)?\b)''');
+  final spans=<InlineSpan>[];var last=0;
+  for(final m in pattern.allMatches(code)){if(m.start>last)spans.add(TextSpan(text:code.substring(last,m.start),style:base));final token=m.group(0)!;final color=token.startsWith('//')||token.startsWith('/*')||token.startsWith('#')?const Color(0xFF91A399):token.startsWith('"')||token.startsWith("'")?const Color(0xFFB7E3A1):RegExp(r'^\d').hasMatch(token)?const Color(0xFFF5C78B):const Color(0xFFC4B5FD);spans.add(TextSpan(text:token,style:base.copyWith(color:color)));last=m.end;}
+  if(last<code.length)spans.add(TextSpan(text:code.substring(last),style:base));return spans;
+ }
+ @override Widget build(BuildContext c)=>Container(margin:const EdgeInsets.symmetric(vertical:4),decoration:BoxDecoration(color:const Color(0xFF16161D),borderRadius:BorderRadius.circular(8),border:Border.all(color:Colors.white12)),child:Column(mainAxisSize:MainAxisSize.min,crossAxisAlignment:CrossAxisAlignment.start,children:[Row(children:[Expanded(child:Padding(padding:const EdgeInsets.only(left:10),child:Text(language.isEmpty?'Código':language,style:const TextStyle(fontSize:11,color:Colors.white54)))),IconButton(tooltip:'Copiar código',visualDensity:VisualDensity.compact,onPressed:()async{await Clipboard.setData(ClipboardData(text:code));if(c.mounted)notice(c,'Código copiado.');},icon:const Icon(Icons.copy,size:16))]),const Divider(height:1),SingleChildScrollView(scrollDirection:Axis.horizontal,padding:const EdgeInsets.all(10),child:Text.rich(TextSpan(children:highlighted())))]));
+}
+
+
 Future<void> saveMeowFile(BuildContext c,Uint8List bytes,String name,bool image)async{
  if(image){await Gal.putImageBytes(bytes,name:name);if(c.mounted)notice(c,'Imagem salva na galeria.');return;}
  final dot=name.lastIndexOf('.');final ext=dot>0?name.substring(dot+1):'';final stem=dot>0?name.substring(0,dot):name;
@@ -2926,23 +3076,37 @@ class MeowDiscover extends StatefulWidget {
  @override State<MeowDiscover> createState()=>_MeowDiscoverState();
 }
 class _MeowDiscoverState extends State<MeowDiscover>{
- final search=TextEditingController();bool busy=false;String? error;List<QueryDocumentSnapshot<Map<String,dynamic>>>? results;int generation=0;
+ final search=TextEditingController();bool busy=false,more=false,searched=false;String? error;String query='';int generation=0;
+ DocumentSnapshot<Map<String,dynamic>>? cursor;final results=<QueryDocumentSnapshot<Map<String,dynamic>>>[];
  @override void dispose(){generation++;search.dispose();super.dispose();}
- Future<void> find()async{final q=search.text.trim();final g=++generation;setState((){busy=q.isNotEmpty;error=null;results=null;});if(q.isEmpty)return;
+ Future<void> find({bool next=false})async{
+  if(next&&busy)return;
+  final q=next?query:search.text.trim();final g=++generation;
+  if(!next)setState((){query=q;results.clear();cursor=null;searched=q.isNotEmpty;more=false;});
+  if(q.isEmpty){setState(()=>busy=false);return;}
+  setState((){busy=true;error=null;});
   try{
-   final exact=await meowFindUsers(q);final matches={for(final d in exact)d.id:d};
-   if(!RegExp(r'^#?[0-9]{1,8}$').hasMatch(q)&&matches.length<20){
-    final alternatives={q,q.toLowerCase(),q[0].toUpperCase()+q.substring(1)};
-    for(final prefix in alternatives){if(matches.length>=20)break;final r=await db.collection('users').orderBy('displayName').startAt([prefix]).endAt(['$prefix\uf8ff']).limit(20).get();for(final d in r.docs){matches[d.id]=d;}}
+   if(RegExp(r'^#?[0-9]{1,8}$').hasMatch(q)){final found=await meowFindUsers(q);if(mounted&&g==generation)setState(()=>results.addAll(found));return;}
+   final lower=q.toLowerCase();var last=cursor;final found=<QueryDocumentSnapshot<Map<String,dynamic>>>[];var hasMore=true;
+   // Scan at most 100 public profiles per action; use pagination rather than a forbidden unbounded query.
+   for(var page=0;page<5;page++){
+    Query<Map<String,dynamic>> req=db.collection('users').orderBy(FieldPath.documentId).limit(20);
+    if(last!=null)req=req.startAfterDocument(last);
+    final batch=await req.get();if(!mounted||g!=generation)return;
+    found.addAll(batch.docs.where((d)=>(d.data()['displayName']?.toString()??'').toLowerCase().contains(lower)));
+    if(batch.docs.isNotEmpty)last=batch.docs.last;
+    if(batch.docs.length<20){hasMore=false;break;}
+    if(found.length>=20)break;
    }
-   if(mounted&&g==generation)setState(()=>results=matches.values.take(20).toList());
+   if(mounted&&g==generation)setState((){cursor=last;more=hasMore;results.addAll(found);});
   }catch(_){if(mounted&&g==generation)setState(()=>error='Não foi possível pesquisar. Tente novamente.');}
   finally{if(mounted&&g==generation)setState(()=>busy=false);}
  }
- @override Widget build(BuildContext c)=>Column(children:[Padding(padding:const EdgeInsets.all(12),child:TextField(controller:search,textInputAction:TextInputAction.search,onSubmitted:(_)=>find(),decoration:InputDecoration(hintText:'Nome de exibição ou ID',prefixIcon:const Icon(Icons.search),suffixIcon:IconButton(tooltip:'Pesquisar',icon:const Icon(Icons.arrow_forward),onPressed:find)))),
-  Expanded(child:busy?const Center(child:CircularProgressIndicator()):error!=null?Center(child:Text(error!)):results==null?const Center(child:Column(mainAxisSize:MainAxisSize.min,children:[Icon(Icons.people_outline,size:46,color:purple),SizedBox(height:12),Text('Encontre seus amigos')])):results!.isEmpty?const Center(child:Text('Nenhum usuário encontrado.')):ListView(children:[for(final d in results!)ListTile(leading:ProfileAvatar(uid:d.id),title:Text(userLabel(d.data())),subtitle:Text(meowPublicId(d.data())),onTap:()=>openProfile(c,d.id))])),
+ @override Widget build(BuildContext c)=>Column(children:[Padding(padding:const EdgeInsets.all(12),child:TextField(controller:search,textInputAction:TextInputAction.search,onSubmitted:(_)=>find(),decoration:InputDecoration(hintText:'Nome de exibição ou ID',prefixIcon:const Icon(Icons.search),suffixIcon:IconButton(tooltip:'Pesquisar',icon:const Icon(Icons.arrow_forward),onPressed:()=>find())))),
+  Expanded(child:!searched?const Center(child:Column(mainAxisSize:MainAxisSize.min,children:[Icon(Icons.people_outline,size:46,color:purple),SizedBox(height:12),Text('Encontre seus amigos')])):ListView(children:[for(final d in results)ListTile(leading:ProfileAvatar(uid:d.id),title:Text(userLabel(d.data())),subtitle:Text(meowPublicId(d.data())),onTap:()=>openProfile(c,d.id)),if(busy)const Center(child:Padding(padding:EdgeInsets.all(16),child:CircularProgressIndicator())),if(error!=null)ListTile(title:Text(error!),trailing:TextButton(onPressed:()=>find(next:results.isNotEmpty),child:const Text('Tentar'))),if(!busy&&error==null&&results.isEmpty&&!more)const Center(child:Padding(padding:EdgeInsets.all(20),child:Text('Nenhum usuário encontrado.'))),if(more&&!busy)TextButton(onPressed:()=>find(next:true),child:const Text('Buscar mais resultados'))])),
  ]);
 }
+
 class MeowChannelTitle extends StatelessWidget {
  final String server,name;const MeowChannelTitle({super.key,required this.server,required this.name});
  @override Widget build(BuildContext c)=>Column(crossAxisAlignment:CrossAxisAlignment.start,mainAxisSize:MainAxisSize.min,children:[Text('# $name',maxLines:1,overflow:TextOverflow.ellipsis,style:const TextStyle(fontWeight:FontWeight.bold,fontSize:17)),MeowStreamBuilder<DocumentSnapshot<Map<String,dynamic>>>(stream:db.collection('servers').doc(server).meowSnapshots(),builder:(c,s){if(!s.hasData||s.hasError)return const SizedBox.shrink();final ids=List<String>.from(s.data?.data()?['members']??[]);return MeowOnlineCount(key:ValueKey(server),ids:ids);})]);
