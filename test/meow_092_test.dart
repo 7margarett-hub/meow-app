@@ -1,3 +1,4 @@
+import 'dart:typed_data';
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:meow/main.dart';
@@ -21,7 +22,32 @@ void main(){
  });
  test('Menções e avatares',(){
   expect(mentionNames('oi @#00000001 @everyone'),{'#00000001','everyone'});
-  expect(meowChatAvatarSize,54);
+  expect(meowChatAvatarSize,44);
+ });
+ test('Prévia usa resolução proporcional, limitada e reutilizável',(){
+  expect(meowPreviewPixels(44,2),128);
+  expect(meowPreviewPixels(44,3),256);
+  expect(meowPreviewPixels(400,3),1536);
+  expect(meowPreviewPixels(double.infinity,2),0);
+  expect(meowPreviewPixels(0,2),0);
+  expect(meowStaticPreview(Uint8List.fromList([255,216,255,224,0,0,0,0])),isTrue);
+  expect(meowStaticPreview(Uint8List.fromList([71,73,70,56,57,97,0,0])),isFalse);
+ });
+ testWidgets('Indicador não lido é circular e verde, desaparece quando lido',(tester)async{
+  await tester.pumpWidget(const MaterialApp(home:Scaffold(body:Center(child:MeowUnreadMark(unread:true)))));
+  final mark=find.descendant(of:find.byType(MeowUnreadMark),matching:find.byType(DecoratedBox));
+  expect(mark,findsOneWidget);
+  final decoration=tester.widget<DecoratedBox>(mark).decoration as BoxDecoration;
+  expect(decoration.shape,BoxShape.circle);expect(decoration.color,const Color(0xFF39F57A));
+  expect(tester.getSize(find.byType(MeowUnreadMark)),const Size(10,10));
+  await tester.pumpWidget(const MaterialApp(home:Scaffold(body:Center(child:MeowUnreadMark(unread:false)))));
+  expect(mark,findsNothing);
+ });
+ testWidgets('As três insígnias usam suas artes aprovadas',(tester)async{
+  await tester.pumpWidget(MaterialApp(home:Scaffold(body:Row(children:[for(final b in meowBadgeDefinitions)meowBadgeArt(b)]))));
+  final images=tester.widgetList<Image>(find.byType(Image)).map((i)=>(i.image as AssetImage).assetName).toList();
+  expect(images,['assets/badges/developer.png','assets/badges/beta_tester.png','assets/badges/bug_hunter.png']);
+  await tester.pumpAndSettle();
  });
  testWidgets('Markdown combinado e texto malformado', (tester)async{
   Future<void> show(String text)async{await tester.pumpWidget(MaterialApp(home:Scaffold(body:MeowMessageText(text:text,people:const {}))));await tester.pump();}
