@@ -1,6 +1,11 @@
 import 'dart:async';
 import 'dart:convert';
 import 'dart:math';
+import 'dart:io';
+import 'package:path_provider/path_provider.dart';
+import 'package:video_player/video_player.dart';
+import 'package:get_thumbnail_video/video_thumbnail.dart';
+import 'package:shared_preferences/shared_preferences.dart';
 import 'dart:typed_data';
 import 'dart:ui' as ui;
 import 'package:gal/gal.dart';
@@ -68,8 +73,8 @@ Future<void> meowAccountAction(Map<String,dynamic> body) async {
 }
 String currentPresence(Map<String,dynamic>? d) {
   final p=d?['presence']?.toString()??'offline';
-  final t=d?['lastSeen'];
-  if(p=='invisible'||t is! Timestamp||DateTime.now().difference(t.toDate())>const Duration(seconds:110))return 'offline';
+  final t=d?['lastSeen'];final closed=d?['presenceClosedAt'];
+  if(p=='invisible'||t is! Timestamp||(closed is Timestamp&&closed.compareTo(t)>=0)||DateTime.now().difference(t.toDate())>const Duration(seconds:80))return 'offline';
   return presenceLabels.containsKey(p)?p:'offline';
 }
 Future<void> notifyMessage(String path) async {
@@ -81,12 +86,13 @@ Future<void> notifyMessage(String path) async {
 Future<void> logoutMeow(BuildContext c) async {
   try {
     final uid=myUid; final f=FirebaseMessaging.instance;
+    try{await db.collection('users').doc(uid).update({'lastSeen':FieldValue.serverTimestamp(),'presenceClosedAt':FieldValue.serverTimestamp()}).timeout(const Duration(seconds:3));}catch(_){}
     final token=await f.getToken();
     if(token!=null)await db.collection('users').doc(uid).collection('devices').doc(token).delete();
     try {await f.deleteToken();}catch(_){}
   }catch(e){if(c.mounted)notice(c,'Não foi possível desregistrar as notificações: $e');return;}
   await _nativeNotification<void>('clearSession',myUid);
-   PrivateMediaCache.clear();MeowStreams.clear();activeThread.value=null;
+   PrivateMediaCache.clear();await MeowVideoCache.clear();MeowStreams.clear();activeThread.value=null;
   meowNavigator.currentState?.popUntil((route)=>route.isFirst);
   await FirebaseAuth.instance.signOut();
 }
@@ -256,6 +262,7 @@ class PrivateMediaCache {
     _pending.remove(key);
   }
 
+  static void purgeCompleted(){_completed.clear();_usedBytes=0;PaintingBinding.instance.imageCache.clear();}
   static void clear() {
     _session++;
     _generation.clear();
@@ -488,7 +495,19 @@ class PrivateImage extends StatefulWidget {
 
 class _PrivateImageState extends State<PrivateImage> {
   late Future<Uint8List?> future;
-  Future<Uint8List?> fetch() => PrivateMediaCache.get(widget.url);
+  StreamSubscription<DocumentSnapshot<Map<String,dynamic>>>? revisionSub;
+  String revision=''; int revisionEpoch=0;
+  Uri get revisionUrl=>revision.isEmpty?widget.url:widget.url.replace(queryParameters:{...widget.url.queryParameters,'revision':revision});
+  Future<Uint8List?> fetch() => PrivateMediaCache.get(revisionUrl);
+  void watchRevision(){
+    revisionSub?.cancel();revisionSub=null;final epoch=++revisionEpoch;
+    if(widget.scope!='profile'||!TickerMode.of(context))return;
+    revisionSub=db.collection('users').doc(widget.id).meowSnapshots().listen((snap){
+      if(!mounted||epoch!=revisionEpoch)return;final next=snap.data()?['${widget.slot}Revision']?.toString()??'';
+      if(next!=revision)setState((){revision=next;future=fetch();});
+    },onError:(Object _){});
+  }
+  @override void didChangeDependencies(){super.didChangeDependencies();watchRevision();}
   void refresh(){
     if(changedImage.value==widget.url&&mounted){
       setState(()=>future=fetch());
@@ -501,20 +520,20 @@ class _PrivateImageState extends State<PrivateImage> {
 }
   @override void didUpdateWidget(covariant PrivateImage old){
     super.didUpdateWidget(old);
-    if(old.url!=widget.url)future=fetch();
+    if(old.url!=widget.url){revision='';future=fetch();watchRevision();}
 }
   @override void dispose(){
-    changedImage.removeListener(refresh);
+    revisionEpoch++;revisionSub?.cancel();changedImage.removeListener(refresh);
     super.dispose();
 }
   @override Widget build(BuildContext c){
-    final banner=widget.slot=='banner';
+    final banner=widget.slot=='banner';final statusIcon=widget.slot.startsWith('status');
       return SizedBox(width:widget.width??(banner?double.infinity:widget.size), height:widget.size, child:ClipRRect(borderRadius:widget.borderRadius??BorderRadius.circular(banner?8:widget.size),
-      child:FutureBuilder<Uint8List?>(future:future, builder:(c, s){
+      child:FutureBuilder<Uint8List?>(key:ValueKey(revisionUrl),future:future, builder:(c, s){
           final placeholder=ColoredBox(color:panel, child:Center(child:Icon(banner?Icons.landscape:widget.scope=='server'?Icons.groups:Icons.person,
         color:Colors.white54, size:banner?38:widget.size*.5
 )));
-          return s.data==null?placeholder:meowPreview(c,s.data!,width:widget.width??widget.size,height:widget.size,fit:BoxFit.cover,errorBuilder:(c,
+          return s.data==null?placeholder:meowPreview(c,s.data!,width:widget.width??widget.size,height:widget.size,fit:statusIcon?BoxFit.contain:BoxFit.cover,errorBuilder:(c,
         e, st
 ){ debugPrint('Meow: falha ao decodificar imagem: $e'); return placeholder; });
 }
@@ -529,9 +548,10 @@ class ChangeImage extends StatefulWidget {
   slot,
   label;
   final bool iconOnly;
+  final ValueChanged<MeowDraftImage>? onDraft;
   const ChangeImage(this.scope, this.id, this.slot, this.label, {
     super.key,
-    this.iconOnly=false
+    this.iconOnly=false,this.onDraft
 }
 );
   @override State<ChangeImage> createState()=>_ChangeImageState();
@@ -577,12 +597,13 @@ class _ChangeImageState extends State<ChangeImage> {
       }
       if(edit){
         if(!mounted)return;
-        final result=await Navigator.push<Uint8List>(context,MaterialPageRoute(builder:(_)=>MeowCropPage(bytes:bytes,aspect:widget.slot=='avatar'?1.0:widget.slot=='banner'?3.0:0.75,circle:widget.slot=='avatar')));
+        final result=await Navigator.push<Uint8List>(context,MaterialPageRoute(builder:(_)=>MeowCropPage(bytes:bytes,aspect:widget.slot=='avatar'?1.0:widget.slot=='banner'?(widget.scope=='profile'?meowProfileBannerAspect:3.0):0.75,circle:widget.slot=='avatar',showAvatarGuide:widget.scope=='profile'&&widget.slot=='banner')));
         if(result==null||!mounted)return;
         if(!identical(result,bytes))mime='image/png';
         bytes=result;
       }
       if(bytes.length>limit)throw Exception('Imagem acima do limite após edição.');
+      if(widget.onDraft!=null){widget.onDraft!(MeowDraftImage(bytes,mime));return;}
       final headers = await authHeaders();
       headers['Content-Type'] = mime;
       final r=await http.put(mediaUrl(widget.scope, widget.id, widget.slot), headers:headers,
@@ -639,13 +660,13 @@ class _PresenceGlyphState extends State<_PresenceGlyph>{
     if(!TickerMode.of(context)||currentPresence(widget.data)=='offline')return;
     final t=widget.data?['lastSeen'];
     if(t is! Timestamp)return;
-    final remaining=t.toDate().add(const Duration(seconds:110,milliseconds:50)).difference(DateTime.now());
+    final remaining=t.toDate().add(const Duration(seconds:80,milliseconds:50)).difference(DateTime.now());
     if(remaining>Duration.zero)timer=Timer(remaining,(){if(mounted)setState((){});});
   }
   @override void didChangeDependencies(){super.didChangeDependencies();schedule();}
-  @override void didUpdateWidget(covariant _PresenceGlyph old){super.didUpdateWidget(old);if(old.data?['lastSeen']!=widget.data?['lastSeen']||old.data?['presence']!=widget.data?['presence'])schedule();}
+  @override void didUpdateWidget(covariant _PresenceGlyph old){super.didUpdateWidget(old);if(old.data?['lastSeen']!=widget.data?['lastSeen']||old.data?['presence']!=widget.data?['presence']||old.data?['presenceClosedAt']!=widget.data?['presenceClosedAt'])schedule();}
   @override void dispose(){timer?.cancel();super.dispose();}
-  @override Widget build(BuildContext c)=>Container(width:13,height:13,decoration:BoxDecoration(color:presenceColor(currentPresence(widget.data)),shape:BoxShape.circle,border:Border.all(color:bg,width:2)));
+  @override Widget build(BuildContext c)=>Container(width:17,height:17,decoration:BoxDecoration(color:presenceColor(currentPresence(widget.data)),shape:BoxShape.circle,border:Border.all(color:bg,width:2)));
 }
 class ProfileAvatar extends StatelessWidget {
   final String uid;
@@ -716,10 +737,10 @@ class FollowButton extends StatelessWidget {
   const FollowButton({super.key,required this.target});
   @override Widget build(BuildContext context)=>MeowStreamBuilder<DocumentSnapshot<Map<String,dynamic>>>(
     stream:db.collection('users').doc(myUid).collection('following').doc(target).meowSnapshots(),
-    builder:(context,s)=>FilledButton.icon(
-      onPressed:()=>toggleFollow(target,s.data?.exists==true).catchError((Object e){if(context.mounted)notice(context,e);}),
-      icon:Icon(s.data?.exists==true?Icons.person_remove:Icons.person_add),
-      label:Text(s.data?.exists==true?'Deixar de seguir':'Seguir')));
+    builder:(context,s)=>SizedBox(height:44,child:FilledButton(
+      onPressed:!s.hasData?null:()=>toggleFollow(target,s.data?.exists==true).catchError((Object e){if(context.mounted)notice(context,e);}),
+      style:FilledButton.styleFrom(backgroundColor:purple,foregroundColor:Colors.white,padding:const EdgeInsets.symmetric(horizontal:8)),
+      child:FittedBox(fit:BoxFit.scaleDown,child:Text(s.data?.exists==true?'Deixar de seguir':'Seguir',maxLines:1)))));
 }
 class MeowMutualChecks {
  static final _cached=Expando<Future<List<String>>>('meowMutual');
@@ -733,12 +754,12 @@ class RelationshipCounters extends StatelessWidget {
   final String uid;
   const RelationshipCounters({super.key,required this.uid});
   @override Widget build(BuildContext context)=>Row(children:[
-    for(final kind in ['followers','following','friends']) Expanded(child:MeowStreamBuilder<QuerySnapshot<Map<String,dynamic>>>(
+    for(final kind in ['followers','following','friends']) ...[if(kind!='followers')Container(width:1,height:30,color:Theme.of(context).colorScheme.onSurface.withOpacity(.24)),Expanded(child:MeowStreamBuilder<QuerySnapshot<Map<String,dynamic>>>(
       stream:db.collection('users').doc(uid).collection(kind=='friends'?'following':kind).meowSnapshots(),
       builder:(context,s){
         if(kind=='friends')return FutureBuilder<List<String>>(future: MeowMutualChecks.ids(uid,s.data),builder:(context,c)=>_counter(context,kind,c.data?.length??0));
         return _counter(context,kind,s.data?.docs.length??0);
-      }))]);
+      }))]]);
   Widget _counter(BuildContext c,String kind,int count)=>TextButton(
     onPressed:()=>Navigator.push(c,MaterialPageRoute(builder:(_)=>RelationshipListPage(uid:uid,kind:kind))),
     child:Column(children:[Text('$count',style:const TextStyle(fontWeight:FontWeight.bold)),
@@ -775,21 +796,28 @@ Set<String> meowBadges(Map<String,dynamic> data){
  final raw=data['badges'];
  return raw is List?raw.whereType<String>().where((id)=>meowBadgeDefinitions.any((b)=>b.id==id)).toSet():<String>{};
 }
-class MeowProfileBadges extends StatelessWidget {
+class MeowProfileBadges extends StatefulWidget {
  final Map<String,dynamic> data;final Color background,ink;
  const MeowProfileBadges({super.key,required this.data,required this.background,required this.ink});
+ @override State<MeowProfileBadges> createState()=>_MeowProfileBadgesState();
+}
+class _MeowProfileBadgesState extends State<MeowProfileBadges> {
+ OverlayEntry? entry;Timer? fadeTimer,removeTimer;bool shown=true;
+ void dismiss(){fadeTimer?.cancel();removeTimer?.cancel();entry?.remove();entry?.dispose();entry=null;}
+ void show(MeowBadgeDefinition badge){
+   dismiss();shown=true;
+   final overlay=Overlay.of(context,rootOverlay:true);
+   entry=OverlayEntry(builder:(c)=>Positioned(top:MediaQuery.viewPaddingOf(c).top+5,left:16,right:16,child:IgnorePointer(child:TweenAnimationBuilder<double>(tween:Tween<double>(begin:0,end:shown?1:0),duration:const Duration(milliseconds:230),curve:Curves.easeOutCubic,builder:(c,value,child)=>Opacity(opacity:value,child:Transform.translate(offset:Offset(0,-12*(1-value)),child:child)),child:Center(child:ConstrainedBox(constraints:const BoxConstraints(maxWidth:340),child:Material(color:const Color(0xFF0A0A0E),borderRadius:BorderRadius.circular(30),elevation:8,child:Padding(padding:const EdgeInsets.symmetric(horizontal:15,vertical:11),child:Row(mainAxisSize:MainAxisSize.min,children:[Icon(badge.icon,color:badge.color,size:22),const SizedBox(width:10),Flexible(child:Column(mainAxisSize:MainAxisSize.min,crossAxisAlignment:CrossAxisAlignment.start,children:[Text(badge.title,style:const TextStyle(color:Colors.white,fontSize:13,fontWeight:FontWeight.bold)),Text(badge.description,style:const TextStyle(color:Colors.white70,fontSize:11))]))])))))))));
+   overlay.insert(entry!);
+   fadeTimer=Timer(const Duration(milliseconds:4750),(){shown=false;entry?.markNeedsBuild();});
+   removeTimer=Timer(const Duration(seconds:5),dismiss);
+ }
+ @override void dispose(){dismiss();super.dispose();}
  @override Widget build(BuildContext c){
-   final ids=meowBadges(data);if(ids.isEmpty)return const SizedBox.shrink();
-   return Container(padding:const EdgeInsets.symmetric(horizontal:6,vertical:2),
-     decoration:BoxDecoration(color:const Color(0xD91B1B24),borderRadius:BorderRadius.circular(18)),
-     child:Wrap(alignment:WrapAlignment.center,crossAxisAlignment:WrapCrossAlignment.center,children:[
-       for(final badge in meowBadgeDefinitions)if(ids.contains(badge.id))
-         IconButton(tooltip:badge.title,iconSize:22,visualDensity:VisualDensity.compact,
-           constraints:const BoxConstraints(minWidth:36,minHeight:36),padding:const EdgeInsets.all(5),
-           icon:Icon(badge.icon,color:badge.color),onPressed:()=>showDialog<void>(context:c,builder:(d)=>AlertDialog(
-             icon:Icon(badge.icon,color:badge.color,size:36),title:Text(badge.title),content:Text(badge.description),
-             actions:[TextButton(onPressed:()=>Navigator.pop(d),child:const Text('Fechar'))])))
-     ]));
+   final ids=meowBadges(widget.data);if(ids.isEmpty)return const SizedBox.shrink();
+   return Wrap(alignment:WrapAlignment.center,crossAxisAlignment:WrapCrossAlignment.center,spacing:2,children:[
+     for(final badge in meowBadgeDefinitions)if(ids.contains(badge.id))IconButton(tooltip:badge.title,iconSize:18,visualDensity:VisualDensity.compact,constraints:const BoxConstraints(minWidth:36,minHeight:36),padding:const EdgeInsets.all(5),icon:Icon(badge.icon,color:badge.color),onPressed:()=>show(badge))
+   ]);
  }
 }
 class MeowAdminEntry extends StatefulWidget {
@@ -845,38 +873,64 @@ class _MeowBadgeAdminPageState extends State<MeowBadgeAdminPage> {
     FilledButton(onPressed:busy?null:save,child:const Text('Salvar alterações'))],
    if(busy)const Padding(padding:EdgeInsets.all(12),child:LinearProgressIndicator())]));
 }
+// Shared profile banner aspect; used by the profile editor and cropper.
+const double meowProfileBannerAspect=2.2;
+class MeowStatusBubble extends StatelessWidget {
+ final String status;final Color background,ink;final VoidCallback? onTap;final List<Widget> emojis;
+ const MeowStatusBubble({super.key,required this.status,required this.background,required this.ink,this.onTap,this.emojis=const []});
+ @override Widget build(BuildContext c)=>Stack(clipBehavior:Clip.none,children:[
+   Positioned(left:0,top:-6,child:Container(width:10,height:10,decoration:BoxDecoration(color:background,shape:BoxShape.circle))),
+   Positioned(left:12,top:-3,child:Container(width:17,height:17,decoration:BoxDecoration(color:background,shape:BoxShape.circle))),
+   Material(color:background,borderRadius:BorderRadius.circular(18),child:InkWell(onTap:onTap,borderRadius:BorderRadius.circular(18),child:Padding(padding:const EdgeInsets.symmetric(horizontal:9,vertical:8),child:Wrap(spacing:3,runSpacing:2,crossAxisAlignment:WrapCrossAlignment.center,children:[if(status.isNotEmpty)Text(status,maxLines:3,overflow:TextOverflow.ellipsis,style:TextStyle(color:ink,fontSize:12)),...emojis])))),
+ ]);
+}
+const meowStatusSlots=['status0','status1','status2','status3'];
+List<Widget> meowStatusIcons(String uid,Map<String,dynamic> data,Map<String,MeowDraftImage> draftImages)=>[
+ for(final slot in meowStatusSlots)if(draftImages.containsKey(slot))Image.memory(draftImages[slot]!.bytes,width:19,height:19,fit:BoxFit.contain,gaplessPlayback:true)
+ else if((data['${slot}Revision']?.toString()??'').isNotEmpty)PrivateImage(scope:'profile',id:uid,slot:slot,size:19,borderRadius:BorderRadius.zero),
+];
 class ProfilePage extends StatelessWidget {
   final String uid; final bool expanded; final ScrollController? scrollController;
-  const ProfilePage({super.key,required this.uid,this.expanded=false,this.scrollController});
+  final Map<String,dynamic>? draft; final Map<String,MeowDraftImage> draftImages;
+  const ProfilePage({super.key,required this.uid,this.expanded=false,this.scrollController,this.draft,this.draftImages=const {}});
+  Widget media(String slot,double size,{BorderRadius? borderRadius}) { final image=draftImages[slot]; return image==null?PrivateImage(scope:'profile',id:uid,slot:slot,size:size,borderRadius:borderRadius):SizedBox(height:size,width:slot=='avatar'?size:double.infinity,child:ClipRRect(borderRadius:borderRadius??BorderRadius.circular(size),child:Image.memory(image.bytes,fit:BoxFit.cover,gaplessPlayback:true))); }
   @override Widget build(BuildContext c)=>MeowStreamBuilder<DocumentSnapshot<Map<String,dynamic>>>(stream:db.collection('users').doc(uid).meowSnapshots(),builder:(c,s){
-    if(s.hasError)return const Center(child:Text('Perfil indisponível.'));
+    if(s.hasError||s.hasData&&s.data?.exists!=true)return const Center(child:Text('Perfil indisponível.'));
     if(!s.hasData)return const Center(child:CircularProgressIndicator());
-    final d=s.data!.data()??{}; final own=uid==FirebaseAuth.instance.currentUser?.uid;
+    final d=draft??s.data!.data()??{}; final own=uid==FirebaseAuth.instance.currentUser?.uid;
     final base=meowColor(d['themeColorA'],panel);final end=d['themeGradient']==true?meowColor(d['themeColorB'],base):base;
     final ink=d['backgroundEnabled']==true?Colors.white:Color.lerp(base,end,.5)!.computeLuminance()>.42?Colors.black:Colors.white;
-    final accent=Color.lerp(base,ink,.22)!;final cardColor=Color.lerp(base,ink,.09)!.withOpacity(.88);
-    final presence=currentPresence(d);
-    return Theme(data:Theme.of(c).copyWith(textTheme:Theme.of(c).textTheme.apply(bodyColor:ink,displayColor:ink),colorScheme:Theme.of(c).colorScheme.copyWith(primary:ink,onPrimary:base,surface:cardColor,onSurface:ink)),child:Container(decoration:BoxDecoration(gradient:profileGradient(d)),child:Stack(children:[
-      if(d['backgroundEnabled']==true)Positioned.fill(child:ProfileBackground(uid:uid)),
+    final accent=ink.withOpacity(.20);final cardColor=Color.lerp(base,ink,.09)!.withOpacity(.66);
+    final presence=draft==null?currentPresence(d):d['presence']?.toString()??'offline';final status=d['customStatus']?.toString().trim()??'';final statusIcons=meowStatusIcons(uid,d,draftImages);final hasStatus=status.isNotEmpty||statusIcons.isNotEmpty;
+    final theme=Theme.of(c);
+    return Theme(data:theme.copyWith(textTheme:theme.textTheme.apply(bodyColor:ink,displayColor:ink),colorScheme:theme.colorScheme.copyWith(surface:base,onSurface:ink)),child:Container(decoration:BoxDecoration(gradient:profileGradient(d)),child:Stack(children:[
+      if(d['backgroundEnabled']==true)Positioned.fill(child:draftImages['background']==null?ProfileBackground(uid:uid):Stack(fit:StackFit.expand,children:[Image.memory(draftImages['background']!.bytes,fit:BoxFit.cover,gaplessPlayback:true),const ColoredBox(color:Color(0x99000000))])),
       ListView(controller:scrollController,padding:EdgeInsets.zero,children:[
-        Stack(alignment:Alignment.topCenter,children:[
-          if(d['bannerHidden']!=true)Positioned.fill(child:PrivateImage(scope:'profile',id:uid,slot:'banner',size:244,borderRadius:BorderRadius.zero)),
-          Positioned.fill(child:DecoratedBox(decoration:BoxDecoration(gradient:LinearGradient(begin:Alignment.topCenter,end:Alignment.bottomCenter,colors:[Colors.transparent,Colors.black.withOpacity(.68)])))),
-          Padding(padding:const EdgeInsets.fromLTRB(12,28,12,14),child:ConstrainedBox(constraints:const BoxConstraints(minHeight:202),child:Column(mainAxisAlignment:MainAxisAlignment.end,children:[
-            Container(padding:const EdgeInsets.all(3),decoration:BoxDecoration(color:base,shape:BoxShape.circle),child:Stack(clipBehavior:Clip.none,children:[PrivateImage(scope:'profile',id:uid,slot:'avatar',size:84),Positioned(right:2,bottom:2,child:PresenceDot(uid:uid))])),
-            const SizedBox(height:6),Text(userLabel(d),textAlign:TextAlign.center,maxLines:1,overflow:TextOverflow.ellipsis,style:const TextStyle(fontSize:25,fontWeight:FontWeight.bold,color:Colors.white)),
-            Wrap(alignment:WrapAlignment.center,crossAxisAlignment:WrapCrossAlignment.center,spacing:5,children:[MeowIdLabel(data:d,ink:Colors.white),if((d['pronouns']?.toString()??'').isNotEmpty)Text(d['pronouns'].toString(),style:const TextStyle(color:Colors.white70,fontSize:12)),MeowProfileBadges(data:d,background:cardColor,ink:Colors.white)]),
-            Row(mainAxisAlignment:MainAxisAlignment.center,children:[Icon(Icons.circle,size:9,color:presenceColor(presence)),const SizedBox(width:6),Text(presenceLabels[presence]??'Offline',style:const TextStyle(color:Colors.white70))]),
-          ]))),
-        ]),
+        LayoutBuilder(builder:(c,box){
+          final width=box.maxWidth;final hasBanner=d['bannerHidden']!=true;
+          final h=hasBanner?width/meowProfileBannerAspect:56.0;
+          final avatar=min(96.0,width*.27);final radius=avatar/2+3;
+          final space=max(0.0,width/2-radius-18);
+          return Column(children:[SizedBox(height:h+radius+8,child:Stack(clipBehavior:Clip.none,children:[
+            if(hasBanner)Positioned(left:0,right:0,top:0,height:h,child:media('banner',h,borderRadius:BorderRadius.zero)),
+            Positioned(top:8,right:8,child:Material(color:hasBanner?Colors.black54:cardColor,shape:const CircleBorder(),child:PopupMenuButton<String>(tooltip:'Opções do perfil',icon:Icon(Icons.more_horiz,color:hasBanner?Colors.white:ink),onSelected:(action)async{if(action=='id'){await Clipboard.setData(ClipboardData(text:meowSerial(d)));if(c.mounted)notice(c,'ID copiado!');}},itemBuilder:(_)=>[PopupMenuItem(value:'id',enabled:meowSerial(d).isNotEmpty,child:Row(mainAxisSize:MainAxisSize.min,children:[Text(meowPublicId(d)),const SizedBox(width:12),const Icon(Icons.copy,size:16)]))]))),
+            Positioned(left:width/2-radius,top:h-radius,child:Container(padding:const EdgeInsets.all(3),decoration:BoxDecoration(color:base,shape:BoxShape.circle),child:Stack(clipBehavior:Clip.none,children:[media('avatar',avatar),Positioned(right:2,bottom:2,child:draft==null?PresenceDot(uid:uid):Container(width:17,height:17,decoration:BoxDecoration(shape:BoxShape.circle,color:presenceColor(d['presence']?.toString()??'offline'),border:Border.all(color:bg,width:2))))]))),
+            if(hasStatus&&space>=45)Positioned(left:width/2+radius+9,top:h-radius/2,width:space,child:MeowStatusBubble(status:status,background:Color.lerp(base,ink,.12)!,ink:ink,emojis:statusIcons)),
+          ])),
+          if(hasStatus&&space<45)Padding(padding:const EdgeInsets.all(6),child:MeowStatusBubble(status:status,background:Color.lerp(base,ink,.12)!,ink:ink,emojis:statusIcons)),
+          Padding(padding:const EdgeInsets.symmetric(horizontal:12),child:Text(userLabel(d),textAlign:TextAlign.center,maxLines:1,overflow:TextOverflow.ellipsis,style:TextStyle(fontSize:25,fontWeight:FontWeight.bold,color:ink))),
+          if((d['pronouns']?.toString()??'').isNotEmpty)Text(d['pronouns'].toString(),textAlign:TextAlign.center,style:TextStyle(color:ink.withOpacity(.8),fontSize:12)),
+          MeowProfileBadges(data:d,background:cardColor,ink:ink),
+          Row(mainAxisAlignment:MainAxisAlignment.center,children:[Icon(Icons.circle,size:9,color:presenceColor(presence)),const SizedBox(width:6),Text(presenceLabels[presence]??'Offline',style:TextStyle(color:ink.withOpacity(.75)))]),
+          ]);
+        }),
         Padding(padding:const EdgeInsets.all(16),child:Column(crossAxisAlignment:CrossAxisAlignment.stretch,children:[
-          if((d['customStatus']?.toString()??'').isNotEmpty)Padding(padding:const EdgeInsets.only(bottom:10),child:Text(d['customStatus'].toString(),textAlign:TextAlign.center)),
           Container(decoration:BoxDecoration(color:cardColor,borderRadius:BorderRadius.circular(15),border:Border.all(color:accent)),padding:const EdgeInsets.symmetric(vertical:8),child:RelationshipCounters(uid:uid)),
           const SizedBox(height:12),
-          if(own)FilledButton.icon(onPressed:()=>Navigator.push(c,MaterialPageRoute(builder:(_)=>EditProfilePage(uid:uid))),icon:const Icon(Icons.edit),label:const Text('Editar perfil e status'))
-          else Row(children:[Expanded(child:FollowButton(target:uid)),const SizedBox(width:8),Expanded(flex:2,child:FilledButton.icon(onPressed:()async{if(expanded){Navigator.pop(c,'dm');}else{await openDm(c,uid);}},icon:const Icon(Icons.message),label:const Text('Enviar mensagem')))]),
+          if(own)FilledButton.icon(onPressed:draft!=null?null:()=>Navigator.push(c,MaterialPageRoute(builder:(_)=>EditProfilePage(uid:uid))),icon:const Icon(Icons.edit),label:const Text('Editar perfil'))
+          else Row(children:[Expanded(child:FollowButton(target:uid)),const SizedBox(width:8),Expanded(child:SizedBox(height:44,child:OutlinedButton(onPressed:()async{if(expanded){Navigator.pop(c,'dm');}else{await openDm(c,uid);}},style:OutlinedButton.styleFrom(foregroundColor:ink,padding:const EdgeInsets.symmetric(horizontal:8),side:BorderSide(color:ink.withOpacity(.65))),child:const FittedBox(fit:BoxFit.scaleDown,child:Text('Enviar mensagem',maxLines:1)))))]),
           const SizedBox(height:8),MeowProfileSections(key:ValueKey(uid),uid:uid,data:d,cardColor:cardColor,ink:ink),
-          if(own&&!expanded)TextButton.icon(onPressed:()=>Navigator.push(c,MaterialPageRoute(builder:(_)=>const AppSettingsPage())),icon:const Icon(Icons.settings),label:const Text('Configurações do aplicativo')),
+          if(own&&!expanded&&draft==null)TextButton.icon(onPressed:()=>Navigator.push(c,MaterialPageRoute(builder:(_)=>const AppSettingsPage())),icon:const Icon(Icons.settings),label:const Text('Configurações do aplicativo')),
         ])),
       ]),
     ])));
@@ -891,7 +945,7 @@ class _MeowProfileSectionsState extends State<MeowProfileSections>{
  int section=0;
  @override Widget build(BuildContext c)=>Column(crossAxisAlignment:CrossAxisAlignment.stretch,children:[
    Row(children:[for(var i=0;i<3;i++)Expanded(child:TextButton(onPressed:(){setState(()=>section=i);},child:Column(children:[Text(['Sobre','Amigos','Servidores'][i],style:TextStyle(fontWeight:section==i?FontWeight.bold:FontWeight.normal,color:widget.ink)),const SizedBox(height:4),Container(height:2,color:section==i?purple:Colors.transparent)])))]),const Divider(height:1),const SizedBox(height:12),
-   if(section==0)...[const Text('Sobre mim',style:TextStyle(fontWeight:FontWeight.bold)),const SizedBox(height:6),MeowMessageText(text:(widget.data['bio']?.toString()??'').isEmpty?'Sem biografia.':widget.data['bio'].toString(),people:const {}),const SizedBox(height:16),FriendsPreview(uid:widget.uid,background:widget.cardColor,ink:widget.ink),const SizedBox(height:16),Text(widget.uid==myUid?'Meus servidores':'Servidores em comum',style:const TextStyle(fontWeight:FontWeight.bold)),MeowCommonServers(uid:widget.uid)]
+   if(section==0)...[Container(padding:const EdgeInsets.all(12),decoration:BoxDecoration(color:widget.cardColor,borderRadius:BorderRadius.circular(14)),child:Column(crossAxisAlignment:CrossAxisAlignment.start,children:[const Text('Sobre mim',style:TextStyle(fontWeight:FontWeight.bold)),const SizedBox(height:6),MeowMessageText(text:(widget.data['bio']?.toString()??'').isEmpty?'Sem biografia.':widget.data['bio'].toString(),people:const {})])),const SizedBox(height:16),FriendsPreview(uid:widget.uid,background:widget.cardColor,ink:widget.ink),const SizedBox(height:16),Text(widget.uid==myUid?'Meus servidores':'Servidores em comum',style:const TextStyle(fontWeight:FontWeight.bold)),MeowCommonServers(uid:widget.uid)]
    else if(section==1)...[FriendsPreview(uid:widget.uid,background:widget.cardColor,ink:widget.ink),TextButton(onPressed:()=>Navigator.push(c,MaterialPageRoute(builder:(_)=>RelationshipListPage(uid:widget.uid,kind:'friends'))),child:const Text('Ver todos os amigos'))]
    else ...[Text(widget.uid==myUid?'Meus servidores':'Servidores em comum',style:const TextStyle(fontWeight:FontWeight.bold)),MeowCommonServers(uid:widget.uid)],
  ]);
@@ -917,9 +971,28 @@ class AppSettingsPage extends StatelessWidget {
         ListTile(title:const Text('Alterar senha'),onTap:()=>Navigator.push(c,MaterialPageRoute(builder:(_)=>const ChangePasswordPage()))), ListTile(title:const Text('Sair da conta'),onTap:()=>logoutMeow(c))]))))),
       const MeowAdminEntry(),
       ListTile(leading:const Icon(Icons.notifications),title:const Text('Notificações'),onTap:()=>Navigator.push(c,MaterialPageRoute(builder:(_)=>const NotificationSettingsPage()))),
-      ListTile(leading:const Icon(Icons.storage),title:const Text('Armazenamento'),onTap:()=>Navigator.push(c,MaterialPageRoute(builder:(_)=>Scaffold(appBar:AppBar(title:const Text('Armazenamento')),body:ListTile(title:const Text('Limpar cache de imagens'),onTap:(){PrivateMediaCache.clear();notice(c,'Cache limpo.');}))))),
+      ListTile(leading:const Icon(Icons.storage),title:const Text('Armazenamento'),onTap:()=>Navigator.push(c,MaterialPageRoute(builder:(_)=>const MeowStoragePage()))),
       ListTile(leading:const Icon(Icons.info),title:const Text('Sobre o Meow'),onTap:()=>Navigator.push(c,MaterialPageRoute(builder:(_)=>Scaffold(appBar:AppBar(title:const Text('Sobre o Meow')),body:const Center(child:MeowTitle()))))),
     ]));
+}
+class MeowCacheMaintenance {
+ static const key='meow_last_cache_cleanup_091';static bool busy=false;
+ static Future<DateTime?> last()async{final p=await SharedPreferences.getInstance();final n=p.getInt(key);return n==null?null:DateTime.fromMillisecondsSinceEpoch(n);}
+ static Future<void> maybeClean()async{try{final p=await last();if(p==null||DateTime.now().difference(p)>=const Duration(hours:12))await clean();}catch(e){debugPrint('Meow cache: $e');}}
+ static Future<void> clean()async{if(busy)return;busy=true;try{PrivateMediaCache.purgeCompleted();await MeowVideoCache.clear();final prefs=await SharedPreferences.getInstance();await prefs.setInt(key,DateTime.now().millisecondsSinceEpoch);}finally{busy=false;}}
+}
+class MeowStoragePage extends StatefulWidget{const MeowStoragePage({super.key});@override State<MeowStoragePage> createState()=>_MeowStoragePageState();}
+class _MeowStoragePageState extends State<MeowStoragePage>{
+ late Future<Map<String,dynamic>> data;bool busy=false;
+ @override void initState(){super.initState();data=read();}
+ Future<Map<String,dynamic>> read()async{final native=await _nativeNotification<Map<dynamic,dynamic>>('storageStats');final last=await MeowCacheMaintenance.last();return {if(native!=null)...Map<String,dynamic>.from(native),'last':last,'media':await MeowVideoCache.bytes()};}
+ Future<void> clean()async{if(busy)return;setState(()=>busy=true);try{await MeowCacheMaintenance.clean();if(mounted){setState(()=>data=read());notice(context,'Cache temporário da Meow limpo.');}}catch(e){if(mounted)notice(context,'Não foi possível limpar o cache: $e');}finally{if(mounted)setState(()=>busy=false);}}
+ @override Widget build(BuildContext c)=>Scaffold(appBar:AppBar(title:const Text('Armazenamento'),actions:[IconButton(tooltip:'Atualizar',onPressed:busy?null:()=>setState(()=>data=read()),icon:const Icon(Icons.refresh))]),body:FutureBuilder<Map<String,dynamic>>(future:data,builder:(c,s){
+  if(!s.hasData&&!s.hasError)return const Center(child:CircularProgressIndicator());final d=s.data??{};
+  final app=(d['app'] as num?)?.toInt(),user=(d['data'] as num?)?.toInt(),cache=(d['cache'] as num?)?.toInt();final total=app!=null&&user!=null&&cache!=null?app+user+cache:null;
+  final values=[app,user,cache];final colors=[purple,Colors.lightBlueAccent,Colors.amber];final names=['Tamanho do aplicativo','Dados do usuário','Cache temporário'];
+  return ListView(padding:const EdgeInsets.all(18),children:[const SizedBox(height:12),const Text('Espaço total utilizado',textAlign:TextAlign.center,style:TextStyle(color:Colors.white70)),Text(total==null?'Indisponível':fileSizeLabel(total),textAlign:TextAlign.center,style:const TextStyle(fontSize:32,fontWeight:FontWeight.bold)),const SizedBox(height:20),if(total!=null&&total>0)ClipRRect(borderRadius:BorderRadius.circular(8),child:SizedBox(height:12,child:Row(children:[for(var i=0;i<3;i++)if((values[i]??0)>0)Expanded(flex:max(1,((values[i]??0)/total*1000).round()),child:ColoredBox(color:colors[i]))]))),const SizedBox(height:12),for(var i=0;i<3;i++)ListTile(contentPadding:EdgeInsets.zero,leading:Icon(Icons.circle,color:colors[i],size:12),title:Text(names[i]),trailing:Text(values[i]==null?'Indisponível':fileSizeLabel(values[i]!),style:const TextStyle(fontWeight:FontWeight.w600))),const Divider(),const ListTile(contentPadding:EdgeInsets.zero,title:Text('Limpeza automática'),subtitle:Text('A cada 12 horas enquanto a Meow estiver em uso, ou na próxima abertura.'),trailing:Icon(Icons.schedule,color:purple)),Text('Última limpeza: ${d['last'] is DateTime?formatMeowTime(d['last'] as DateTime):'Ainda não realizada'}',style:const TextStyle(color:Colors.white54)),const SizedBox(height:16),FilledButton.icon(onPressed:busy?null:clean,icon:const Icon(Icons.delete_outline),label:Text(busy?'Limpando…':'Limpar cache temporário')),const SizedBox(height:8),const Text('A limpeza remove somente mídias temporárias da Meow. Os dados de login, mensagens, downloads e arquivos em uso são preservados.',style:TextStyle(color:Colors.white54,fontSize:12))]);
+ }));
 }
 class NotificationSettingsPage extends StatefulWidget {
   const NotificationSettingsPage({super.key});
@@ -931,90 +1004,109 @@ class _NotificationSettingsPageState extends State<NotificationSettingsPage> {
     return ListView(children:[SwitchListTile(title:const Text('Notificações da conta'),value:enabled,onChanged:(v)async{try{await db.collection('users').doc(myUid).collection('preferences').doc('notifications').set({'enabled':v},SetOptions(merge:true));if(v)await FirebaseMessaging.instance.requestPermission();}catch(e){if(c.mounted)notice(c,e);}}),const ListTile(title:Text('Silenciar conversas'),subtitle:Text('Use o sino no cabeçalho de um canal ou DM.')),const ListTile(title:Text('Privacidade'),subtitle:Text('As notificações mostram o remetente e uma prévia. Controle a exibição na tela bloqueada nas configurações do aparelho.'))]);
   }));
 }
+class MeowDraftImage {
+ final Uint8List bytes;final String mime;
+ const MeowDraftImage(this.bytes,this.mime);
+}
 class EditProfilePage extends StatefulWidget {
-  final String uid;
-  const EditProfilePage({
-    super.key,
-    required this.uid
+ final String uid;const EditProfilePage({super.key,required this.uid});
+ @override State<EditProfilePage> createState()=>_EditProfilePageState();
 }
-);
-  @override State<EditProfilePage> createState()=>_EditProfilePageState();
-}
-
 class _EditProfilePageState extends State<EditProfilePage> {
-  final name=TextEditingController(),
-  pronouns=TextEditingController(),
-  bio=TextEditingController(),
-  custom=TextEditingController();
-  String presence='online';
-  bool loaded=false,
-  busy=false;
-  @override void dispose(){
-    name.dispose();
-    pronouns.dispose();
-    bio.dispose();
-    custom.dispose();
-    super.dispose();
-}
-  Future<void> save()async{
-    if(name.text.trim().length>15){notice(context, 'Máximo de 15 caracteres no nome.');return;}
-    setState(()=>busy=true);
-    try{
-      await db.collection('users').doc(widget.uid).update({
-        'displayName':name.text.trim(),
-        'pronouns':pronouns.text.trim(),
-        'bio':bio.text.trim(),
-        'customStatus':custom.text.trim(),
-        'presence':presence,
-        'lastSeen':FieldValue.serverTimestamp()
-}
-);
-      if(mounted){
-        notice(context, 'Perfil salvo!');
-        Navigator.pop(context);
-}
-}catch(e){
-      if(mounted)notice(context, e);
-}finally{
-      if(mounted)setState(()=>busy=false);
-}
-}
-    @override Widget build(BuildContext c)=>Scaffold(appBar:AppBar(title:const Text('Editar perfil')),
-      body:MeowStreamBuilder<DocumentSnapshot<Map<String, dynamic>>>(stream:db.collection('users').doc(widget.uid).meowSnapshots(),
-      builder:(c, s){
-        if(!s.hasData)return const Center(child:CircularProgressIndicator());
-        final d=s.data?.data()??{
-}
-;
-        if(!loaded){
-          loaded=true;
-          name.text=d['displayName']?.toString()??'';
-          pronouns.text=d['pronouns']?.toString()??'';
-          bio.text=d['bio']?.toString()??'';
-          custom.text=d['customStatus']?.toString()??'';
-          presence=presenceLabels.containsKey(d['presence'])?d['presence'].toString():'online';
-}
-          return ListView(children:[Stack(clipBehavior:Clip.none, children:[const SizedBox(height:235,width:double.infinity),ProfileBanner(uid:widget.uid,data:d), Positioned(right:10,top:10,child:Row(mainAxisSize:MainAxisSize.min,children:[ChangeImage('profile',widget.uid,'banner','Trocar banner',iconOnly:true),IconButton.filledTonal(tooltip:'Remover banner',onPressed:()async{await db.collection('users').doc(widget.uid).update({'bannerHidden':true});},icon:const Icon(Icons.hide_image))])), Positioned(left:18, bottom:10, child:Stack(alignment:Alignment.bottomRight, children:[PrivateImage(scope:'profile',
-        id:widget.uid, slot:'avatar', size:90
-), ChangeImage('profile', widget.uid, 'avatar', 'Trocar foto', iconOnly:true)]))]), const SizedBox(height:8),
-            Padding(padding:const EdgeInsets.all(18), child:Column(children:[TextField(controller:name, maxLength:15,
-          decoration:const InputDecoration(labelText:'Nome de exibição')
-), const SizedBox(height:10), TextField(controller:pronouns, maxLength:40, decoration:const InputDecoration(labelText:'Pronomes')),
-            const SizedBox(height:10), TextField(controller:bio, maxLength:300, maxLines:4, decoration:const InputDecoration(labelText:'Biografia')),
-            const SizedBox(height:10), TextField(controller:custom, maxLength:100, decoration:const InputDecoration(labelText:'Status personalizado')),
-              DropdownButtonFormField<String>(value:presence, decoration:const InputDecoration(labelText:'Disponibilidade'),
-              items:presenceLabels.entries.map((e)=>DropdownMenuItem(value:e.key, child:Text(e.value))).toList(),
-              onChanged:(v){
-                if(v!=null)setState(()=>presence=v);
-}
-), const SizedBox(height:12), ProfileThemeEditor(uid:widget.uid),ChangeImage('profile',widget.uid,'background','Trocar fundo da bio'),if(d['backgroundEnabled']==true) TextButton(onPressed:()async{try{await db.collection('users').doc(widget.uid).update({'backgroundEnabled':false});}catch(e){if(c.mounted)notice(c,e);}},child:const Text('Remover fundo')),const SizedBox(height:20), SizedBox(width:double.infinity, child:FilledButton(onPressed:busy?null:save,
-            child:Text(busy?'Salvando...':'Salvar alterações')
-)),
-]))
-]);
-}
-)
-);
+ final draft=<String,dynamic>{}, original=<String,dynamic>{};
+ final images=<String,MeowDraftImage>{};
+ bool loaded=false,busy=false,allowExit=false;
+ static const keys=['displayName','pronouns','bio','customStatus','presence','themeColorA','themeColorB','themeGradient','bannerHidden','backgroundEnabled','status0Revision','status1Revision','status2Revision','status3Revision'];
+ bool get dirty=>images.isNotEmpty||keys.any((k)=>draft[k]!=original[k]);
+ void load(Map<String,dynamic> d){
+   draft.addAll(d);for(final k in ['displayName','pronouns','bio','customStatus']){draft[k]=d[k]?.toString()??'';}
+   draft['presence']=presenceLabels.containsKey(d['presence'])?d['presence']:'online';
+   draft['themeColorA']=meowHex(meowColor(d['themeColorA'],panel));draft['themeColorB']=meowHex(meowColor(d['themeColorB'],purple));
+   for(final k in ['themeGradient','bannerHidden','backgroundEnabled']){draft[k]=d[k]==true;}
+   for(final slot in meowStatusSlots){draft['${slot}Revision']=d['${slot}Revision']?.toString()??'';}original.addAll(draft);loaded=true;
+ }
+ void change(String k,Object? value){if(!busy&&mounted)setState(()=>draft[k]=value);}
+ void mediaChanged(String slot,MeowDraftImage image){if(busy||!mounted)return;setState((){images[slot]=image;if(slot=='banner')draft['bannerHidden']=false;if(slot=='background')draft['backgroundEnabled']=true;});}
+ void remove(String slot){if(busy)return;setState((){images.remove(slot);draft[slot=='banner'?'bannerHidden':'backgroundEnabled']=slot=='banner';});}
+ Future<void> exit()async{
+   if(busy)return;
+   if(dirty){final discard=await showDialog<bool>(context:context,builder:(c)=>AlertDialog(title:const Text('Sair sem salvar?'),content:const Text('Todas as alterações não salvas serão descartadas.'),actions:[TextButton(onPressed:()=>Navigator.pop(c,false),child:const Text('Continuar editando')),FilledButton(onPressed:()=>Navigator.pop(c,true),child:const Text('Descartar e sair'))]));if(discard!=true||!mounted)return;}
+   if(mounted){setState(()=>allowExit=true);WidgetsBinding.instance.addPostFrameCallback((_) {if(mounted)Navigator.pop(context);});}
+ }
+ Future<void> editText(String key,String label,int limit,{int lines=1})async{
+   if(busy)return;
+   final controller=TextEditingController(text:draft[key]?.toString()??'');
+   final value=await showDialog<String>(context:context,builder:(c)=>AlertDialog(title:Text(label),content:TextField(controller:controller,autofocus:true,maxLength:limit,maxLines:lines),actions:[TextButton(onPressed:()=>Navigator.pop(c),child:const Text('Cancelar')),FilledButton(onPressed:()=>Navigator.pop(c,controller.text),child:const Text('Aplicar'))]));
+   // Dispose after the closing route has released the controller.
+   Future<void>.delayed(const Duration(milliseconds:350),controller.dispose);
+   if(value!=null&&mounted)change(key,value);
+ }
+ Future<void> editStatus()async{
+   if(busy)return;
+   final text=TextEditingController(text:draft['customStatus']?.toString()??'');
+   final local=<String,MeowDraftImage>{for(final slot in meowStatusSlots)if(images.containsKey(slot))slot:images[slot]!};
+   final refs=<String,String>{for(final slot in meowStatusSlots)slot:draft['${slot}Revision']?.toString()??''};
+   bool picking=false;
+   final applied=await showDialog<bool>(context:context,builder:(dialog)=>StatefulBuilder(builder:(c,update)=>AlertDialog(title:const Text('Status personalizado'),content:SingleChildScrollView(child:Column(mainAxisSize:MainAxisSize.min,children:[
+     TextField(controller:text,maxLength:100,maxLines:2,decoration:const InputDecoration(hintText:'Escreva seu status')),
+     Wrap(spacing:5,children:[for(final slot in meowStatusSlots)if(local.containsKey(slot)||refs[slot]!.isNotEmpty)InputChip(label:local.containsKey(slot)?Image.memory(local[slot]!.bytes,width:22,height:22,fit:BoxFit.contain):PrivateImage(scope:'profile',id:widget.uid,slot:slot,size:22,borderRadius:BorderRadius.zero),onDeleted:picking?null:()=>update((){local.remove(slot);refs[slot]='';}))]),
+     OutlinedButton.icon(onPressed:picking?null:()async{
+       update(()=>picking=true);
+       try{final selected=await pickExpression(c,reactionOnly:true);if(!c.mounted||selected==null)return;
+         if(selected is String){final next=text.text+selected;if(next.characters.length<=100){text.text=next;text.selection=TextSelection.collapsed(offset:next.length);}}
+         else if(selected is Map<String,dynamic>){final available=meowStatusSlots.where((slot)=>!local.containsKey(slot)&&refs[slot]!.isEmpty);if(available.isEmpty){notice(context,'Até quatro emojis personalizados no status.');return;}final bytes=await PrivateMediaCache.get(expressionUrl(selected));if(bytes==null||bytes.length>5000000)throw Exception('Emoji indisponível.');if(c.mounted)update(()=>local[available.first]=MeowDraftImage(bytes,'application/octet-stream'));}
+       }catch(e){if(mounted)notice(context,e);}finally{if(c.mounted)update(()=>picking=false);}
+     },icon:const Icon(Icons.emoji_emotions_outlined),label:const Text('Adicionar emoji')),
+     if(picking)const LinearProgressIndicator(),
+   ])),actions:[TextButton(onPressed:picking?null:()=>Navigator.pop(c,false),child:const Text('Cancelar')),TextButton(onPressed:picking?null:(){text.clear();local.clear();for(final slot in meowStatusSlots){refs[slot]='';}Navigator.pop(c,true);},child:const Text('Remover status')),FilledButton(onPressed:picking?null:()=>Navigator.pop(c,true),child:const Text('Aplicar'))])));
+   final value=text.text;Future<void>.delayed(const Duration(milliseconds:350),text.dispose);
+   if(applied==true&&mounted)setState((){draft['customStatus']=value;for(final slot in meowStatusSlots){draft['${slot}Revision']=refs[slot];images.remove(slot);if(local.containsKey(slot))images[slot]=local[slot]!;}});
+ }
+ Future<void> color(String key)async{if(busy)return;final value=await showDialog<Color>(context:context,builder:(_)=>MeowColorWheelDialog(initial:meowColor(draft[key],panel)));if(value!=null)change(key,meowHex(value));}
+ Future<void> save()async{
+   if(busy||!dirty||!loaded)return;
+   if((draft['displayName'] as String).trim().isEmpty){notice(context,'Informe um nome de exibição.');return;}
+   if(FirebaseAuth.instance.currentUser?.uid!=widget.uid)return;
+   setState(()=>busy=true);
+   try{
+     final updates=<String,dynamic>{for(final k in keys)if(draft[k]!=original[k])k:draft[k]};
+     final random=Random.secure();final rev=List.generate(32,(_)=>random.nextInt(16).toRadixString(16)).join();
+     for(final entry in images.entries){
+       final uri=mediaUrl('profile',widget.uid,entry.key);final staged=uri.replace(queryParameters:{...uri.queryParameters,'stage':rev});
+       final response=await http.put(staged,headers:{...await authHeaders(),'Content-Type':entry.value.mime},body:entry.value.bytes).timeout(const Duration(seconds:120));
+       if(response.statusCode!=201)throw Exception('Não foi possível preparar ${entry.key} (HTTP ${response.statusCode}).');
+       updates['${entry.key}Revision']=rev;
+     }
+     if(FirebaseAuth.instance.currentUser?.uid!=widget.uid)throw Exception('Sessão alterada.');
+     final ref=db.collection('users').doc(widget.uid);
+     // Firestore transactions require a connection and publish one atomic update.
+     await db.runTransaction((tx)async{final current=await tx.get(ref);if(!current.exists)throw Exception('Perfil indisponível.');if(FirebaseAuth.instance.currentUser?.uid!=widget.uid)throw Exception('Sessão alterada.');if(updates.isNotEmpty)tx.update(ref,updates);});
+     for(final slot in images.keys){final url=mediaUrl('profile',widget.uid,slot);PrivateMediaCache.invalidate(url);changedImage.value=null;changedImage.value=url;}
+     if(mounted){notice(context,'Perfil salvo!');setState((){busy=false;allowExit=true;});WidgetsBinding.instance.addPostFrameCallback((_) {if(mounted)Navigator.pop(context);});}
+   }catch(e){if(mounted){notice(context,'Não foi possível salvar: $e');setState(()=>busy=false);}}
+ }
+ Widget media(String slot,double size){final item=images[slot];return item==null?PrivateImage(scope:'profile',id:widget.uid,slot:slot,size:size,borderRadius:slot=='banner'?BorderRadius.circular(12):null):SizedBox(width:slot=='avatar'?size:double.infinity,height:size,child:ClipRRect(borderRadius:BorderRadius.circular(slot=='avatar'?size:12),child:Image.memory(item.bytes,fit:BoxFit.cover,gaplessPlayback:true)));}
+ Widget editIcon(String slot)=>ChangeImage('profile',widget.uid,slot,'Editar $slot',iconOnly:true,onDraft:(image)=>mediaChanged(slot,image));
+ Widget field(String key,String label,IconData icon,int limit,{int lines=1})=>ListTile(dense:true,leading:Icon(icon),title:Text(label),subtitle:Text((draft[key]?.toString()??'').isEmpty?'Não definido':draft[key].toString(),maxLines:1,overflow:TextOverflow.ellipsis),trailing:const Icon(Icons.chevron_right),onTap:busy?null:()=>editText(key,label,limit,lines:lines));
+ Widget colorRow(String key,String label)=>ListTile(dense:true,title:Text(label),trailing:Container(width:32,height:32,decoration:BoxDecoration(color:meowColor(draft[key],panel),borderRadius:BorderRadius.circular(8),border:Border.all(color:Colors.white30))),onTap:busy?null:()=>color(key));
+ @override Widget build(BuildContext c)=>PopScope(canPop:allowExit,onPopInvokedWithResult:(didPop,_) {if(!didPop)exit();},child:Scaffold(appBar:AppBar(automaticallyImplyLeading:false,leading:IconButton(icon:const Icon(Icons.arrow_back),onPressed:busy?null:exit),title:const Text('Editar perfil'),actions:[TextButton(onPressed:busy||!dirty?null:save,child:Text(busy?'Salvando…':'Salvar'))]),body:MeowStreamBuilder<DocumentSnapshot<Map<String,dynamic>>>(stream:db.collection('users').doc(widget.uid).meowSnapshots(),builder:(c,s){
+   if(!loaded){if(s.hasError)return const Center(child:Text('Perfil indisponível.'));if(!s.hasData)return const Center(child:CircularProgressIndicator());load(s.data!.data()??{});}
+   return Column(children:[if(busy)const LinearProgressIndicator(),Expanded(child:AbsorbPointer(absorbing:busy,child:ListView(padding:const EdgeInsets.all(14),children:[
+     LayoutBuilder(builder:(c,b){final w=b.maxWidth;final h=w/meowProfileBannerAspect;final avatar=min(90.0,w*.26);return SizedBox(height:h+avatar/2+8,child:Stack(clipBehavior:Clip.none,children:[
+       Positioned(left:0,right:0,top:0,height:h,child:draft['bannerHidden']==true?DecoratedBox(decoration:BoxDecoration(gradient:profileGradient(draft),borderRadius:BorderRadius.circular(12))):media('banner',h)),
+       Positioned(top:6,right:6,child:Row(children:[if(draft['bannerHidden']!=true)IconButton.filledTonal(tooltip:'Remover banner',onPressed:()=>remove('banner'),icon:const Icon(Icons.hide_image)),editIcon('banner')])),
+       Positioned(left:(w-avatar)/2,top:h-avatar/2,child:Stack(clipBehavior:Clip.none,children:[media('avatar',avatar),Positioned(top:-4,right:-6,child:editIcon('avatar'))])),
+       Positioned(left:w/2+avatar/2+6,right:0,top:h-avatar/4,child:MeowStatusBubble(status:(draft['customStatus'] as String).isEmpty&&meowStatusIcons(widget.uid,draft,images).isEmpty?'+ Status':draft['customStatus'].toString(),background:panel,ink:Colors.white,onTap:editStatus,emojis:meowStatusIcons(widget.uid,draft,images))),
+     ]));}),
+     Text(userLabel(draft),textAlign:TextAlign.center,style:const TextStyle(fontSize:24,fontWeight:FontWeight.bold)),Text(draft['pronouns']?.toString()??'',textAlign:TextAlign.center),
+     const SizedBox(height:12),Card(color:panel,child:Column(children:[field('displayName','Nome de exibição',Icons.person_outline,15),const Divider(height:1),field('pronouns','Pronomes',Icons.format_quote,40),const Divider(height:1),field('bio','Biografia',Icons.notes,300,lines:4),const Divider(height:1),ListTile(dense:true,title:const Text('Disponibilidade'),trailing:DropdownButton<String>(value:draft['presence'] as String,items:presenceLabels.entries.map((e)=>DropdownMenuItem(value:e.key,child:Text(e.value))).toList(),onChanged:(v){if(v!=null)change('presence',v);}))])),
+     const SizedBox(height:10),const Text('Aparência do perfil',style:TextStyle(fontWeight:FontWeight.bold,fontSize:17)),const SizedBox(height:8),
+     Card(color:panel,child:Column(children:[Container(height:85,margin:const EdgeInsets.all(12),clipBehavior:Clip.antiAlias,decoration:BoxDecoration(gradient:profileGradient(draft),borderRadius:BorderRadius.circular(12)),child:draft['backgroundEnabled']==true?(images['background']!=null?Image.memory(images['background']!.bytes,width:double.infinity,fit:BoxFit.cover,gaplessPlayback:true):ProfileBackground(uid:widget.uid)):const SizedBox.expand()),
+       SwitchListTile(title:const Text('Usar gradiente'),value:draft['themeGradient']==true,onChanged:(v)=>change('themeGradient',v)),colorRow('themeColorA','Cor principal'),if(draft['themeGradient']==true)colorRow('themeColorB','Cor secundária'),
+       ChangeImage('profile',widget.uid,'background','Escolher foto ou GIF de fundo',onDraft:(image)=>mediaChanged('background',image)),if(draft['backgroundEnabled']==true)TextButton(onPressed:()=>remove('background'),child:const Text('Remover imagem de fundo'))])),
+     const SizedBox(height:12),OutlinedButton.icon(onPressed:()=>Navigator.push(c,MaterialPageRoute(builder:(_)=>Scaffold(appBar:AppBar(title:const Text('Prévia do perfil')),body:ProfilePage(uid:widget.uid,draft:Map.of(draft),draftImages:Map.of(images))))),icon:const Icon(Icons.visibility_outlined),label:const Text('Prévia do perfil')),
+   ])))]);
+ })));
 }
 
 // Keep keyboard MediaQuery dependencies inside the server-list pane, not the chat.
@@ -1149,17 +1241,19 @@ class _SocialHomeState extends State<SocialHome> with WidgetsBindingObserver {
 ;
   StreamSubscription<String>? tokenSub;
   StreamSubscription<RemoteMessage>? foregroundSub,openedSub;
-  OverlayEntry? notificationOverlay; Timer? notificationTimer;
+  OverlayEntry? notificationOverlay; Timer? notificationTimer;String? overlayThread;
   final seenNotifications=<String>{};
   String? lastOpenedNotification; DateTime? lastOpenedAt;
   Timer? presenceTimer;
   StreamSubscription<QuerySnapshot<Map<String,dynamic>>>? deletionSub;
-  bool appActive = true;
+  bool appActive = true;DateTime? pausedAt;Timer? cacheTimer;
   @override void initState(){
     super.initState();
     WidgetsBinding.instance.addObserver(this);
     initNotifications();
     touchPresence();
+    unawaited(MeowCacheMaintenance.maybeClean());
+    cacheTimer=Timer.periodic(const Duration(minutes:10),(_){if(appActive)unawaited(MeowCacheMaintenance.maybeClean());});
     final uid=myUid;
     deletionSub=db.collection('servers').where('members',arrayContains:uid).meowSnapshots().listen((snapshot){
       if(!mounted||FirebaseAuth.instance.currentUser?.uid!=uid)return;
@@ -1167,25 +1261,19 @@ class _SocialHomeState extends State<SocialHome> with WidgetsBindingObserver {
       final selected=serverId;
       if(selected!=null&&!snapshot.metadata.isFromCache&&!snapshot.docs.any((d)=>d.id==selected&&d.data()['deleting']!=true))setState((){serverId=null;channelId=null;showingChannels=true;});
     },onError:(Object e){debugPrint('Meow exclusões pendentes: $e');});
-    presenceTimer = Timer.periodic(const Duration(seconds: 45), (_) {
+    presenceTimer = Timer.periodic(const Duration(seconds: 35), (_) {
       if (appActive) touchPresence();
     });
 }
-  Future<void> touchPresence()async{
-    try{
-      final ref=db.collection('users').doc(myUid);
-      await ref.update({
-        'lastSeen':FieldValue.serverTimestamp()
-}
-);
-}catch(_){
-}
-}
+  Future<void> touchPresence({bool closed=false})async{
+    try{final user=FirebaseAuth.instance.currentUser;if(user==null)return;await db.collection('users').doc(user.uid).update({'lastSeen':FieldValue.serverTimestamp(),if(closed)'presenceClosedAt':FieldValue.serverTimestamp()});}catch(_){}
+  }
   @override void didChangeAppLifecycleState(AppLifecycleState state){
-    appActive = state == AppLifecycleState.resumed;
-    if (appActive) touchPresence();
+    final wasActive=appActive;appActive=state==AppLifecycleState.resumed;
+    if(appActive){unawaited(touchPresence());unawaited(MeowCacheMaintenance.maybeClean());final elapsed=pausedAt==null?Duration.zero:DateTime.now().difference(pausedAt!);pausedAt=null;if(elapsed>const Duration(seconds:3))unawaited(db.enableNetwork());}
+    else if(state==AppLifecycleState.paused||state==AppLifecycleState.hidden||state==AppLifecycleState.detached){if(pausedAt==null){pausedAt=DateTime.now();unawaited(touchPresence(closed:true));}}
     syncNativeThread();
-}
+  }
   Future<void> initNotifications()async{
     try{
       final fcm=FirebaseMessaging.instance;final registeredUid=myUid;
@@ -1236,11 +1324,11 @@ class _SocialHomeState extends State<SocialHome> with WidgetsBindingObserver {
     WidgetsBinding.instance.removeObserver(this);
     tokenSub?.cancel(); foregroundSub?.cancel(); openedSub?.cancel(); dismissNotification();
     activeThread.removeListener(syncNativeThread);_meowNativeNotifications.setMethodCallHandler(null);
-    presenceTimer?.cancel();deletionSub?.cancel();
+    presenceTimer?.cancel();cacheTimer?.cancel();deletionSub?.cancel();
     super.dispose();
 }
-  void syncNativeThread(){unawaited(_nativeNotification<void>('setActiveThread',{'recipientId':FirebaseAuth.instance.currentUser?.uid,'threadKey':appActive?activeThread.value:null}));}
-  void dismissNotification(){notificationTimer?.cancel();notificationOverlay?.remove();notificationOverlay=null;}
+  void syncNativeThread(){final thread=appActive?activeThread.value:null;if(thread!=null&&overlayThread==thread)dismissNotification();unawaited(_nativeNotification<void>('setActiveThread',{'recipientId':FirebaseAuth.instance.currentUser?.uid,'threadKey':thread}));}
+  void dismissNotification(){notificationTimer?.cancel();notificationOverlay?.remove();notificationOverlay=null;overlayThread=null;}
   Future<void> showNotification(RemoteMessage message) async {
     final path=message.data['messagePath']??'';
     if(!mounted||message.data['recipientId']!=FirebaseAuth.instance.currentUser?.uid||!validMessagePath(path)||!seenNotifications.add(path))return;
@@ -1253,6 +1341,7 @@ class _SocialHomeState extends State<SocialHome> with WidgetsBindingObserver {
       final text=(d['text']?.toString()??'').trim();
       if(!mounted||activeThread.value==threadFromPath(path))return;
       dismissNotification();
+      overlayThread=threadFromPath(path);
       notificationOverlay=OverlayEntry(builder:(c)=>Positioned(top:MediaQuery.paddingOf(c).top+8,left:12,right:12,child:MeowNotificationBanner(key:ValueKey(path),sender:sender,title:userLabel(u),subtitle:message.data['kind']=='reply'?'Respondeu à sua mensagem':message.data['kind']=='mention'?'Mencionou você':path.startsWith('dms/')?'Mensagem privada':'Mensagem no servidor',preview:text.isEmpty?(message.data['notificationBody']?.toString()??'Nova mensagem'):text,onDismiss:dismissNotification,onTap:(){dismissNotification();openNotification(message);} )));
       final overlay=meowNavigator.currentState?.overlay;if(overlay==null){notificationOverlay=null;return;}
       overlay.insert(notificationOverlay!);notificationTimer=Timer(const Duration(seconds:5),dismissNotification);
@@ -1271,7 +1360,7 @@ class _SocialHomeState extends State<SocialHome> with WidgetsBindingObserver {
         if(others.isNotEmpty&&mounted)nav.push(CupertinoPageRoute<void>(builder:(_)=>DmChatPage(id:parts[1],other:others.first,uid:myUid,initialMessageId:parts.last)));
       }else{
         final ch=(await db.collection('servers').doc(parts[1]).collection('channels').doc(parts[3]).get()).data();
-        if(mounted)nav.push(MaterialPageRoute(builder:(_)=>Scaffold(appBar:AppBar(title:MeowChannelTitle(server:parts[1],name:ch?['name']?.toString()??'canal'),actions:[MuteButton(thread:'server:${parts[1]}:${parts[3]}')]),body:MessageThread(collection:db.collection('servers').doc(parts[1]).collection('channels').doc(parts[3]).collection('messages'),uid:myUid,serverId:parts[1],threadId:'server:${parts[1]}:${parts[3]}',initialMessageId:parts.last))));
+        if(mounted)nav.push(MaterialPageRoute(builder:(_)=>MeowChannelHistoryPage(server:parts[1],channel:parts[3],name:ch?['name']?.toString()??'canal',uid:myUid,initialMessageId:parts.last)));
       }
     }catch(e){if(mounted)notice(context,'Mensagem indisponível.');}
   }
@@ -1471,7 +1560,7 @@ class _SocialHomeState extends State<SocialHome> with WidgetsBindingObserver {
         final activeName=activeDoc.isEmpty?'canal':activeDoc.first.data()['name']?.toString()??'canal';
         return ChannelSlide(open:showingChannels,onChange:(v){if(v)FocusManager.instance.primaryFocus?.unfocus();setState(()=>showingChannels=v);},
           list:Row(children:[rail(),Expanded(child:ColoredBox(color:panel,child:Column(children:[MeowCompactServerHeader(id:serverId!),Row(children:[const Expanded(child:Padding(padding:EdgeInsets.all(12),child:Text('Canais',style:TextStyle(fontSize:18)))),IconButton(onPressed:createChannel,icon:const Icon(Icons.add)),IconButton(onPressed:createInvite,icon:const Icon(Icons.share))]),Expanded(child:channelList(docs))])))]),
-          chat:Column(children:[ListTile(leading:IconButton(icon:const Icon(Icons.arrow_back),onPressed:(){FocusManager.instance.primaryFocus?.unfocus();setState(()=>showingChannels=true);}),title:InkWell(onTap:()=>showGeneralDialog(context:context,barrierDismissible:true,barrierLabel:'Membros',transitionDuration:const Duration(milliseconds:220),pageBuilder:(c,_,__)=>Align(alignment:Alignment.centerRight,child:Material(color:panel,child:SizedBox(width:min(MediaQuery.sizeOf(c).width*.85,350.0),child:ServerMembers(server:serverId!)))),transitionBuilder:(c,a,_,child)=>SlideTransition(position:Tween(begin:const Offset(1,0),end:Offset.zero).animate(a),child:child)),child:MeowChannelTitle(server:selected,name:activeName)),trailing:active==null?null:MuteButton(thread:'server:$serverId:$active')),Expanded(child:active==null?const Center(child:Text('Sem canais')):MessageThread(key:ValueKey('$serverId/$active'),collection:db.collection('servers').doc(serverId).collection('channels').doc(active).collection('messages'),uid:myUid,serverId:serverId,threadId:'server:$serverId:$active',visible:!showingChannels&&tab==2))]));
+          chat:Column(children:[ListTile(leading:IconButton(icon:const Icon(Icons.arrow_back),onPressed:(){FocusManager.instance.primaryFocus?.unfocus();setState(()=>showingChannels=true);}),title:InkWell(onTap:()=>showGeneralDialog(context:context,barrierDismissible:true,barrierLabel:'Membros',transitionDuration:const Duration(milliseconds:220),pageBuilder:(c,_,__)=>Align(alignment:Alignment.centerRight,child:Material(color:panel,child:SizedBox(width:min(MediaQuery.sizeOf(c).width*.85,350.0),child:ServerMembers(server:serverId!)))),transitionBuilder:(c,a,_,child)=>SlideTransition(position:Tween(begin:const Offset(1,0),end:Offset.zero).animate(a),child:child)),child:MeowChannelTitle(server:selected,name:activeName)),trailing:active==null?null:Row(mainAxisSize:MainAxisSize.min,children:[MuteButton(thread:'server:$selected:$active'),MeowSearchButton(collection:db.collection('servers').doc(selected).collection('channels').doc(active).collection('messages'),openResult:(c,message)=>Navigator.pushReplacement(c,MaterialPageRoute(builder:(_)=>MeowChannelHistoryPage(server:selected,channel:active,name:activeName,uid:myUid,initialMessageId:message))))])),Expanded(child:active==null?const Center(child:Text('Sem canais')):MessageThread(key:ValueKey('$serverId/$active'),collection:db.collection('servers').doc(serverId).collection('channels').doc(active).collection('messages'),uid:myUid,serverId:serverId,threadId:'server:$serverId:$active',visible:!showingChannels&&tab==2))]));
       });
   }
   @override Widget build(BuildContext c){
@@ -1508,22 +1597,11 @@ Future<void> openDm(BuildContext context, String other) async {
     if (!otherUser.exists) throw Exception('Usuario nao encontrado.');
     final dm = db.collection('dms').doc(id);
     await db.runTransaction((tx) async {final existingDm=await tx.get(dm);if(!existingDm.exists)tx.set(dm,{'members':[me,other]..sort()});});
-    final follows = await db.collection('users').doc(me).collection('following').doc(other).get();
-    final followed = await db.collection('users').doc(other).collection('following').doc(me).get();
-    if (!(follows.exists && followed.exists)) {
-      final requestRef = db.collection('dmRequests').doc(id);
-      final existing = await requestRef.get();
-      if (!existing.exists) {
-        await requestRef.set({
-          'from': me,
-          'to': other,
-          'status': 'pending',
-          'createdAt': FieldValue.serverTimestamp(),
-        });
-      } else if (existing.data()?['status'] == 'declined') {
-        if (context.mounted) notice(context, 'Esta solicitacao foi recusada.');
-        return;
-      }
+    final existing = await db.collection('dmRequests').doc(id).get();
+    if(existing.data()?['status']=='declined'){
+      final a=await db.collection('users').doc(me).collection('following').doc(other).get();
+      final b=await db.collection('users').doc(other).collection('following').doc(me).get();
+      if(!a.exists||!b.exists){if(context.mounted)notice(context,'Esta solicitação foi recusada.');return;}
     }
     if (context.mounted) {
       Navigator.push(context, CupertinoPageRoute<void>(
@@ -1542,31 +1620,55 @@ class DmListPage extends StatefulWidget {
 }
 class _DmListPageState extends State<DmListPage> {
  String query='';
- @override Widget build(BuildContext c)=>Column(children:[
-  ListTile(title:const Text('Mensagens privadas',style:TextStyle(fontSize:22,fontWeight:FontWeight.bold)),trailing:Stack(children:[IconButton(tooltip:'Solicitações',onPressed:()=>Navigator.push(c,MaterialPageRoute(builder:(_)=>DmRequestsPage(uid:widget.uid))),icon:const Icon(Icons.mail_outline)),Positioned(right:5,top:5,child:DmRequestsDot(uid:widget.uid))])),
+ final rows=<String,_MeowDmRow>{};
+ StreamSubscription<QuerySnapshot<Map<String,dynamic>>>? rooms,followingSub,followersSub;
+ Set<String> followingIds={},followerIds={};
+ bool loaded=false;String? error;bool listening=false;
+ @override void didChangeDependencies(){super.didChangeDependencies();final active=TickerMode.of(context);if(active&&!listening)start();if(!active&&listening)stop();}
+ void start(){listening=true;followingSub=db.collection('users').doc(widget.uid).collection('following').meowSnapshots().listen((s){if(mounted&&listening)setState(()=>followingIds=s.docs.map((d)=>d.id).toSet());},onError:(Object _){});followersSub=db.collection('users').doc(widget.uid).collection('followers').meowSnapshots().listen((s){if(mounted&&listening)setState(()=>followerIds=s.docs.map((d)=>d.id).toSet());},onError:(Object _){});rooms=db.collection('dms').where('members',arrayContains:widget.uid).meowSnapshots().listen(updateRooms,onError:(Object e){if(mounted&&listening)setState(()=>error='Não foi possível carregar conversas.');});}
+ void stop(){listening=false;rooms?.cancel();rooms=null;followingSub?.cancel();followersSub?.cancel();followingIds.clear();followerIds.clear();for(final r in rows.values){r.stop();}rows.clear();loaded=false;}
+ void updateRooms(QuerySnapshot<Map<String,dynamic>> snapshot){if(!mounted||!listening)return;
+  final ids=snapshot.docs.map((d)=>d.id).toSet();for(final id in rows.keys.toList()){if(!ids.contains(id))rows.remove(id)?.stop();}
+  for(final d in snapshot.docs){if(rows.containsKey(d.id))continue;final others=List<String>.from(d.data()['members']??[]).where((x)=>x!=widget.uid);if(others.isEmpty)continue;
+   final row=_MeowDmRow(d.id,others.first);rows[d.id]=row;void changed(){if(mounted&&listening&&identical(rows[d.id],row))setState((){});}
+   row.subs.add(d.reference.collection('messages').orderBy('createdAt',descending:true).limit(1).meowSnapshots().listen((m){row.latest=m.docs.isEmpty?null:m.docs.first.data();row.messagesReady=true;changed();},onError:(Object e){row.latest=null;row.messagesReady=true;changed();}));
+   row.subs.add(db.collection('dmRequests').doc(d.id).meowSnapshots().listen((r){row.request=r.data();row.requestReady=true;changed();},onError:(Object e){row.requestReady=false;changed();}));
+   row.subs.add(db.collection('users').doc(row.other).meowSnapshots().listen((u){row.profile=u.data()??{};changed();},onError:(Object _){}));
+  }
+  setState((){loaded=true;error=null;});
+ }
+ @override void dispose(){stop();super.dispose();}
+ @override Widget build(BuildContext c){
+  final visible=rows.values.where((r){final status=r.request?['status'];return r.requestReady&&r.messagesReady&&r.latest!=null&&((followingIds.contains(r.other)&&followerIds.contains(r.other))||(status!='declined'&&!(status=='pending'&&r.request?['to']==widget.uid)))&&(query.isEmpty||userLabel(r.profile).toLowerCase().contains(query)||meowSerial(r.profile).contains(query.replaceFirst('#','')));}).toList()..sort((a,b){final t=b.time.compareTo(a.time);return t==0?a.id.compareTo(b.id):t;});
+  const h=72.0;
+  return Column(children:[ListTile(title:const Text('Mensagens privadas',style:TextStyle(fontSize:22,fontWeight:FontWeight.bold)),trailing:Stack(children:[IconButton(tooltip:'Solicitações',onPressed:()=>Navigator.push(c,MaterialPageRoute(builder:(_)=>DmRequestsPage(uid:widget.uid))),icon:const Icon(Icons.mail_outline)),Positioned(right:5,top:5,child:DmRequestsDot(uid:widget.uid))])),
   Padding(padding:const EdgeInsets.symmetric(horizontal:12),child:TextField(decoration:const InputDecoration(hintText:'Buscar por nome ou ID',prefixIcon:Icon(Icons.search)),onChanged:(v)=>setState(()=>query=v.trim().toLowerCase()))),
-  Expanded(child:MeowStreamBuilder<QuerySnapshot<Map<String,dynamic>>>(stream:db.collection('dms').where('members',arrayContains:widget.uid).meowSnapshots(),builder:(c,s){
-    if(s.hasError)return Center(child:Text('Erro: ${s.error}'));
-    if(!s.hasData)return const Center(child:CircularProgressIndicator());
-    if(s.data!.docs.isEmpty)return const Center(child:Text('Abra o perfil de alguém para conversar.'));
-    return ListView(children:[for(final d in s.data!.docs) Builder(builder:(c){
-      final others=List<String>.from(d.data()['members']??[]).where((x)=>x!=widget.uid).toList();
-      if(others.isEmpty)return const SizedBox.shrink();
-      final other=others.first;
-      return MeowStreamBuilder<DocumentSnapshot<Map<String,dynamic>>>(stream:db.collection('users').doc(other).meowSnapshots(),builder:(c,u){
-        final data=u.data?.data()??{};
-        final name=userLabel(data);
-        final serial=meowSerial(data);
-        if(query.isNotEmpty&&!name.toLowerCase().contains(query)&&!(serial.isNotEmpty&&serial.contains(query.replaceFirst('#',''))))return const SizedBox.shrink();
-        return ListTile(leading:ProfileAvatar(uid:other),title:Text(name),subtitle:DmPreview(id:d.id,uid:widget.uid),trailing:ThreadUnreadDot(threadId:'dm:${d.id}',uid:widget.uid,collection:d.reference.collection('messages')),onTap:()=>Navigator.push(c,CupertinoPageRoute<void>(builder:(_)=>DmChatPage(id:d.id,other:other,uid:widget.uid))));
-      });
-    })]);
-  }))]);
+  Expanded(child:error!=null?Center(child:Text(error!)):!loaded?const Center(child:CircularProgressIndicator()):visible.isEmpty?const Center(child:Text('Nenhuma conversa.')):SingleChildScrollView(child:SizedBox(height:h*visible.length,child:Stack(clipBehavior:Clip.hardEdge,children:[for(var i=0;i<visible.length;i++)AnimatedPositioned(key:ValueKey(visible[i].id),duration:const Duration(milliseconds:240),curve:Curves.easeOutCubic,top:i*h,left:0,right:0,height:h,child:Builder(builder:(c){final r=visible[i];return ListTile(leading:ProfileAvatar(uid:r.other),title:Text(userLabel(r.profile)),subtitle:_MeowDmTypingPreview(id:r.id,uid:widget.uid,latest:r.latest!),trailing:ThreadUnreadDot(threadId:'dm:${r.id}',uid:widget.uid,collection:db.collection('dms').doc(r.id).collection('messages')),onTap:()=>Navigator.push(c,CupertinoPageRoute<void>(builder:(_)=>DmChatPage(id:r.id,other:r.other,uid:widget.uid))));}))]))))]);
+ }
+}
+class _MeowDmRow {
+ final String id,other;_MeowDmRow(this.id,this.other);final subs=<StreamSubscription<dynamic>>[];
+ Map<String,dynamic>? latest,request;Map<String,dynamic> profile={};bool messagesReady=false,requestReady=false;
+ DateTime get time {final t=latest?['createdAt'];return t is Timestamp?t.toDate():DateTime.fromMillisecondsSinceEpoch(0);}
+ void stop(){for(final s in subs){unawaited(s.cancel());}subs.clear();}
+}
+class _MeowDmTypingPreview extends StatefulWidget {
+ final String id,uid;final Map<String,dynamic> latest;const _MeowDmTypingPreview({required this.id,required this.uid,required this.latest});
+ @override State<_MeowDmTypingPreview> createState()=>_MeowDmTypingPreviewState();
+}
+class _MeowDmTypingPreviewState extends State<_MeowDmTypingPreview>{
+ Timer? timer;int frame=0;
+ @override void dispose(){timer?.cancel();super.dispose();}
+ @override Widget build(BuildContext c)=>MeowStreamBuilder<QuerySnapshot<Map<String,dynamic>>>(stream:db.collection('dms').doc(widget.id).collection('typing').meowSnapshots(),builder:(c,s){
+  final typing=TickerMode.of(c)&&(s.data?.docs.any((d){final t=d.data()['at'];return d.id!=widget.uid&&t is Timestamp&&DateTime.now().difference(t.toDate()).inMilliseconds<6000;})??false);
+  if(typing){timer??=Timer.periodic(const Duration(milliseconds:350),(_){if(mounted)setState(()=>frame=(frame+1)%3);});return Row(children:[const Text('Digitando',style:TextStyle(color:purple)),const SizedBox(width:4),for(var i=0;i<3;i++)AnimatedOpacity(opacity:frame==i?1:.3,duration:const Duration(milliseconds:180),child:const Text('•',style:TextStyle(color:purple)))]);}
+  timer?.cancel();timer=null;final d=widget.latest;final t=(d['text']?.toString()??'').isNotEmpty?d['text'].toString():d['attachment'] is Map?'📎 Anexo':'Mensagem';return Text('${d['authorId']==widget.uid?'Você: ':''}$t',maxLines:1,overflow:TextOverflow.ellipsis);
+ });
 }
 class DmChatPage extends StatelessWidget {
  final String id,other,uid;final String? initialMessageId;
  const DmChatPage({super.key,required this.id,required this.other,required this.uid,this.initialMessageId});
- @override Widget build(BuildContext c)=>Scaffold(appBar:AppBar(title:MeowAccountHeader(uid:other,showPresence:true,onTap:()=>openProfile(c,other)),actions:[MuteButton(thread:'dm:$id')]),body:DmPermissionGate(id:id,uid:uid,other:other,initialMessageId:initialMessageId));
+ @override Widget build(BuildContext c)=>Scaffold(appBar:AppBar(title:MeowAccountHeader(uid:other,showPresence:true,onTap:()=>openProfile(c,other)),actions:[MuteButton(thread:'dm:$id'),MeowSearchButton(collection:db.collection('dms').doc(id).collection('messages'),openResult:(c,message)=>Navigator.pushReplacement(c,CupertinoPageRoute<void>(builder:(_)=>DmChatPage(id:id,other:other,uid:uid,initialMessageId:message))))]),body:DmPermissionGate(id:id,uid:uid,other:other,initialMessageId:initialMessageId));
 }
 // Read receipts: a user's last-read timestamp is stored separately per thread.
 // Security rules must restrict each receipt to its owner.
@@ -1611,13 +1713,13 @@ class MessageThread extends StatefulWidget {
   dynamic>> collection;
   final String uid,
   threadId;
-  final String? serverId,initialMessageId; final bool visible;
+  final String? serverId,initialMessageId; final bool visible,readOnly;
   const MessageThread({
     super.key,
     required this.collection,
     required this.uid,
     required this.threadId,
-    this.serverId,this.initialMessageId,this.visible=true
+    this.serverId,this.initialMessageId,this.visible=true,this.readOnly=false
 }
 );
   @override State<MessageThread> createState()=>_MessageThreadState();
@@ -1625,6 +1727,15 @@ class MessageThread extends StatefulWidget {
 
 class _MessageThreadState extends State<MessageThread> with RouteAware,WidgetsBindingObserver {
   final itemScroll=ItemScrollController();
+  final itemPositions=ItemPositionsListener.create();
+  List<QueryDocumentSnapshot<Map<String,dynamic>>> historyDocs=[];
+  bool loadingHistory=false,historyEnded=false,historyWaiting=false;
+  String? historyError,flashMessage;
+  Timer? flashTimer;
+  int historyEpoch=0;
+  QueryDocumentSnapshot<Map<String,dynamic>>? historyStart;
+  Query<Map<String,dynamic>> get historyQuery=>widget.collection.orderBy('createdAt',descending:true);
+  Query<Map<String,dynamic>> get windowQuery=>historyStart==null?historyQuery:historyQuery.startAtDocument(historyStart!);
   bool jumped=false,routeActive=true,foreground=true,anchored=false;
   final typingActive=ValueNotifier<bool>(false);
   Map<String,Map<String,dynamic>> people={}; bool everyoneAllowed=false;
@@ -1635,7 +1746,42 @@ class _MessageThreadState extends State<MessageThread> with RouteAware,WidgetsBi
   int memberEpoch=0;
   Set<String> memberIds=<String>{};
   bool memberRebuildQueued=false;
-  @override void initState(){super.initState();WidgetsBinding.instance.addObserver(this);messages=widget.collection.orderBy('createdAt',descending:true).limit(100).meowSnapshots();if(widget.visible)startMembers();if(widget.initialMessageId!=null)loadTarget();}
+  @override void initState(){super.initState();WidgetsBinding.instance.addObserver(this);messages=historyQuery.limit(50).meowSnapshots();itemPositions.itemPositions.addListener(maybeLoadHistory);if(widget.visible)startMembers();if(widget.initialMessageId!=null)loadTarget();}
+  void maybeLoadHistory(){
+    if(!mounted||!widget.visible||!foreground||!routeActive||historyEnded||loadingHistory||historyWaiting||historyError!=null||historyDocs.length<50)return;
+    final positions=itemPositions.itemPositions.value.where((p)=>p.itemTrailingEdge>0&&p.itemLeadingEdge<1);
+    if(positions.any((p)=>p.index>=historyDocs.length-5)){
+      WidgetsBinding.instance.addPostFrameCallback((_){if(mounted&&!loadingHistory&&!historyEnded)loadOlder();});
+      WidgetsBinding.instance.ensureVisualUpdate();
+    }
+  }
+  Future<void> loadOlder()async{
+    if(loadingHistory||historyWaiting||historyEnded||historyDocs.isEmpty||!widget.visible||!foreground||!routeActive)return;
+    final cursor=historyDocs.last, epoch=historyEpoch;
+    setState((){loadingHistory=true;historyError=null;cachedMessagePane=null;});
+    try{
+      final page=await historyQuery.startAfterDocument(cursor).limit(50).get(const GetOptions(source:Source.server));
+      if(!mounted||epoch!=historyEpoch)return;
+      setState((){
+        historyEnded=page.docs.length<50;
+        if(page.docs.isNotEmpty){
+          // Keep a live bounded range, including the already loaded messages.
+          // A snapshot cursor includes document identity, even when timestamps tie.
+          historyWaiting=true;messages=windowQuery.endAtDocument(page.docs.last).meowSnapshots();
+        }
+        loadingHistory=false;cachedMessagePane=null;
+      });
+    }catch(e){if(mounted&&epoch==historyEpoch)setState((){loadingHistory=false;historyError='Não foi possível carregar mensagens antigas.';cachedMessagePane=null;});}
+  }
+  void resetHistory(){
+    historyEpoch++;flashTimer?.cancel();
+    setState((){anchored=false;jumped=true;flashMessage=null;historyStart=null;historyDocs=[];historyEnded=false;loadingHistory=false;historyWaiting=false;historyError=null;lastMarkedMessage=null;cachedMessagePane=null;messages=historyQuery.limit(50).meowSnapshots();});
+    WidgetsBinding.instance.addPostFrameCallback((_){if(mounted&&itemScroll.isAttached)itemScroll.jumpTo(index:0);});
+  }
+  void flashTarget(String id){
+    flashTimer?.cancel();flashMessage=id;
+    flashTimer=Timer(const Duration(seconds:3),(){if(mounted)setState((){flashMessage=null;cachedMessagePane=null;});});
+  }
   void startMembers(){
     if(memberSub!=null||!widget.visible||!foreground||!routeActive)return;
     final epoch=++memberEpoch;
@@ -1652,7 +1798,22 @@ class _MessageThreadState extends State<MessageThread> with RouteAware,WidgetsBi
     WidgetsBinding.instance.addPostFrameCallback((_){memberRebuildQueued=false;if(mounted){setState((){cachedMessagePane=null;});}});
     WidgetsBinding.instance.ensureVisualUpdate();
   }
-  Future<void> loadTarget()async {try{final target=await widget.collection.doc(widget.initialMessageId).get();final t=target.data()?['createdAt'];if(t is Timestamp&&mounted){final recent=await widget.collection.orderBy('createdAt',descending:true).limit(100).get();if(!recent.docs.any((d)=>d.id==target.id)&&mounted)setState((){anchored=true;jumped=false;cachedMessagePane=null;messages=widget.collection.orderBy('createdAt',descending:true).startAt([t]).limit(100).meowSnapshots();});}}catch(_){} }
+  Future<void> loadTarget()async {
+    final epoch=historyEpoch;
+    try{
+      final id=widget.initialMessageId;if(id==null)return;
+      final target=await widget.collection.doc(id).get();
+      if(!mounted||epoch!=historyEpoch||!target.exists||target.data()?['createdAt'] is! Timestamp)return;
+      final recent=await historyQuery.limit(50).get();
+      if(!mounted||epoch!=historyEpoch)return;
+      if(!recent.docs.any((d)=>d.id==id)){
+        // Fetch the exact target by snapshot, then the surrounding older page.
+        final page=await historyQuery.startAtDocument(target).limit(50).get();
+        if(!mounted||epoch!=historyEpoch||page.docs.isEmpty)return;
+        setState((){historyEpoch++;anchored=true;jumped=false;historyEnded=false;loadingHistory=false;historyWaiting=false;historyError=null;historyDocs=[];cachedMessagePane=null;historyStart=page.docs.first;messages=windowQuery.limit(50).meowSnapshots();});
+      }
+    }catch(e){if(mounted)notice(context,'Não foi possível localizar a mensagem.');}
+  }
   void updateMembers(DocumentSnapshot<Map<String,dynamic>> snapshot){
     if(!mounted)return;
     final d=snapshot.data()??{};final ids=List<String>.from(d['members']??[]).toSet();
@@ -1675,7 +1836,7 @@ class _MessageThreadState extends State<MessageThread> with RouteAware,WidgetsBi
   @override void didUpdateWidget(covariant MessageThread old){super.didUpdateWidget(old);if(old.visible!=widget.visible){updateActive();lastMarkedMessage=null;cachedMessagePane=null;}}
   void updateActive(){typingActive.value=widget.visible&&routeActive&&foreground;if(typingActive.value){activeThread.value=widget.threadId;startMembers();}else{if(activeThread.value==widget.threadId)activeThread.value=null;suspendMembers();if(lastTyping!=null)unawaited(stopTyping());}}
   @override void didPush(){routeActive=true;updateActive();} @override void didPopNext(){routeActive=true;updateActive();if(mounted)setState((){lastMarkedMessage=null;cachedMessagePane=null;});} @override void didPushNext(){routeActive=false;updateActive();} @override void didPop(){routeActive=false;updateActive();}
-  @override void didChangeAppLifecycleState(AppLifecycleState state){foreground=state==AppLifecycleState.resumed;updateActive();if(foreground&&mounted)setState((){lastMarkedMessage=null;cachedMessagePane=null;});}
+  @override void didChangeAppLifecycleState(AppLifecycleState state){foreground=state==AppLifecycleState.resumed;updateActive();if(foreground&&mounted){setState((){lastMarkedMessage=null;cachedMessagePane=null;});if(widget.visible&&routeActive&&!anchored)unawaited(historyQuery.limit(50).get(const GetOptions(source:Source.server)).then<void>((_){}).catchError((Object _){}));}}
   void replyTo(QueryDocumentSnapshot<Map<String,dynamic>> doc){final d=doc.data();setState((){replyId=doc.id;replyText=d['text']?.toString()??'';replyAuthor=d['author']?.toString()??'Usuário';replyAuthorId=d['authorId']?.toString();});}
   String? get mentionQuery=>RegExp(r'(?:^|\s)@([^\s@]*)$').firstMatch(input.text)?.group(1)?.toLowerCase();
   void selectMention(String name){final match=RegExp(r'@([^\s@]*)$').firstMatch(input.text);if(match==null)return;input.text=input.text.replaceRange(match.start,match.end,'@$name ');input.selection=TextSelection.collapsed(offset:input.text.length);typingChanged(input.text);}
@@ -1698,7 +1859,7 @@ class _MessageThreadState extends State<MessageThread> with RouteAware,WidgetsBi
           for(final e in suggestions)ListTile(dense:true,
             leading:PrivateImage(scope:'profile',id:e.key,slot:'avatar',size:30),
             title:Text(userLabel(e.value),maxLines:1,overflow:TextOverflow.ellipsis),
-            subtitle:Text(meowPublicId(e.value),maxLines:1,overflow:TextOverflow.ellipsis),
+            
             onTap:()=>selectMention('#${meowSerial(e.value)}')),
         ],
       )),
@@ -1726,7 +1887,7 @@ class _MessageThreadState extends State<MessageThread> with RouteAware,WidgetsBi
   DocumentReference<Map<String,dynamic>> get typingRef=>widget.collection.parent!.collection('typing').doc(widget.uid);
   Future<void> stopTyping() async {typingTimer?.cancel();typingTimer=null;if(lastTyping==null)return;lastTyping=null;try{await typingRef.delete();}catch(_){} }
   void typingChanged(String value){
-    if(!widget.visible||!routeActive||!foreground||value.trim().isEmpty){unawaited(stopTyping());return;}
+    if(widget.readOnly||!widget.visible||!routeActive||!foreground||value.trim().isEmpty){unawaited(stopTyping());return;}
     final now=DateTime.now();
     if(lastTyping==null||now.difference(lastTyping!).inMilliseconds>=1500){
       lastTyping=now;
@@ -1740,7 +1901,7 @@ class _MessageThreadState extends State<MessageThread> with RouteAware,WidgetsBi
   replyText,
   replyAuthor,replyAuthorId;
   @override void dispose(){
-    meowRouteObserver.unsubscribe(this);WidgetsBinding.instance.removeObserver(this);suspendMembers();if(activeThread.value==widget.threadId)activeThread.value=null;
+    historyEpoch++;flashTimer?.cancel();itemPositions.itemPositions.removeListener(maybeLoadHistory);meowRouteObserver.unsubscribe(this);WidgetsBinding.instance.removeObserver(this);suspendMembers();if(activeThread.value==widget.threadId)activeThread.value=null;
     stopTyping();
     typingActive.dispose();
     input.dispose();
@@ -1749,20 +1910,15 @@ class _MessageThreadState extends State<MessageThread> with RouteAware,WidgetsBi
   Future<void> markRead()async{
     if(!widget.visible||!foreground||!routeActive)return;
     try{
-      await receiptRef(widget.threadId, widget.uid).set({
-        'at':FieldValue.serverTimestamp()
-}
-);
+      final t=lastMarkedMessage;
+      await receiptRef(widget.threadId, widget.uid).set({'at':FieldValue.serverTimestamp()});
+      if(t!=null&&FirebaseAuth.instance.currentUser?.uid==widget.uid)await _nativeNotification<void>('markThreadRead',{'recipientId':widget.uid,'threadKey':widget.threadId,'readAt':t.toDate().millisecondsSinceEpoch});
 }catch(_){
 }
 }
-  Future<void> send({
-    Map<String,
-    dynamic>? attachment, Map<String,dynamic>? expression
-}
-)async{
+  Future<bool> send({List<Map<String,dynamic>> attachments=const [], Map<String,dynamic>? expression})async{
     final text=input.text.trim();
-    if((text.isEmpty&&attachment==null&&expression==null)||sending)return;
+    if(widget.readOnly||(text.isEmpty&&attachments.isEmpty&&expression==null)||sending)return false;
     setState(()=>sending=true);
     try{
       final u=(await db.collection('users').doc(widget.uid).get()).data()??{
@@ -1784,12 +1940,29 @@ class _MessageThreadState extends State<MessageThread> with RouteAware,WidgetsBi
 }
 );
 }
-      if(attachment!=null)data['attachment']=attachment;
+      if(attachments.isNotEmpty){data['attachment']=attachments.first;if(attachments.length>1)data['attachments']=attachments;}
       if(expression!=null)data['expression']=expression;
       if(widget.serverId!=null&&everyoneAllowed&&mentionNames(text).contains('everyone'))data['everyoneMention']=true;
-      final sent=await widget.collection.add(data);
+      final sent=widget.collection.doc();
+      if(widget.serverId==null){
+        final dm=widget.collection.parent!;
+        final request=db.collection('dmRequests').doc(dm.id);
+        await db.runTransaction((tx)async{
+          final room=await tx.get(dm);final members=List<String>.from(room.data()?['members']??[]);
+          if(members.length!=2||!members.contains(widget.uid))throw Exception('Conversa indisponível.');
+          final other=members.firstWhere((x)=>x!=widget.uid);
+          final req=await tx.get(request);
+          final a=await tx.get(db.collection('users').doc(widget.uid).collection('following').doc(other));
+          final b=await tx.get(db.collection('users').doc(other).collection('following').doc(widget.uid));
+          final direct=a.exists&&b.exists;
+          final status=req.data()?['status'];
+          if(!direct&&req.exists&&status!='accepted'&&!(status=='pending'&&req.data()?['from']==widget.uid))throw Exception('É necessário aceitar a conversa antes de responder.');
+          if(!direct&&!req.exists)tx.set(request,{'from':widget.uid,'to':other,'status':'pending','createdAt':FieldValue.serverTimestamp(),'firstMessageId':sent.id});
+          tx.set(sent,data);
+        });
+      }else{await sent.set(data);}
       unawaited(notifyMessage(sent.path));
-      if(!mounted)return;
+      if(!mounted)return true;
       input.clear();
       unawaited(stopTyping());
       if(mounted)setState((){
@@ -1798,50 +1971,44 @@ class _MessageThreadState extends State<MessageThread> with RouteAware,WidgetsBi
         replyAuthor=null;replyAuthorId=null;
 }
 );
-      await markRead();
+      await markRead();return true;
 }catch(e){
-      if(mounted)notice(context, 'Falha ao enviar: $e');
+      if(mounted)notice(context, 'Falha ao enviar: $e');return false;
 }finally{
       if(mounted)setState(()=>sending=false);
 }
 }
-  bool uploading = false; double? uploadProgress;
-  Future<void> attach() async {
-    if (uploading || sending) return;
-    setState(() {uploading=true;uploadProgress=null;});
-    try {
-      final source = await showModalBottomSheet<String>(
-        context: context,
-        builder: (c) => SafeArea(child: Column(mainAxisSize: MainAxisSize.min, children: [
-          ListTile(leading: const Icon(Icons.photo), title: const Text('Galeria'),
-            onTap: () => Navigator.pop(c, 'gallery')),
-          ListTile(leading:const Icon(Icons.videocam),title:const Text('Vídeo da galeria'),onTap:()=>Navigator.pop(c,'video')),
-          ListTile(leading:const Icon(Icons.camera_alt),title:const Text('Câmera'),onTap:()=>Navigator.pop(c,'camera')),
-          ListTile(leading: const Icon(Icons.folder), title: const Text('Arquivos (25 MiB)'),
-            onTap: () => Navigator.pop(c, 'files')),
-        ])),
-      );
-      if (!mounted || source == null) return;
-      final file = source == 'gallery'
-          ? await ImagePicker().pickImage(source: ImageSource.gallery, requestFullMetadata: false)
-          : source=='video'?await ImagePicker().pickVideo(source:ImageSource.gallery):source=='camera'?await ImagePicker().pickImage(source:ImageSource.camera,requestFullMetadata:false):await files.openFile();
-      if (file == null || !mounted) return;
-      final length = await file.length();
-      if (length == 0 || length > attachmentLimit) {
-        throw Exception('O arquivo precisa ter entre 1 byte e 25 MiB.');
-      }
+  bool uploading=false;double? uploadProgress;
+  final pendingAttachments=<MeowPendingAttachment>[];
+  Future<void> attach()async{
+    if(uploading||sending||widget.readOnly)return;
+    try{
+      final source=await showModalBottomSheet<String>(context:context,builder:(c)=>SafeArea(child:Column(mainAxisSize:MainAxisSize.min,children:[
+        ListTile(leading:const Icon(Icons.photo),title:const Text('Galeria'),onTap:()=>Navigator.pop(c,'gallery')),
+        ListTile(leading:const Icon(Icons.videocam),title:const Text('Vídeo da galeria'),onTap:()=>Navigator.pop(c,'video')),
+        ListTile(leading:const Icon(Icons.camera_alt),title:const Text('Câmera'),onTap:()=>Navigator.pop(c,'camera')),
+        ListTile(leading:const Icon(Icons.folder),title:const Text('Arquivos (25 MiB por arquivo)'),onTap:()=>Navigator.pop(c,'files')),
+      ])));
+      if(source==null||!mounted)return;
+      List<files.XFile> selected=[];
+      if(source=='gallery'){selected=await ImagePicker().pickMultiImage(requestFullMetadata:false);}
+      else if(source=='files'){selected=await files.openFiles();}
+      else {final f=source=='video'?await ImagePicker().pickVideo(source:ImageSource.gallery):await ImagePicker().pickImage(source:ImageSource.camera,requestFullMetadata:false);if(f!=null)selected=[f];}
       if(!mounted)return;
-      final confirm=await showModalBottomSheet<bool>(context:context,builder:(c)=>SafeArea(child:Padding(padding:const EdgeInsets.all(18),child:Column(mainAxisSize:MainAxisSize.min,children:[const Icon(Icons.attach_file,size:36),Text(file.name),Text(fileSizeLabel(length)),const SizedBox(height:12),FilledButton(onPressed:()=>Navigator.pop(c,true),child:const Text('Enviar arquivo')),TextButton(onPressed:()=>Navigator.pop(c,false),child:const Text('Cancelar'))]))));
-      if(confirm!=true||!mounted)return;
+      final added=<MeowPendingAttachment>[];
+      for(final file in selected){
+        if(pendingAttachments.length+added.length>=5){notice(context,'Até 5 arquivos por mensagem.');break;}
+        final length=await file.length();if(!mounted)return;
+        if(length<1||length>attachmentLimit){notice(context,'${file.name}: limite de 25 MiB por arquivo.');continue;}
+        added.add(MeowPendingAttachment(file,length));
+      }
+      if(mounted)setState(()=>pendingAttachments.addAll(added));
+    }catch(e){if(mounted)notice(context,'Não foi possível selecionar arquivo: $e');}
+  }
+  Future<Map<String,dynamic>> uploadOne(MeowPendingAttachment entry,int index,int total)async{
+      final file=entry.file;final length=entry.length;
       final name = file.name;
-      final extension = name.contains('.') ? name.split('.').last.toLowerCase() : '';
-      const mime = <String, String>{
-        'jpg': 'image/jpeg', 'jpeg': 'image/jpeg', 'png': 'image/png',
-        'gif': 'image/gif', 'webp': 'image/webp', 'pdf': 'application/pdf',
-        'txt': 'text/plain', 'mp4': 'video/mp4', 'mov': 'video/quicktime',
-        'mp3': 'audio/mpeg', 'wav': 'audio/wav', 'zip': 'application/zip',
-      };
-      final contentType = mime[extension] ?? 'application/octet-stream';
+      final contentType=entry.mime;
       final uri = Uri.https(imageHost, '/functions/v1/meow-anexos',
           {'thread': widget.threadId, 'name': name});
       final request = http.StreamedRequest('PUT', uri);
@@ -1857,7 +2024,7 @@ class _MessageThreadState extends State<MessageThread> with RouteAware,WidgetsBi
             await for (final chunk in file.openRead()) {
               request.sink.add(chunk);transferred+=chunk.length;
               final now=DateTime.now();
-              if(mounted&&(transferred>=length||now.difference(lastPaint)>=const Duration(milliseconds:120))){lastPaint=now;setState(()=>uploadProgress=(transferred/length).clamp(0.0,1.0).toDouble());}
+              if(mounted&&(transferred>=length||now.difference(lastPaint)>=const Duration(milliseconds:120))){lastPaint=now;setState(()=>uploadProgress=((index+transferred/length)/total).clamp(0.0,1.0).toDouble());}
             }
             await request.sink.close();
           } catch (e, st) {
@@ -1883,20 +2050,27 @@ class _MessageThreadState extends State<MessageThread> with RouteAware,WidgetsBi
             payload['size'] is! int || payload['size'] != length) {
           throw Exception('Resposta inválida do servidor de anexos.');
         }
-        if(!mounted)return;
-        await send(attachment: {
-          'id': payload['id'], 'name': payload['name'],
-          'contentType': payload['contentType'], 'size': payload['size'],
-        });
-      } finally {
-        client.close();
-      }
-    } catch (e) {
-      if (mounted) notice(context, 'Anexo não enviado: $e');
-    } finally {
-      if (mounted) setState(() => uploading = false);
-    }
+        return {'id':payload['id'],'name':payload['name'],'contentType':payload['contentType'],'size':payload['size']};
+      }finally{client.close();}
   }
+  Future<void> sendQueued({Map<String,dynamic>? expression})async{
+    if(sending||uploading||widget.readOnly)return;
+    if(pendingAttachments.isEmpty){await send(expression:expression);return;}
+    final items=List<MeowPendingAttachment>.from(pendingAttachments);
+    setState((){uploading=true;uploadProgress=0;});
+    try{
+      for(var i=0;i<items.length;i++){
+        if(!mounted||FirebaseAuth.instance.currentUser?.uid!=widget.uid)return;
+        final item=items[i];item.uploaded??=await uploadOne(item,i,items.length);
+        if(mounted)setState(()=>uploadProgress=(i+1)/items.length);
+      }
+      if(!mounted||FirebaseAuth.instance.currentUser?.uid!=widget.uid)return;
+      final ok=await send(attachments:items.map((e)=>e.uploaded!).toList(),expression:expression);
+      if(ok&&mounted)setState(()=>pendingAttachments.clear());
+    }catch(e){if(mounted)notice(context,'Anexo não enviado: $e. Toque em Enviar para tentar novamente.');}
+    finally{if(mounted)setState((){uploading=false;uploadProgress=null;});}
+  }
+  Widget attachmentTray()=>SizedBox(height:104,child:ListView(scrollDirection:Axis.horizontal,padding:const EdgeInsets.symmetric(horizontal:8,vertical:6),children:[for(final item in pendingAttachments)Padding(padding:const EdgeInsets.only(right:8),child:Stack(children:[Container(width:item.mime.startsWith('image/')?94:178,height:92,clipBehavior:Clip.antiAlias,decoration:BoxDecoration(color:panel,borderRadius:BorderRadius.circular(12)),child:item.mime.startsWith('image/')?Image.file(File(item.file.path),fit:BoxFit.cover,cacheWidth:200,errorBuilder:(_,__,___)=>const Icon(Icons.image)):Padding(padding:const EdgeInsets.all(12),child:Row(children:[Icon(item.mime.startsWith('video/')?Icons.movie:Icons.insert_drive_file,color:Colors.white70),const SizedBox(width:8),Expanded(child:Column(mainAxisAlignment:MainAxisAlignment.center,crossAxisAlignment:CrossAxisAlignment.start,children:[Text(item.file.name,maxLines:1,overflow:TextOverflow.ellipsis),Text(fileSizeLabel(item.length),style:const TextStyle(fontSize:11,color:Colors.white54))]))]))),Positioned(right:0,top:0,child:IconButton.filledTonal(visualDensity:VisualDensity.compact,tooltip:'Remover anexo',onPressed:uploading||sending?null:()=>setState(()=>pendingAttachments.remove(item)),icon:const Icon(Icons.close,size:16))) ]))]));
   Future<bool> admin()async{
     if(widget.serverId==null)return false;
     final d=(await db.collection('servers').doc(widget.serverId).get()).data();
@@ -1914,9 +2088,9 @@ class _MessageThreadState extends State<MessageThread> with RouteAware,WidgetsBi
 }
     if(!mounted)return;
       final action=await showModalBottomSheet<String>(context:context, builder:(c)=>SafeArea(child:Column(mainAxisSize:MainAxisSize.min,
-        children:[ListTile(leading:const Icon(Icons.add_reaction_outlined),title:const Text('Adicionar reação'),onTap:()=>Navigator.pop(c,'react')),ListTile(leading:const Icon(Icons.reply), title:const Text('Responder'), onTap:()=>Navigator.pop(c,
+        children:[if(!widget.readOnly)ListTile(leading:const Icon(Icons.add_reaction_outlined),title:const Text('Adicionar reação'),onTap:()=>Navigator.pop(c,'react')),if(!widget.readOnly)ListTile(leading:const Icon(Icons.reply), title:const Text('Responder'), onTap:()=>Navigator.pop(c,
       'reply'
-)), if((d['text']?.toString()??'').isNotEmpty)ListTile(leading:const Icon(Icons.copy), title:const Text('Copiar mensagem'), onTap:()=>Navigator.pop(c, 'copy')), if(own)ListTile(leading:const Icon(Icons.edit), title:const Text('Editar'), onTap:()=>Navigator.pop(c,
+)), if((d['text']?.toString()??'').isNotEmpty)ListTile(leading:const Icon(Icons.copy), title:const Text('Copiar mensagem'), onTap:()=>Navigator.pop(c, 'copy')), if(meowAttachments(d).isNotEmpty)ListTile(leading:const Icon(Icons.download),title:const Text('Salvar anexo'),onTap:()=>Navigator.pop(c,'download')),if(own)ListTile(leading:const Icon(Icons.edit), title:const Text('Editar'), onTap:()=>Navigator.pop(c,
       'edit'
 )), if(canDelete)ListTile(leading:const Icon(Icons.delete), title:const Text('Apagar'), onTap:()=>Navigator.pop(c,
       'delete'
@@ -1928,8 +2102,9 @@ class _MessageThreadState extends State<MessageThread> with RouteAware,WidgetsBi
       if(mounted)notice(context, 'Mensagem copiada!');
       return;
     }
+    if(action=='download'){final list=meowAttachments(d);final selected=list.length==1?list.first:await showModalBottomSheet<Map<String,dynamic>>(context:context,builder:(c)=>SafeArea(child:ListView(shrinkWrap:true,children:[for(final a in list)ListTile(title:Text(a['name'].toString()),onTap:()=>Navigator.pop(c,a))])));if(selected!=null&&mounted){try{final bytes=await PrivateMediaCache.get(attachmentUrl(selected['id'].toString()));if(bytes==null)throw Exception('Anexo indisponível.');if(mounted)await saveMeowFile(context,bytes,selected['name'].toString(),selected['contentType'].toString().startsWith('image/'));}catch(e){if(mounted)notice(context,e);}}}
     if(action=='reply')replyTo(doc);
-    if(action=='react')await addReaction(context,doc.reference,widget.uid);
+    if(action=='react'&&!widget.readOnly)await addReaction(context,doc.reference,widget.uid);
     if (action == 'edit' && own) {
       String edited = d['text']?.toString() ?? '';
       final v = await showDialog<String>(
@@ -1981,6 +2156,20 @@ class _MessageThreadState extends State<MessageThread> with RouteAware,WidgetsBi
         if(s.hasError)return Center(child:Text('Erro: ${s.error}'));
         if(!s.hasData)return const Center(child:CircularProgressIndicator());
         final docs=s.data!.docs;
+        if(s.connectionState==ConnectionState.active){
+          final previous=historyDocs;
+          if(previous.isNotEmpty&&docs.isNotEmpty&&previous.first.id!=docs.first.id&&itemScroll.isAttached){
+            final visible=itemPositions.itemPositions.value.where((p)=>p.itemLeadingEdge>=0&&p.itemLeadingEdge<1&&p.index<previous.length).toList();
+            visible.sort((a,b)=>a.itemLeadingEdge.compareTo(b.itemLeadingEdge));
+            if(visible.isNotEmpty&&!visible.any((p)=>p.index==0)){
+              final anchor=visible.first;final id=previous[anchor.index].id;
+              final index=docs.indexWhere((d)=>d.id==id);
+              if(index>=0&&index!=anchor.index)WidgetsBinding.instance.addPostFrameCallback((_){if(mounted&&itemScroll.isAttached)itemScroll.jumpTo(index:index,alignment:anchor.itemLeadingEdge);});
+            }
+          }
+          historyDocs=docs;
+          if(!s.data!.metadata.isFromCache)historyWaiting=false;
+        }
         if(docs.isEmpty)return const Center(child:Column(mainAxisSize:MainAxisSize.min,children:[Image(image:AssetImage('assets/meow_foreground.png'),width:72,height:72),SizedBox(height:12),Text('Comece a conversa!')]));
         final newest = docs.first.data()['createdAt'];
         if (widget.visible && foreground && routeActive && newest is Timestamp && newest != lastMarkedMessage && !anchored) {
@@ -1990,44 +2179,58 @@ class _MessageThreadState extends State<MessageThread> with RouteAware,WidgetsBi
           });
         }
           final targetIndex=docs.indexWhere((d)=>d.id==widget.initialMessageId);
-          if(targetIndex>=0&&!jumped){jumped=true;WidgetsBinding.instance.addPostFrameCallback((_){if(mounted&&itemScroll.isAttached)itemScroll.jumpTo(index:targetIndex);});}
-          return ScrollablePositionedList.builder(key:PageStorageKey<String>(widget.threadId),itemScrollController:itemScroll,reverse:true,padding:const EdgeInsets.all(12),itemCount:docs.length,itemBuilder:(c,
+          if(targetIndex>=0&&!jumped){jumped=true;flashTarget(docs[targetIndex].id);WidgetsBinding.instance.addPostFrameCallback((_){if(mounted&&itemScroll.isAttached)itemScroll.jumpTo(index:targetIndex,alignment:.35);});}
+          return ScrollablePositionedList.builder(key:PageStorageKey<String>(widget.threadId),itemScrollController:itemScroll,itemPositionsListener:itemPositions,reverse:true,padding:const EdgeInsets.all(12),itemCount:docs.length+1,itemBuilder:(c,
         i
 ){
+          if(i==docs.length)return Center(child:Padding(padding:const EdgeInsets.symmetric(vertical:8),child:loadingHistory||historyWaiting?const SizedBox(width:20,height:20,child:CircularProgressIndicator(strokeWidth:2)):historyError!=null?TextButton(onPressed:loadOlder,child:Text('$historyError Tentar novamente')):historyEnded?const Text('Início da conversa',style:TextStyle(color:Colors.white54,fontSize:12)):TextButton(onPressed:loadOlder,child:const Text('Carregar mensagens anteriores'))));
           final doc=docs[i],
           d=doc.data();
           final author=d['authorId']?.toString()??'';
-          final attachment=d['attachment'];
+          final attachments=meowAttachments(d);
           final older=i+1<docs.length?docs[i+1].data():null;
-          final grouped=older!=null && older['authorId']==author && older['createdAt'] is Timestamp && d['createdAt'] is Timestamp && (d['createdAt'] as Timestamp).toDate().difference((older['createdAt'] as Timestamp).toDate()).inMinutes.abs()<5;
+          bool sameGroup(Map<String,dynamic>? other)=>other!=null&&other['authorId']==author&&other['createdAt'] is Timestamp&&d['createdAt'] is Timestamp&&(d['createdAt'] as Timestamp).toDate().difference((other['createdAt'] as Timestamp).toDate()).inSeconds.abs()<300;
+          final grouped=sameGroup(older);
+          final groupEnd=!sameGroup(i>0?docs[i-1].data():null);
           final when=d['createdAt'] is Timestamp?formatMeowTime((d['createdAt'] as Timestamp).toDate()):'Enviando...';
           final isDm=widget.serverId==null;
           final mine=author==widget.uid;
           final name=people.containsKey(author)?userLabel(people[author]!):d['author']?.toString()??'Usuário';
-          final messageContents=<Widget>[
+          final rawText=d['text']?.toString()??'';
+          final soloEmoji=MeowMessageText.isEmojiOnly(rawText);
+          final textContents=<Widget>[
             if(d['replyToId']!=null)Container(padding:const EdgeInsets.only(left:6),decoration:const BoxDecoration(border:Border(left:BorderSide(color:Colors.white38,width:2))),child:DefaultTextStyle.merge(style:const TextStyle(color:Colors.white70,fontSize:12),child:MeowMessageText(text:'↳ ${d['replyAuthor']??''}: ${d['replyText']??''}',people:people,compact:true))),
             if((d['text']?.toString()??'').isNotEmpty)MeowMessageText(text:d['text'].toString(),people:people),
-            if(attachment is Map&&attachment['id'] is String)AttachmentView(key:ValueKey(attachment['id']),attachment:attachment),
+          ];
+          final mediaContents=<Widget>[
+            for(final attachment in attachments)AttachmentView(key:ValueKey(attachment['id']),attachment:attachment),
             if(d['expression'] is Map)ExpressionImage(data:Map<String,dynamic>.from(d['expression'] as Map),message:doc.reference.path,size:(d['expression'] as Map)['kind']=='emoji'&&(d['text']?.toString()??'').isNotEmpty?26.0:null),
-            ReactionBar(ref:doc.reference,uid:widget.uid),
+          ];
+          final tailContents=<Widget>[
+            if(!widget.readOnly)ReactionBar(ref:doc.reference,uid:widget.uid),
             if(d['editedAt']!=null)const Text('(editada)',style:TextStyle(fontSize:11,color:Colors.white54)),
           ];
+          final messageContents=<Widget>[...textContents,...mediaContents,...tailContents];
           final Widget messageBody;
           if(isDm){
             messageBody=Row(crossAxisAlignment:CrossAxisAlignment.start,children:[
               if(!mine)...[if(grouped)const SizedBox(width:32)else ProfileAvatar(uid:author,size:32),const SizedBox(width:8)],
               Expanded(child:Align(alignment:mine?Alignment.centerRight:Alignment.centerLeft,child:FractionallySizedBox(widthFactor:.88,alignment:mine?Alignment.centerRight:Alignment.centerLeft,child:Column(crossAxisAlignment:mine?CrossAxisAlignment.end:CrossAxisAlignment.start,children:[
-                Container(padding:const EdgeInsets.symmetric(horizontal:12,vertical:8),decoration:BoxDecoration(color:mine?const Color(0xFF6440A9):panel,borderRadius:BorderRadius.circular(16),border:highlighted(d)?Border.all(color:Colors.amber,width:1):null),child:Column(mainAxisSize:MainAxisSize.min,crossAxisAlignment:CrossAxisAlignment.start,children:messageContents)),
-                if(!grouped)Padding(padding:const EdgeInsets.only(top:3),child:Text(when,style:const TextStyle(fontSize:11,color:Colors.white54))),
+                if(textContents.isNotEmpty)
+                  if(soloEmoji&&d['replyToId']==null) ...textContents
+                  else Container(padding:const EdgeInsets.symmetric(horizontal:12,vertical:8),decoration:BoxDecoration(color:mine?const Color(0xFF6440A9):panel,borderRadius:BorderRadius.circular(16),border:highlighted(d)?Border.all(color:Colors.amber,width:1):null),child:Column(mainAxisSize:MainAxisSize.min,crossAxisAlignment:CrossAxisAlignment.start,children:textContents)),
+                ...mediaContents,...tailContents,
+                if(groupEnd)Padding(padding:const EdgeInsets.only(top:3),child:Text(when,style:const TextStyle(fontSize:11,color:Colors.white54))),
               ])))),
+              if(mine)...[const SizedBox(width:8),if(grouped)const SizedBox(width:32)else ProfileAvatar(uid:author,size:32)],
             ]);
           }else{
             messageBody=Row(crossAxisAlignment:CrossAxisAlignment.start,children:[grouped?const SizedBox(width:40):ProfileAvatar(uid:author),const SizedBox(width:10),Expanded(child:Column(crossAxisAlignment:CrossAxisAlignment.start,children:[
               if(!grouped)Row(children:[Flexible(child:InkWell(onTap:()=>openProfile(c,author),child:Text(name,style:const TextStyle(fontWeight:FontWeight.bold,color:purple)))),const SizedBox(width:8),Text(when,style:const TextStyle(fontSize:11,color:Colors.white54))]),...messageContents,
             ]))]);
           }
-          return ReplySwipe(key:ValueKey(doc.id),onReply:()=>replyTo(doc),child:InkWell(onLongPress:()=>options(doc),child:Container(
-            decoration:!isDm&&highlighted(d)?const BoxDecoration(color:Color(0x22FFC107),border:Border(left:BorderSide(color:Colors.amber,width:3))):null,
+          return ReplySwipe(key:ValueKey(doc.id),onReply:(){if(!widget.readOnly)replyTo(doc);},child:InkWell(onLongPress:()=>options(doc),child:Container(
+            decoration:flashMessage==doc.id?BoxDecoration(color:purple.withOpacity(.22),borderRadius:BorderRadius.circular(8)):!isDm&&highlighted(d)?const BoxDecoration(color:Color(0x22FFC107),border:Border(left:BorderSide(color:Colors.amber,width:3))):null,
             padding:EdgeInsets.symmetric(vertical:grouped?2:5,horizontal:4),child:messageBody)));
 
 }
@@ -2035,20 +2238,29 @@ class _MessageThreadState extends State<MessageThread> with RouteAware,WidgetsBi
 }
 )
 );
-    @override Widget build(BuildContext c)=>Column(children:[if(anchored)TextButton(onPressed:()=>setState((){anchored=false;jumped=true;cachedMessagePane=null;messages=widget.collection.orderBy('createdAt',descending:true).limit(100).meowSnapshots();}),child:const Text('Voltar às mensagens recentes')),messageArea(), if(uploading)LinearProgressIndicator(value:uploadProgress),ValueListenableBuilder<bool>(valueListenable:typingActive,builder:(c,active,_)=>active?TypingLabel(collection:widget.collection.parent!.collection('typing'),uid:widget.uid):const SizedBox.shrink()), if(replyId!=null)ListTile(dense:true, title:Text('Respondendo a $replyAuthor: $replyText', maxLines:1,
+    @override Widget build(BuildContext c)=>Column(children:[if(anchored)TextButton(onPressed:resetHistory,child:const Text('Voltar às mensagens recentes')),messageArea(), if(uploading)LinearProgressIndicator(value:uploadProgress),ValueListenableBuilder<bool>(valueListenable:typingActive,builder:(c,active,_)=>active?TypingLabel(collection:widget.collection.parent!.collection('typing'),uid:widget.uid):const SizedBox.shrink()), if(!widget.readOnly&&replyId!=null)ListTile(dense:true, title:Text('Respondendo a $replyAuthor: $replyText', maxLines:1,
   overflow:TextOverflow.ellipsis
 ), trailing:IconButton(icon:const Icon(Icons.close), onPressed:()=>setState((){
     replyId=null;
     replyText=null;
     replyAuthor=null;replyAuthorId=null;
 }
-))), SafeArea(top:false, child:Padding(padding:const EdgeInsets.all(8), child:Row(children:[IconButton(tooltip:'Anexar arquivo',
+))), if(!widget.readOnly&&pendingAttachments.isNotEmpty)attachmentTray(),if(!widget.readOnly)SafeArea(top:false, child:Padding(padding:const EdgeInsets.all(8), child:Row(children:[IconButton(tooltip:'Anexar arquivo',
   onPressed:(sending||uploading)?null:attach, icon:Icon(uploading?Icons.hourglass_top:Icons.add_circle_outline)
-), Expanded(child:TextField(controller:input, maxLength:2000, maxLines:4, minLines:1, decoration:InputDecoration(hintText:'Mensagem',counterText:'',border:OutlineInputBorder(borderRadius:BorderRadius.circular(24))), onChanged:typingChanged,onSubmitted:(_){if(!uploading)send();})), IconButton(tooltip:'Emojis e figurinhas',icon:const Icon(Icons.emoji_emotions_outlined),onPressed:(sending||uploading)?null:()async{final v=await pickExpression(context);if(!mounted||v==null)return;if(v is String){input.text+=v;typingChanged(input.text);}else if(v is Map<String,dynamic>){await send(expression:v);}}), IconButton(onPressed:(sending||uploading)?null:()=>send(), icon:const Icon(Icons.send,
+), Expanded(child:TextField(controller:input,enabled:!sending&&!uploading, maxLength:2000, maxLines:4, minLines:1, decoration:InputDecoration(hintText:'Mensagem',counterText:'',border:OutlineInputBorder(borderRadius:BorderRadius.circular(24))), onChanged:typingChanged,onSubmitted:(_){if(!uploading)sendQueued();})), IconButton(tooltip:'Emojis e figurinhas',icon:const Icon(Icons.emoji_emotions_outlined),onPressed:(sending||uploading)?null:()async{final v=await pickExpression(context);if(!mounted||v==null)return;if(v is String){input.text+=v;typingChanged(input.text);}else if(v is Map<String,dynamic>){await sendQueued(expression:v);}}), IconButton(onPressed:(sending||uploading)?null:()=>sendQueued(), icon:const Icon(Icons.send,
   color:purple
 ))])))]);
 }
 
+List<Map<String,dynamic>> meowAttachments(Map<String,dynamic> data){
+ final raw=data['attachments'];if(raw is List){final all=raw.whereType<Map>().where((a)=>a['id'] is String).map((a)=>Map<String,dynamic>.from(a)).toList();if(all.isNotEmpty)return all;}
+ final one=data['attachment'];return one is Map&&one['id'] is String?[Map<String,dynamic>.from(one)]:[];
+}
+class MeowPendingAttachment{
+ final files.XFile file;final int length;final String mime;Map<String,dynamic>? uploaded;
+ MeowPendingAttachment(this.file,this.length):mime=meowFileMime(file.name);
+}
+String meowFileMime(String name)=>const {'jpg':'image/jpeg','jpeg':'image/jpeg','png':'image/png','gif':'image/gif','webp':'image/webp','pdf':'application/pdf','txt':'text/plain','mp4':'video/mp4','mov':'video/quicktime','webm':'video/webm','m4v':'video/mp4','mp3':'audio/mpeg','wav':'audio/wav','zip':'application/zip','apk':'application/vnd.android.package-archive'}[name.split('.').last.toLowerCase()]??'application/octet-stream';
 class AttachmentView extends StatefulWidget {
  final Map attachment;const AttachmentView({super.key,required this.attachment});
  @override State<AttachmentView> createState()=>_AttachmentViewState();
@@ -2067,6 +2279,7 @@ class _AttachmentViewState extends State<AttachmentView>{
  }
  @override Widget build(BuildContext c){
    final name=widget.attachment['name']?.toString()??'Arquivo';
+   if((widget.attachment['contentType']?.toString()??'').startsWith('video/'))return MeowVideoAttachment(key:ValueKey(widget.attachment['id']),attachment:widget.attachment);
    if(isImage){
      return Container(
        margin:const EdgeInsets.only(top:5),
@@ -2100,6 +2313,80 @@ class _AttachmentViewState extends State<AttachmentView>{
    );
  }
 }
+// Media files are private, bounded by the existing 25 MiB attachment limit.
+// Active players hold a lease; cache cleanup never deletes an active file.
+class MeowVideoCache {
+ static final active=<String>{};
+ static Future<Directory> directory()async{final base=await getTemporaryDirectory();return Directory('${base.path}/meow_video_091')..createSync(recursive:true);}
+ static Future<File> acquire(Map attachment)async{
+  final id=attachment['id'].toString();final uid=myUid;
+  final dir=await directory();final ext=const {'video/mp4':'mp4','video/quicktime':'mov','video/webm':'webm'}[attachment['contentType']]??'mp4';
+  final file=File('${dir.path}/${DateTime.now().microsecondsSinceEpoch}_${Random.secure().nextInt(1<<30)}.$ext');
+  active.add(file.path);
+  final client=http.Client();
+  try{
+   final request=http.Request('GET',attachmentUrl(id));request.headers.addAll(await authHeaders());
+   final response=await client.send(request).timeout(const Duration(seconds:30));
+   if(response.statusCode!=200||(response.contentLength??0)>attachmentLimit)throw Exception('Vídeo indisponível.');
+   var size=0;final sink=file.openWrite();
+   try{await for(final chunk in response.stream.timeout(const Duration(seconds:30))){if(FirebaseAuth.instance.currentUser?.uid!=uid)throw Exception('Sessão alterada.');size+=chunk.length;if(size>attachmentLimit)throw Exception('Vídeo acima do limite.');sink.add(chunk);}}finally{await sink.close();}
+   if(size==0||FirebaseAuth.instance.currentUser?.uid!=uid)throw Exception('Vídeo indisponível.');
+   return file;
+  }catch(_){await release(file);rethrow;}finally{client.close();}
+ }
+ static Future<void> release(File? file)async{if(file==null)return;active.remove(file.path);try{if(await file.exists())await file.delete();}catch(_){} }
+ static Future<int> bytes()async{var size=0;try{final dir=await directory();await for(final e in dir.list(followLinks:false)){if(e is File)size+=await e.length();}}catch(_){}return size;}
+ static Future<void> clear()async{try{final dir=await directory();await for(final e in dir.list(followLinks:false)){if(e is File&&!active.contains(e.path)){try{await e.delete();}catch(_){}}}}catch(_){} }
+}
+class MeowVideoAttachment extends StatefulWidget {
+ final Map attachment;const MeowVideoAttachment({super.key,required this.attachment});
+ @override State<MeowVideoAttachment> createState()=>_MeowVideoAttachmentState();
+}
+class _MeowVideoAttachmentState extends State<MeowVideoAttachment> with RouteAware,WidgetsBindingObserver {
+ File? file;VideoPlayerController? player;Uint8List? thumbnail;double thumbnailAspect=16/9;bool preparing=false,opening=false,full=false,failed=false,visible=true,foreground=true;int epoch=0;
+ Future<void>? preparation;
+ @override void initState(){super.initState();WidgetsBinding.instance.addObserver(this);}
+ @override void didChangeDependencies(){super.didChangeDependencies();final route=ModalRoute.of(context);if(route!=null)meowRouteObserver.subscribe(this,route);visible=TickerMode.of(context)&&(route?.isCurrent??true);if(visible&&foreground){if(preparation==null&&!failed)WidgetsBinding.instance.addPostFrameCallback((_){if(mounted&&visible&&preparation==null&&!failed)prepare();});}else if(!full){player?.pause();}}
+ Future<void> prepare()async{if(preparation!=null){await preparation;return;}final generation=++epoch;setState((){preparing=true;failed=false;});final task=()async{
+   try{final f=await MeowVideoCache.acquire(widget.attachment);if(!mounted||generation!=epoch){await MeowVideoCache.release(f);return;}file=f;
+    try{final thumb=await VideoThumbnail.thumbnailData(video:f.path,imageFormat:ImageFormat.JPEG,maxWidth:480,quality:75);final codec=await ui.instantiateImageCodec(thumb);final frame=await codec.getNextFrame();final ratio=frame.image.width/frame.image.height;frame.image.dispose();codec.dispose();if(mounted&&generation==epoch)setState((){thumbnail=thumb;thumbnailAspect=ratio;});}catch(_){/* Playback can still work without a preview. */}
+   }catch(_){if(mounted&&generation==epoch){setState(()=>failed=true);await MeowVideoCache.release(file);file=null;}}
+   finally{if(mounted&&generation==epoch)setState(()=>preparing=false);}
+  }();preparation=task;await task;
+ }
+ Future<VideoPlayerController?> ready()async{
+  if(failed){preparation=null;await prepare();}else if(preparation==null){await prepare();}else{await preparation;}
+  if(!mounted||file==null||failed)return null;
+  if(player?.value.isInitialized==true)return player;
+  final next=VideoPlayerController.file(file!);try{await next.initialize();if(!mounted){await next.dispose();return null;}if(player!=null)await player!.dispose();player=next;setState((){});return next;}catch(_){await next.dispose();if(mounted){notice(context,'Formato de vídeo não compatível.');}return null;}
+ }
+ Future<void> tap({bool fullscreen=false})async{
+  if(opening||full)return;opening=true;
+  try{final p=await ready();if(!mounted||p==null||!visible||!foreground)return;
+   if(fullscreen||p.value.isPlaying){if(!p.value.isPlaying){if(p.value.position>=p.value.duration)await p.seekTo(Duration.zero);await p.play();}if(!mounted)return;full=true;setState((){});await Navigator.push(context,MaterialPageRoute<void>(builder:(_)=>MeowFullVideo(player:p)));if(!mounted)return;full=false;setState((){});if(!visible||!foreground)await p.pause();}
+   else{if(p.value.position>=p.value.duration)await p.seekTo(Duration.zero);await p.play();}
+  }finally{opening=false;}
+ }
+ @override void didPushNext(){visible=false;if(!full)player?.pause();}
+ @override void didPopNext(){visible=TickerMode.of(context);}
+ @override void didPop(){if(!full)player?.pause();}
+ @override void didChangeAppLifecycleState(AppLifecycleState state){foreground=state==AppLifecycleState.resumed;if(!foreground)player?.pause();}
+ @override void dispose(){epoch++;meowRouteObserver.unsubscribe(this);WidgetsBinding.instance.removeObserver(this);final p=player;final f=file;unawaited(()async{try{await p?.dispose();}finally{await MeowVideoCache.release(f);}}());super.dispose();}
+ @override Widget build(BuildContext c){final p=player;return Container(margin:const EdgeInsets.only(top:5),constraints:const BoxConstraints(maxWidth:320,maxHeight:340),child:ClipRRect(borderRadius:BorderRadius.circular(12),child:p!=null&&p.value.isInitialized&&!full?MeowVideoSurface(player:p,onTap:()=>tap(),onDoubleTap:()=>tap(fullscreen:true)):AspectRatio(aspectRatio:thumbnailAspect,child:GestureDetector(onTap:()=>tap(),onDoubleTap:()=>tap(fullscreen:true),child:Stack(fit:StackFit.expand,children:[ColoredBox(color:panel,child:thumbnail==null?const Center(child:Icon(Icons.movie_outlined,color:Colors.white54,size:32)):Image.memory(thumbnail!,fit:BoxFit.contain,gaplessPlayback:true)),Center(child:Container(padding:const EdgeInsets.all(14),decoration:const BoxDecoration(color:Colors.black54,shape:BoxShape.circle),child:preparing?const SizedBox(width:25,height:25,child:CircularProgressIndicator(strokeWidth:2)):Icon(failed?Icons.refresh:Icons.play_arrow,color:Colors.white,size:30))) ])))));}
+}
+class MeowVideoSurface extends StatelessWidget{
+ final VideoPlayerController player;final VoidCallback onTap,onDoubleTap;final bool full;
+ const MeowVideoSurface({super.key,required this.player,required this.onTap,required this.onDoubleTap,this.full=false});
+ @override Widget build(BuildContext c)=>ValueListenableBuilder<VideoPlayerValue>(valueListenable:player,builder:(c,v,_){
+  final duration=max(1,v.duration.inMilliseconds);final position=v.position.inMilliseconds.clamp(0,duration).toDouble();
+  return AspectRatio(aspectRatio:v.aspectRatio>0?v.aspectRatio:16/9,child:Stack(fit:StackFit.expand,children:[GestureDetector(behavior:HitTestBehavior.opaque,onTap:onTap,onDoubleTap:onDoubleTap,child:VideoPlayer(player)),if(!v.isPlaying)Center(child:IgnorePointer(child:Container(decoration:const BoxDecoration(color:Colors.black54,shape:BoxShape.circle),padding:const EdgeInsets.all(12),child:const Icon(Icons.play_arrow,size:32,color:Colors.white)))),Positioned(left:0,right:0,bottom:0,child:Container(color:Colors.black54,child:Row(children:[IconButton(visualDensity:VisualDensity.compact,onPressed:()=>v.isPlaying?player.pause():player.play(),icon:Icon(v.isPlaying?Icons.pause:Icons.play_arrow,color:Colors.white,size:20)),Expanded(child:Slider(value:position,max:duration.toDouble(),onChanged:(n)=>player.seekTo(Duration(milliseconds:n.round())))),IconButton(visualDensity:VisualDensity.compact,onPressed:()=>player.setVolume(v.volume>0?0:1),icon:Icon(v.volume>0?Icons.volume_up:Icons.volume_off,color:Colors.white,size:20))])))]));
+ });
+}
+class MeowFullVideo extends StatelessWidget{
+ final VideoPlayerController player;const MeowFullVideo({super.key,required this.player});
+ @override Widget build(BuildContext c)=>Scaffold(backgroundColor:Colors.black,appBar:AppBar(backgroundColor:Colors.black),body:Center(child:MeowVideoSurface(player:player,full:true,onTap:()=>player.value.isPlaying?player.pause():player.play(),onDoubleTap:()=>Navigator.maybePop(c))));
+}
+
 class FriendsPage extends StatelessWidget {
  final String uid;const FriendsPage({super.key,required this.uid});
  @override Widget build(BuildContext c)=>Scaffold(appBar:AppBar(title:const Text('Amigos')),body:Column(children:[
@@ -2115,7 +2402,7 @@ Future<void> meowFindProfile(BuildContext c,String value)async{
   if(found.isEmpty){notice(c,'Usuário não encontrado');return;}
   if(found.length==1){await openProfile(c,found.first.id);return;}
   final selected=await showModalBottomSheet<String>(context:c,builder:(sheet)=>SafeArea(child:ListView(shrinkWrap:true,children:[
-    for(final d in found)ListTile(leading:ProfileAvatar(uid:d.id),title:Text(userLabel(d.data())),subtitle:Text(meowPublicId(d.data())),onTap:()=>Navigator.pop(sheet,d.id))])));
+    for(final d in found)ListTile(leading:ProfileAvatar(uid:d.id),title:Text(userLabel(d.data())),onTap:()=>Navigator.pop(sheet,d.id))])));
   if(c.mounted&&selected!=null)await openProfile(c,selected);
  }catch(e){if(c.mounted)notice(c,'Não foi possível buscar usuários.');}
 }
@@ -2134,9 +2421,9 @@ class MutualFriendsList extends StatefulWidget {
 }
 class _MutualFriendsListState extends State<MutualFriendsList>{
  StreamSubscription<QuerySnapshot<Map<String,dynamic>>>? following;final mutualSubs=<String,StreamSubscription<DocumentSnapshot<Map<String,dynamic>>>>{};final profileSubs=<String,StreamSubscription<DocumentSnapshot<Map<String,dynamic>>>>{};final profiles=<String,Map<String,dynamic>>{};Timer? timer;bool loaded=false;
- @override void initState(){super.initState();following=db.collection('users').doc(widget.uid).collection('following').meowSnapshots().listen((s){if(!mounted)return;final ids=s.docs.map((d)=>d.id).toSet();for(final id in mutualSubs.keys.toList()){if(!ids.contains(id)){mutualSubs.remove(id)?.cancel();profileSubs.remove(id)?.cancel();profiles.remove(id);}}for(final id in ids){mutualSubs.putIfAbsent(id,()=>db.collection('users').doc(id).collection('following').doc(widget.uid).meowSnapshots().listen((m){if(!mounted||!mutualSubs.containsKey(id))return;if(m.exists){profiles.putIfAbsent(id,()=>{});profileSubs.putIfAbsent(id,()=>db.collection('users').doc(id).meowSnapshots().listen((u){if(mounted&&profileSubs.containsKey(id))setState(()=>profiles[id]=u.data()??{});}));}else{profileSubs.remove(id)?.cancel();profiles.remove(id);}setState((){});}));}setState(()=>loaded=true);},onError:(Object _){if(mounted)setState(()=>loaded=true);});timer=Timer.periodic(const Duration(seconds:15),(_){if(mounted)setState((){});});}
+ @override void initState(){super.initState();following=db.collection('users').doc(widget.uid).collection('following').meowSnapshots().listen((s){if(!mounted)return;final ids=s.docs.map((d)=>d.id).toSet();for(final id in mutualSubs.keys.toList()){if(!ids.contains(id)){mutualSubs.remove(id)?.cancel();profileSubs.remove(id)?.cancel();profiles.remove(id);}}for(final id in ids){mutualSubs.putIfAbsent(id,()=>db.collection('users').doc(id).collection('following').doc(widget.uid).meowSnapshots().listen((m){if(!mounted||!mutualSubs.containsKey(id))return;if(m.exists){profiles.putIfAbsent(id,()=>{});profileSubs.putIfAbsent(id,()=>db.collection('users').doc(id).meowSnapshots().listen((u){if(mounted&&profileSubs.containsKey(id))setState(()=>profiles[id]=u.data()??{});}));}else{profileSubs.remove(id)?.cancel();profiles.remove(id);}setState((){});}));}setState(()=>loaded=true);},onError:(Object _){if(mounted)setState(()=>loaded=true);});timer=Timer.periodic(const Duration(seconds:5),(_){if(mounted)setState((){});});}
  @override void dispose(){following?.cancel();timer?.cancel();for(final s in mutualSubs.values){s.cancel();}for(final s in profileSubs.values){s.cancel();}super.dispose();}
- @override Widget build(BuildContext c){if(!loaded)return const Center(child:CircularProgressIndicator());if(profiles.isEmpty)return const Center(child:Text('Nenhum amigo ainda.'));final entries=profiles.entries.toList()..sort((a,b){final offA=currentPresence(a.value)=='offline';final offB=currentPresence(b.value)=='offline';if(offA!=offB)return offA?1:-1;return userLabel(a.value).compareTo(userLabel(b.value));});return ListView(children:[for(final e in entries)ListTile(leading:ProfileAvatar(uid:e.key),title:Text(userLabel(e.value)),subtitle:Text(meowPublicId(e.value)),onTap:()=>openProfile(c,e.key))]);}
+ @override Widget build(BuildContext c){if(!loaded)return const Center(child:CircularProgressIndicator());if(profiles.isEmpty)return const Center(child:Text('Nenhum amigo ainda.'));final entries=profiles.entries.toList()..sort((a,b){final offA=currentPresence(a.value)=='offline';final offB=currentPresence(b.value)=='offline';if(offA!=offB)return offA?1:-1;return userLabel(a.value).compareTo(userLabel(b.value));});return ListView(children:[for(final e in entries)ListTile(leading:ProfileAvatar(uid:e.key),title:Text(userLabel(e.value)),dense:true,visualDensity:VisualDensity.compact,onTap:()=>openProfile(c,e.key))]);}
 }
 
 String formatMeowTime(DateTime date) {
@@ -2232,7 +2519,7 @@ class _ProfileThemeEditorState extends State<ProfileThemeEditor>{
    SwitchListTile(title:const Text('Usar gradiente de duas cores'),value:gradient,onChanged:(v)=>setState(()=>gradient=v)),
    OutlinedButton(onPressed:()=>pick(0),child:const Text('Selecionar cor principal')),
    if(gradient)OutlinedButton(onPressed:()=>pick(1),child:const Text('Selecionar segunda cor')),
-   FilledButton(onPressed:saving?null:()async{setState(()=>saving=true);try{await db.collection('users').doc(widget.uid).update({'themeColorA':meowHex(first),'themeColorB':meowHex(second),'themeGradient':gradient});if(mounted)notice(context,'Tema salvo!');}catch(e){if(mounted)notice(context,e);}finally{if(mounted)setState(()=>saving=false);}},child:Text(saving?'Salvando...':'Salvar tema')),
+   FilledButton(onPressed:saving?null:()async{setState(()=>saving=true);try{if(mounted)notice(context,'Use Editar perfil para salvar o tema.');}catch(e){if(mounted)notice(context,e);}finally{if(mounted)setState(()=>saving=false);}},child:Text(saving?'Salvando...':'Salvar tema')),
   ]);
  });
 }
@@ -2386,143 +2673,38 @@ class DmRequestsDot extends StatelessWidget {
 }
 
 class DmRequestsPage extends StatelessWidget {
-  final String uid;
-  const DmRequestsPage({super.key, required this.uid});
-  @override
-  Widget build(BuildContext context) => Scaffold(
-    appBar: AppBar(title: const Text('Solicitacoes de mensagens')),
-    body: MeowStreamBuilder<QuerySnapshot<Map<String, dynamic>>>(
-      stream: myDmRequests(uid),
-      builder: (context, snapshot) {
-        if (snapshot.hasError) return Center(child: Text('Erro: ${snapshot.error}'));
-        if (!snapshot.hasData) return const Center(child: CircularProgressIndicator());
-        final requests = snapshot.data!.docs
-            .where((doc) => doc.data()['status'] == 'pending').toList();
-        if (requests.isEmpty) return const Center(child: Text('Nenhuma solicitacao pendente.'));
-        return ListView(children: [
-          for (final request in requests)
-            ListTile(
-              leading: ProfileAvatar(uid: request.data()['from']?.toString() ?? ''),
-              title: UserDisplayName(uid: request.data()['from']?.toString() ?? ''),
-              subtitle: const Text('Quer conversar com voce'),
-              trailing: Wrap(children: [
-                IconButton(
-                  tooltip: 'Aceitar', icon: const Icon(Icons.check),
-                  onPressed: () async {
-                    try {
-                      await request.reference.update({'status': 'accepted'});
-                      if (context.mounted) {
-                        Navigator.push(context, CupertinoPageRoute<void>(builder: (_) =>
-                            DmChatPage(id: request.id, other: request.data()['from'].toString(), uid: uid)));
-                      }
-                    } catch (e) { if (context.mounted) notice(context, e); }
-                  },
-                ),
-                IconButton(
-                  tooltip: 'Recusar', icon: const Icon(Icons.close),
-                  onPressed: () async {
-                    try { await request.reference.update({'status': 'declined'}); }
-                    catch (e) { if (context.mounted) notice(context, e); }
-                  },
-                ),
-              ]),
-            ),
-        ]);
-      },
-    ),
-  );
+ final String uid;const DmRequestsPage({super.key,required this.uid});
+ @override Widget build(BuildContext c)=>Scaffold(appBar:AppBar(title:const Text('Solicitações de mensagens')),body:MeowStreamBuilder<QuerySnapshot<Map<String,dynamic>>>(stream:myDmRequests(uid),builder:(c,s){
+  if(s.hasError)return const Center(child:Text('Não foi possível carregar solicitações.'));
+  if(!s.hasData)return const Center(child:CircularProgressIndicator());
+  if(s.data!.docs.isEmpty)return const Center(child:Text('Nenhuma solicitação pendente.'));
+  return ListView(children:[for(final request in s.data!.docs)MeowStreamBuilder<QuerySnapshot<Map<String,dynamic>>>(key:ValueKey(request.id),stream:db.collection('dms').doc(request.id).collection('messages').orderBy('createdAt',descending:true).limit(1).meowSnapshots(),builder:(c,m){
+    if(m.data?.docs.isNotEmpty!=true)return const SizedBox.shrink();
+    final from=request.data()['from'].toString();
+    return ListTile(leading:ProfileAvatar(uid:from),title:UserDisplayName(uid:from),subtitle:DmPreview(id:request.id,uid:uid),trailing:ThreadUnreadDot(threadId:'dm:${request.id}',uid:uid,collection:db.collection('dms').doc(request.id).collection('messages')),onTap:()=>Navigator.push(c,CupertinoPageRoute<void>(builder:(_)=>DmChatPage(id:request.id,other:from,uid:uid))));
+  })]);
+ }));
 }
 
 class DmPermissionGate extends StatelessWidget {
-  final String id, uid, other; final String? initialMessageId;
-  const DmPermissionGate({super.key, required this.id, required this.uid, required this.other,this.initialMessageId});
-  @override
-  Widget build(BuildContext context) => MeowStreamBuilder<DocumentSnapshot<Map<String, dynamic>>>(
-    stream: db.collection('users').doc(uid).collection('following').doc(other).meowSnapshots(),
-    builder: (context, mine) => MeowStreamBuilder<DocumentSnapshot<Map<String, dynamic>>>(
-      stream: db.collection('users').doc(other).collection('following').doc(uid).meowSnapshots(),
-      builder: (context, theirs) {
-        if (mine.hasError || theirs.hasError) return const Center(child: Text('Nao foi possivel verificar a amizade.'));
-        if (!mine.hasData || !theirs.hasData) return const Center(child: CircularProgressIndicator());
-        if (mine.data!.exists && theirs.data!.exists) {
-          return MessageThread(collection: db.collection('dms').doc(id).collection('messages'), uid: uid, threadId: 'dm:$id',initialMessageId:initialMessageId);
-        }
-        return MeowStreamBuilder<DocumentSnapshot<Map<String, dynamic>>>(
-          stream: db.collection('dmRequests').doc(id).meowSnapshots(),
-          builder: (context, request) {
-            if (request.hasError) return Center(child: Text('Erro: ${request.error}'));
-            if (!request.hasData) return const Center(child: CircularProgressIndicator());
-            final data = request.data!.data();
-            if (data?['status'] == 'accepted') {
-              return MessageThread(collection: db.collection('dms').doc(id).collection('messages'), uid: uid, threadId: 'dm:$id',initialMessageId:initialMessageId);
-            }
-            if (data?['status'] == 'pending' && data?['to'] == uid) {
-              return Center(child: Column(mainAxisSize: MainAxisSize.min, children: [
-                const Text('Solicitacao de mensagem'),
-                const SizedBox(height: 12),
-                FilledButton(onPressed: () async {
-                  try { await request.data!.reference.update({'status': 'accepted'}); }
-                  catch (e) { if (context.mounted) notice(context, e); }
-                }, child: const Text('Aceitar conversa')),
-                TextButton(onPressed: () async {
-                  try { await request.data!.reference.update({'status': 'declined'}); }
-                  catch (e) { if (context.mounted) notice(context, e); }
-                }, child: const Text('Recusar')),
-              ]));
-            }
-            if (data?['status'] == 'pending') {
-              return const Center(child: Text('Aguardando a outra pessoa aceitar sua solicitacao.'));
-            }
-            return const Center(child: Text('Conversa indisponivel sem amizade mutua ou solicitacao aceita.'));
-          },
-        );
-      },
-    ),
-  );
+ final String id,uid,other;final String? initialMessageId;
+ const DmPermissionGate({super.key,required this.id,required this.uid,required this.other,this.initialMessageId});
+ Widget chat({bool readOnly=false})=>MessageThread(key:ValueKey(id),collection:db.collection('dms').doc(id).collection('messages'),uid:uid,threadId:'dm:$id',initialMessageId:initialMessageId,readOnly:readOnly);
+ @override Widget build(BuildContext c)=>MeowStreamBuilder<DocumentSnapshot<Map<String,dynamic>>>(stream:db.collection('users').doc(uid).collection('following').doc(other).meowSnapshots(),builder:(c,mine)=>MeowStreamBuilder<DocumentSnapshot<Map<String,dynamic>>>(stream:db.collection('users').doc(other).collection('following').doc(uid).meowSnapshots(),builder:(c,theirs){
+   if(mine.hasError||theirs.hasError)return const Center(child:Text('Não foi possível verificar a amizade.'));
+   if(!mine.hasData||!theirs.hasData)return const Center(child:CircularProgressIndicator());
+   if(mine.data!.exists&&theirs.data!.exists)return chat();
+   return MeowStreamBuilder<DocumentSnapshot<Map<String,dynamic>>>(stream:db.collection('dmRequests').doc(id).meowSnapshots(),builder:(c,request){
+     if(request.hasError)return const Center(child:Text('Conversa indisponível.'));
+     if(!request.hasData)return const Center(child:CircularProgressIndicator());
+     final data=request.data!.data();final status=data?['status'];
+     if(status=='declined')return const Center(child:Text('Solicitação recusada.'));
+     if(status=='pending'&&data?['to']==uid)return Column(children:[Expanded(child:chat(readOnly:true)),SafeArea(top:false,child:Padding(padding:const EdgeInsets.all(12),child:Column(children:[const Text('Aceite para responder a esta conversa.'),const SizedBox(height:8),Row(children:[Expanded(child:OutlinedButton(onPressed:()async{try{await request.data!.reference.update({'status':'declined'});if(c.mounted)Navigator.maybePop(c);}catch(e){if(c.mounted)notice(c,e);}},child:const Text('Recusar'))),const SizedBox(width:8),Expanded(child:FilledButton(onPressed:()async{try{await request.data!.reference.update({'status':'accepted'});}catch(e){if(c.mounted)notice(c,e);}},child:const Text('Aceitar')))])])))]);
+     return chat();
+   });
+ }));
 }
 
-Future<void> confirmLeaveServer(BuildContext context,String id)async{
- final ok=await showDialog<bool>(context:context,builder:(c)=>AlertDialog(title:const Text('Sair do servidor?'),actions:[TextButton(onPressed:()=>Navigator.pop(c,false),child:const Text('Cancelar')),FilledButton(onPressed:()=>Navigator.pop(c,true),child:const Text('Sair'))]));
- if(ok!=true)return;
- try{await db.collection('servers').doc(id).update({'members':FieldValue.arrayRemove([myUid])});if(context.mounted)Navigator.pop(context);}catch(e){if(context.mounted)notice(context,e);}
-}
-// 0.8.1: deletion is exclusively performed by the authenticated backend.
-Future<Map<String,dynamic>> meowServerAction(String id,String action,String uid) async {
- final user=FirebaseAuth.instance.currentUser;
- if(user==null||user.uid!=uid)throw Exception('Sessão alterada.');
- final token=await user.getIdToken();
- if(token==null||FirebaseAuth.instance.currentUser?.uid!=uid)throw Exception('Entre novamente no Meow.');
- final response=await http.post(
-   Uri.https(imageHost,'/functions/v1/meow-servidores'),
-   headers:{'Authorization':'Bearer $token','Content-Type':'application/json'},
-   body:jsonEncode({'action':action,'serverId':id,if(action=='delete')'confirm':id}),
- ).timeout(const Duration(seconds:90));
- if(FirebaseAuth.instance.currentUser?.uid!=uid)throw Exception('Sessão alterada.');
- dynamic decoded;
- try{decoded=jsonDecode(response.body);}catch(_){decoded=null;}
- if(response.statusCode!=200&&response.statusCode!=202){
-   final detail=decoded is Map&&decoded['error'] is String?decoded['error'] as String:'Serviço de exclusão indisponível.';
-   throw Exception('$detail (HTTP ${response.statusCode})');
- }
- if(decoded is! Map<String,dynamic>||decoded['ok']!=true||decoded['deleted'] is! bool){
-   throw Exception('Resposta inválida do serviço de exclusão.');
- }
- if(action=='delete'&&((response.statusCode==200&&decoded['deleted']!=true)||
-   (response.statusCode==202&&(decoded['deleted']!=false||decoded['retryAfterMs'] is! int)))){
-   throw Exception('Não foi possível confirmar o progresso da exclusão.');
- }
- if(action=='inspect'&&response.statusCode!=200)throw Exception('Resposta de inspeção inválida.');
- return decoded;
-}
-
-Future<bool> confirmServerDelete(BuildContext context,String id,{bool resume=false}) async {
- final uid=FirebaseAuth.instance.currentUser?.uid;if(uid==null)return false;
- final ok=await showDialog<bool>(context:context,builder:(c)=>AlertDialog(title:Text(resume?'Retomar exclusão?':'Excluir servidor?'),content:Text(resume?'Continuar a limpeza dos dados?':'Esta ação é permanente. O servidor será retirado da lista assim que o backend confirmar o bloqueio. A limpeza dos dados continuará depois.'),actions:[TextButton(onPressed:()=>Navigator.pop(c,false),child:const Text('Cancelar')),FilledButton(onPressed:()=>Navigator.pop(c,true),child:Text(resume?'Retomar':'Excluir'))]));
- if(ok!=true||!context.mounted||FirebaseAuth.instance.currentUser?.uid!=uid)return false;
- final result=await showDialog<bool>(context:context,barrierDismissible:false,builder:(_)=>_MeowServerDeleteDialog(id:id,uid:uid));
- if(result==true&&context.mounted)notice(context,'Exclusão iniciada. O servidor não está mais disponível.');
- return result==true;
-}
 class MeowDeletionQueue {
  static final _running=<String>{};
  static final errors=ValueNotifier<Map<String,String>>({});
@@ -2582,13 +2764,17 @@ class ProfileBackground extends StatefulWidget {
  @override State<ProfileBackground> createState()=>_ProfileBackgroundState();
 }
 class _ProfileBackgroundState extends State<ProfileBackground> {
- late Future<Uint8List?> future;
+ late Future<Uint8List?> future;String revision='';int epoch=0;
+ StreamSubscription<DocumentSnapshot<Map<String,dynamic>>>? sub;
  Uri get url=>mediaUrl('profile',widget.uid,'background');
- void refresh(){if(mounted&&changedImage.value==url)setState(()=>future=PrivateMediaCache.get(url));}
+ Uri get versionUrl=>revision.isEmpty?url:url.replace(queryParameters:{...url.queryParameters,'revision':revision});
+ void refresh(){if(mounted&&changedImage.value==url)setState(()=>future=PrivateMediaCache.get(versionUrl));}
+ void watch(){sub?.cancel();sub=null;final generation=++epoch;if(!TickerMode.of(context))return;sub=db.collection('users').doc(widget.uid).meowSnapshots().listen((snap){if(!mounted||generation!=epoch)return;final next=snap.data()?['backgroundRevision']?.toString()??'';if(next!=revision)setState((){revision=next;future=PrivateMediaCache.get(versionUrl);});},onError:(Object _){});}
  @override void initState(){super.initState();future=PrivateMediaCache.get(url);changedImage.addListener(refresh);}
- @override void didUpdateWidget(covariant ProfileBackground old){super.didUpdateWidget(old);if(old.uid!=widget.uid)future=PrivateMediaCache.get(url);}
- @override void dispose(){changedImage.removeListener(refresh);super.dispose();}
- @override Widget build(BuildContext c)=>FutureBuilder<Uint8List?>(future:future,builder:(c,s)=>s.data==null?const SizedBox.shrink():Stack(fit:StackFit.expand,children:[meowPreview(c,s.data!,width:0,height:0,fit:BoxFit.cover,errorBuilder:(c,e,st)=>const SizedBox.shrink()),const ColoredBox(color:Color(0x99000000))]));
+ @override void didChangeDependencies(){super.didChangeDependencies();watch();}
+ @override void didUpdateWidget(covariant ProfileBackground old){super.didUpdateWidget(old);if(old.uid!=widget.uid){revision='';future=PrivateMediaCache.get(url);watch();}}
+ @override void dispose(){epoch++;sub?.cancel();changedImage.removeListener(refresh);super.dispose();}
+ @override Widget build(BuildContext c)=>FutureBuilder<Uint8List?>(key:ValueKey(versionUrl),future:future,builder:(c,s)=>s.data==null?const SizedBox.shrink():Stack(fit:StackFit.expand,children:[meowPreview(c,s.data!,width:0,height:0,fit:BoxFit.cover,errorBuilder:(c,e,st)=>const SizedBox.shrink()),const ColoredBox(color:Color(0x99000000))]));
 }
 class TypingLabel extends StatefulWidget {
  final CollectionReference<Map<String,dynamic>> collection;final String uid;
@@ -2677,7 +2863,7 @@ class _ExpressionImageState extends State<ExpressionImage> {
  late Future<Uint8List?> future;
  @override void initState(){super.initState();future=PrivateMediaCache.get(widget.url);}
  @override void didUpdateWidget(covariant ExpressionImage old){super.didUpdateWidget(old);if(old.url!=widget.url)future=PrivateMediaCache.get(widget.url);}
- @override Widget build(BuildContext c){final n=widget.size??(widget.data['kind']=='sticker'?144.0:48.0);return SizedBox(width:n,height:n,child:FutureBuilder<Uint8List?>(future:future,builder:(c,s)=>s.data==null?const Icon(Icons.image_outlined):meowPreview(c,s.data!,width:n,height:n,fit:BoxFit.contain,errorBuilder:(c,e,st)=>const Icon(Icons.broken_image))));}
+ @override Widget build(BuildContext c){final n=widget.size??(widget.data['kind']=='sticker'?144.0:30.0);return SizedBox(width:n,height:n,child:FutureBuilder<Uint8List?>(future:future,builder:(c,s)=>s.data==null?const Icon(Icons.image_outlined):meowPreview(c,s.data!,width:n,height:n,fit:BoxFit.contain,errorBuilder:(c,e,st)=>const Icon(Icons.broken_image))));}
 }
 // 0.8.1: a bounded, explicit dark sheet. Load the catalogue independently
 // of hidden-tab TickerMode and keep one shared future for both custom tabs.
@@ -2804,9 +2990,9 @@ class ServerMembers extends StatefulWidget {
 }
 class _ServerMembersState extends State<ServerMembers>{
  final users=<String,Map<String,dynamic>>{};final subs=<String,StreamSubscription<DocumentSnapshot<Map<String,dynamic>>>>{};StreamSubscription<DocumentSnapshot<Map<String,dynamic>>>? serverSub;Timer? timer;
- @override void initState(){super.initState();serverSub=db.collection('servers').doc(widget.server).meowSnapshots().listen((s){if(!mounted)return;final ids=List<String>.from(s.data()?['members']??[]).toSet();for(final id in subs.keys.toList()){if(!ids.contains(id)){subs.remove(id)?.cancel();users.remove(id);}}for(final id in ids){users.putIfAbsent(id,()=>{});subs.putIfAbsent(id,()=>db.collection('users').doc(id).meowSnapshots().listen((u){if(mounted)setState(()=>users[id]=u.data()??{});}));}setState((){});});timer=Timer.periodic(const Duration(seconds:15),(_){if(mounted)setState((){});});}
+ @override void initState(){super.initState();serverSub=db.collection('servers').doc(widget.server).meowSnapshots().listen((s){if(!mounted)return;final ids=List<String>.from(s.data()?['members']??[]).toSet();for(final id in subs.keys.toList()){if(!ids.contains(id)){subs.remove(id)?.cancel();users.remove(id);}}for(final id in ids){users.putIfAbsent(id,()=>{});subs.putIfAbsent(id,()=>db.collection('users').doc(id).meowSnapshots().listen((u){if(mounted)setState(()=>users[id]=u.data()??{});}));}setState((){});});timer=Timer.periodic(const Duration(seconds:5),(_){if(mounted)setState((){});});}
  @override void dispose(){timer?.cancel();serverSub?.cancel();for(final s in subs.values){s.cancel();}super.dispose();}
- @override Widget build(BuildContext c){final online=users.entries.where((e)=>currentPresence(e.value)!='offline').toList()..sort((a,b)=>userLabel(a.value).compareTo(userLabel(b.value)));final offline=users.entries.where((e)=>currentPresence(e.value)=='offline').toList()..sort((a,b)=>userLabel(a.value).compareTo(userLabel(b.value)));return SafeArea(child:Column(children:[ListTile(title:const Text('Membros',style:TextStyle(fontSize:20,fontWeight:FontWeight.bold)),trailing:IconButton(onPressed:()=>Navigator.pop(c),icon:const Icon(Icons.close))),Expanded(child:ListView(children:[for(final group in [online,offline])...[Padding(padding:const EdgeInsets.all(12),child:Text('${identical(group,online)?'ONLINE':'OFFLINE'} — ${group.length}',style:const TextStyle(fontSize:12,color:Colors.white70))),for(final e in group)ListTile(leading:ProfileAvatar(uid:e.key),title:Text(userLabel(e.value)),subtitle:Text(meowPublicId(e.value)),onTap:()=>openProfile(c,e.key))]]))]));}
+ @override Widget build(BuildContext c){final online=users.entries.where((e)=>currentPresence(e.value)!='offline').toList()..sort((a,b)=>userLabel(a.value).compareTo(userLabel(b.value)));final offline=users.entries.where((e)=>currentPresence(e.value)=='offline').toList()..sort((a,b)=>userLabel(a.value).compareTo(userLabel(b.value)));return SafeArea(child:Column(children:[ListTile(title:const Text('Membros',style:TextStyle(fontSize:20,fontWeight:FontWeight.bold)),trailing:IconButton(onPressed:()=>Navigator.pop(c),icon:const Icon(Icons.close))),Expanded(child:ListView(children:[for(final group in [online,offline])...[Padding(padding:const EdgeInsets.all(12),child:Text('${identical(group,online)?'ONLINE':'OFFLINE'} — ${group.length}',style:const TextStyle(fontSize:12,color:Colors.white70))),for(final e in group)ListTile(leading:ProfileAvatar(uid:e.key),title:Text(userLabel(e.value)),dense:true,visualDensity:VisualDensity.compact,onTap:()=>openProfile(c,e.key))]]))]));}
 }
 class FriendsPreview extends StatelessWidget {
  final String uid;final Color background,ink;const FriendsPreview({super.key,required this.uid,required this.background,required this.ink});
@@ -2879,6 +3065,7 @@ class MeowMessageText extends StatelessWidget {
  const MeowMessageText({super.key,required this.text,required this.people,this.compact=false});
  static final _emojiPattern=RegExp(r'[\u{1F000}-\u{1FAFF}\u{2600}-\u{27BF}]',unicode:true);
  bool emoji(String c)=>_emojiPattern.hasMatch(c);
+ static bool isEmojiOnly(String value){final gs=value.characters.where((g)=>g.trim().isNotEmpty).toList();return gs.isNotEmpty&&gs.every((g)=>_emojiPattern.hasMatch(g));}
  static const _markers=['__***','__**','__*','***','**','__','~~','*','_'];
  static final _customLink=RegExp(r'\[([^\]\n]+)\]\((https?://[^\s)]+)\)');
  static final _rawLink=RegExp(r'https?://[^\s<>]+');
@@ -2893,7 +3080,45 @@ class MeowMessageText extends StatelessWidget {
   while(i<source.length){
    final pos=source.indexOf(delimiter,i);if(pos<0)return -1;
    var slashes=0;for(var j=pos-1;j>=0&&source[j]=='\\';j--){slashes++;}
-   if(slashes.isEven)return pos;i=pos+delimiter.length;
+   final exactCode=delimiter.startsWith('`');
+   if(slashes.isEven&&(!exactCode||((pos==0||source[pos-1]!='`')&&(pos+delimiter.length==source.length||source[pos+delimiter.length]!='`'))))return pos;
+   i=pos+1;
+  }
+  return -1;
+ }
+ // Scan nested delimiters before testing the enclosing close. Treat an
+ // unmatched run as a literal run rather than parsing its suffix separately.
+ String? markerAt(String source,int i){
+  for(final marker in _markers){
+   if(!source.startsWith(marker,i))continue;
+   if(marker=='_'&&i>0&&_wordChar.hasMatch(source[i-1]))continue;
+   final start=i+marker.length;if(start>=source.length||source[start].trim().isEmpty)continue;
+   if(source[start]==marker[0]&&marker.split('').every((ch)=>ch==marker[0]))continue;
+   return marker;
+  }
+  return null;
+ }
+ int formatEnd(String source,String marker,int start,{String? parentClose,int depth=0,List<int>? budget}){
+  if(depth>12)return -1;
+  final remaining=budget??[12000];
+  final close=closing(marker);var i=start;
+  while(i<source.length){
+   if(--remaining[0]<0)return -1;
+   if(source[i]=='\\'&&i+1<source.length){i+=2;continue;}
+   if(source[i]=='`'){
+    var n=1;while(i+n<source.length&&source[i+n]=='`')n++;
+    final end=findClose(source,source.substring(i,i+n),i+n);
+    if(end>=0){i=end+n;continue;}i+=n;continue;
+   }
+   if(source.startsWith(close,i)&&i>start&&source[i-1].trim().isNotEmpty){
+    var run=0;while(i+run<source.length&&source[i+run]==close[0])run++;
+    final uniform=close.split('').every((ch)=>ch==close[0]);
+    final parentRun=parentClose!=null&&parentClose.split('').every((ch)=>ch==close[0])?parentClose.length:0;
+    if(!uniform||run==close.length||(parentRun>0&&run==close.length+parentRun))return i;
+   }
+   final inner=markerAt(source,i);
+   if(inner!=null){final end=formatEnd(source,inner,i+inner.length,parentClose:close,depth:depth+1,budget:remaining);if(end>=0){i=end+closing(inner).length;continue;}}
+   if('*_~'.contains(source[i])){final ch=source[i];do{i++;}while(i<source.length&&source[i]==ch);}else{i++;}
   }
   return -1;
  }
@@ -2908,7 +3133,7 @@ class MeowMessageText extends StatelessWidget {
   if(depth>12)return [TextSpan(text:source,style:style)];
   final out=<InlineSpan>[];var buffer=StringBuffer();
   void flush(){if(buffer.isEmpty)return;final str=buffer.toString();buffer=StringBuffer();if(compact||!_emojiPattern.hasMatch(str)){out.add(TextSpan(text:str,style:style));return;}
-   var current=StringBuffer();bool? large;void add(){if(current.isEmpty)return;out.add(TextSpan(text:current.toString(),style:large==true?style.copyWith(fontSize:26):style));current=StringBuffer();}
+   var current=StringBuffer();bool? large;void add(){if(current.isEmpty)return;out.add(TextSpan(text:current.toString(),style:large==true?style.copyWith(fontSize:style.fontSize??16):style));current=StringBuffer();}
    for(final g in str.characters){final next=emoji(g);if(large!=null&&large!=next)add();large=next;current.write(g);}add();
   }
   var i=0;
@@ -2939,29 +3164,29 @@ class MeowMessageText extends StatelessWidget {
     else{out.add(TextSpan(text:mention.group(0),style:name=='everyone'?style.copyWith(color:const Color(0xFFC4B5FD)):style));}
     i=mention.end;continue;
    }
-   var matched=false;
-   for(final marker in _markers){
-    if(!source.startsWith(marker,i))continue;
-    if(marker=='_'&&i>0&&_wordChar.hasMatch(source[i-1]))continue;
-    final start=i+marker.length;if(start>=source.length||source[start].trim().isEmpty)continue;
-    final close=closing(marker);var end=findClose(source,close,start);
-    if(end<=start||source[end-1].trim().isEmpty)continue;
-    // For a single marker, skip a doubled marker inside it, so *a **b** c* works.
-    if(marker.length==1){while(end>=0&&((end+1<source.length&&source[end+1]==marker)||(end>start&&source[end-1]==marker))){end=findClose(source,close,end+1);}if(end<=start)continue;}
-    flush();out.addAll(inline(c,source.substring(start,end),decorationFor(marker,style),depth:depth+1));i=end+close.length;matched=true;break;
+   final marker=markerAt(source,i);
+   if(marker!=null){
+    final start=i+marker.length, end=formatEnd(source,marker,i+marker.length);
+    if(end>start){flush();out.addAll(inline(c,source.substring(start,end),decorationFor(marker,style),depth:depth+1));i=end+closing(marker).length;continue;}
+    // Preserve malformed formatting verbatim; no partial consumption of ***.
+    buffer.write(marker);i+=marker.length;continue;
    }
-   if(matched)continue;
+   if('*_~'.contains(source[i])){final ch=source[i];do{buffer.write(source[i]);i++;}while(i<source.length&&source[i]==ch);continue;}
    buffer.write(source[i]);i++;
   }
   flush();return out;
  }
- Widget rich(BuildContext c,String source,TextStyle style)=>Text.rich(TextSpan(children:inline(c,source,style)),maxLines:compact?2:null,overflow:compact?TextOverflow.ellipsis:TextOverflow.clip);
+ Widget rich(BuildContext c,String source,TextStyle style)=>LayoutBuilder(builder:(c,b){
+  final width=b.hasBoundedWidth?b.maxWidth:MediaQuery.sizeOf(c).width-48;
+  final spans=inline(c,source,style).map<InlineSpan>((span)=>span is WidgetSpan?WidgetSpan(alignment:span.alignment,baseline:span.baseline,child:ConstrainedBox(constraints:BoxConstraints(maxWidth:max(1.0,width)),child:span.child)):span).toList();
+  return Text.rich(TextSpan(children:spans),maxLines:compact?2:null,softWrap:true,overflow:compact?TextOverflow.ellipsis:TextOverflow.clip);
+ });
  Widget quote(BuildContext c,String content,TextStyle style)=>Container(margin:const EdgeInsets.symmetric(vertical:3),padding:const EdgeInsets.only(left:9),decoration:const BoxDecoration(border:Border(left:BorderSide(width:3,color:Colors.white38))),child:rich(c,content,style));
  @override Widget build(BuildContext c){
   final style=DefaultTextStyle.of(c).style;
   if(compact)return rich(c,text.replaceAll('\n',' '),style);
   final graphemes=text.characters.where((g)=>g.trim().isNotEmpty).toList();
-  if(graphemes.isNotEmpty&&graphemes.length<=5&&graphemes.every(emoji))return Text(text,style:style.copyWith(fontSize:48));
+  if(graphemes.isNotEmpty&&graphemes.length<=5&&graphemes.every(emoji))return Text(text,style:style.copyWith(fontSize:graphemes.length==1?30:graphemes.length<=3?25:22));
   final lines=text.replaceAll('\r\n','\n').split('\n');final blocks=<Widget>[];final plain=<String>[];
   void flush(){if(plain.isEmpty)return;blocks.add(rich(c,plain.join('\n'),style));plain.clear();}
   var i=0;
@@ -2981,7 +3206,7 @@ class MeowMessageText extends StatelessWidget {
    if(list!=null){flush();final indent=min(4,list.group(1)!.replaceAll('\t','  ').length~/2);final marker=list.group(2)!;blocks.add(Padding(padding:EdgeInsets.only(left:indent*12.0,top:1,bottom:1),child:Row(crossAxisAlignment:CrossAxisAlignment.start,children:[Text(RegExp(r'^\d').hasMatch(marker)?'$marker ':'• ',style:style),Expanded(child:rich(c,list.group(3)!,style))])));i++;continue;}
    plain.add(line);i++;
   }
-  flush();if(blocks.length==1)return blocks.first;return Column(mainAxisSize:MainAxisSize.min,crossAxisAlignment:CrossAxisAlignment.start,children:blocks);
+  flush();if(blocks.isEmpty)return Text(text,style:style);if(blocks.length==1)return blocks.first;return LayoutBuilder(builder:(c,b)=>ConstrainedBox(constraints:BoxConstraints(maxWidth:b.hasBoundedWidth?b.maxWidth:max(1.0,MediaQuery.sizeOf(c).width-48)),child:Column(mainAxisSize:MainAxisSize.min,crossAxisAlignment:CrossAxisAlignment.start,children:blocks)));
  }
 }
 class MeowSpoiler extends StatefulWidget {
@@ -3002,7 +3227,7 @@ class MeowCodeBlock extends StatelessWidget {
   for(final m in pattern.allMatches(code)){if(m.start>last)spans.add(TextSpan(text:code.substring(last,m.start),style:base));final token=m.group(0)!;final color=token.startsWith('//')||token.startsWith('/*')||token.startsWith('#')?const Color(0xFF91A399):token.startsWith('"')||token.startsWith("'")?const Color(0xFFB7E3A1):RegExp(r'^\d').hasMatch(token)?const Color(0xFFF5C78B):const Color(0xFFC4B5FD);spans.add(TextSpan(text:token,style:base.copyWith(color:color)));last=m.end;}
   if(last<code.length)spans.add(TextSpan(text:code.substring(last),style:base));return spans;
  }
- @override Widget build(BuildContext c)=>Container(margin:const EdgeInsets.symmetric(vertical:4),decoration:BoxDecoration(color:const Color(0xFF16161D),borderRadius:BorderRadius.circular(8),border:Border.all(color:Colors.white12)),child:Column(mainAxisSize:MainAxisSize.min,crossAxisAlignment:CrossAxisAlignment.start,children:[Row(children:[Expanded(child:Padding(padding:const EdgeInsets.only(left:10),child:Text(language.isEmpty?'Código':language,style:const TextStyle(fontSize:11,color:Colors.white54)))),IconButton(tooltip:'Copiar código',visualDensity:VisualDensity.compact,onPressed:()async{await Clipboard.setData(ClipboardData(text:code));if(c.mounted)notice(c,'Código copiado.');},icon:const Icon(Icons.copy,size:16))]),const Divider(height:1),SingleChildScrollView(scrollDirection:Axis.horizontal,padding:const EdgeInsets.all(10),child:Text.rich(TextSpan(children:highlighted())))]));
+ @override Widget build(BuildContext c)=>LayoutBuilder(builder:(c,b)=>ConstrainedBox(constraints:BoxConstraints(maxWidth:b.hasBoundedWidth?b.maxWidth:max(1.0,MediaQuery.sizeOf(c).width-72)),child:Container(margin:const EdgeInsets.symmetric(vertical:4),decoration:BoxDecoration(color:const Color(0xFF16161D),borderRadius:BorderRadius.circular(8),border:Border.all(color:Colors.white12)),child:Column(mainAxisSize:MainAxisSize.min,crossAxisAlignment:CrossAxisAlignment.start,children:[Row(children:[Expanded(child:Padding(padding:const EdgeInsets.only(left:10),child:Text(language.isEmpty?'Código':language,style:const TextStyle(fontSize:11,color:Colors.white54)))),IconButton(tooltip:'Copiar código',visualDensity:VisualDensity.compact,onPressed:()async{await Clipboard.setData(ClipboardData(text:code));if(c.mounted)notice(c,'Código copiado.');},icon:const Icon(Icons.copy,size:16))]),const Divider(height:1),SingleChildScrollView(scrollDirection:Axis.horizontal,padding:const EdgeInsets.all(10),child:Text.rich(TextSpan(children:highlighted())))]))));
 }
 
 
@@ -3019,7 +3244,7 @@ class MeowImageViewer extends StatefulWidget {
 class _MeowImageViewerState extends State<MeowImageViewer>{final controller=TransformationController();bool saving=false;@override void dispose(){controller.dispose();super.dispose();}@override Widget build(BuildContext c)=>Scaffold(backgroundColor:Colors.black,appBar:AppBar(backgroundColor:Colors.black,title:Text(widget.name,maxLines:1,overflow:TextOverflow.ellipsis),actions:[IconButton(onPressed:saving?null:()async{setState(()=>saving=true);try{await saveMeowFile(c,widget.bytes,widget.name,true);}catch(e){if(c.mounted)notice(c,e);}finally{if(mounted)setState(()=>saving=false);}},icon:const Icon(Icons.download))]),body:Center(child:GestureDetector(onDoubleTap:()=>setState(()=>controller.value=controller.value.getMaxScaleOnAxis()>1?Matrix4.identity():(Matrix4.identity()..scale(2.0))),child:InteractiveViewer(transformationController:controller,minScale:1,maxScale:5,child:Image.memory(widget.bytes,fit:BoxFit.contain,gaplessPlayback:true)))));}
 // Crop the original decoded pixels using a fixed frame and user-controlled transform.
 class MeowCropPage extends StatefulWidget {
- final Uint8List bytes;final double aspect;final bool circle;const MeowCropPage({super.key,required this.bytes,required this.aspect,required this.circle});
+ final Uint8List bytes;final double aspect;final bool circle,showAvatarGuide;const MeowCropPage({super.key,required this.bytes,required this.aspect,required this.circle,this.showAvatarGuide=false});
  @override State<MeowCropPage> createState()=>_MeowCropPageState();
 }
 class _MeowCropPageState extends State<MeowCropPage>{
@@ -3030,7 +3255,7 @@ class _MeowCropPageState extends State<MeowCropPage>{
  double baseScale(){final i=image!;final w=turns.isOdd?i.height:i.width;final h=turns.isOdd?i.width:i.height;return max(frame.width/w,frame.height/h);}
  Offset bounded(Offset p){final i=image!;final scale=baseScale()*zoom;final w=(turns.isOdd?i.height:i.width)*scale;final h=(turns.isOdd?i.width:i.height)*scale;final x=max(0.0,(w-frame.width)/2);final y=max(0.0,(h-frame.height)/2);return Offset(p.dx.clamp(-x,x).toDouble(),p.dy.clamp(-y,y).toDouble());}
  Future<void> confirm()async{if(image==null||busy||frame.isEmpty)return;setState(()=>busy=true);try{final rec=ui.PictureRecorder();final canvas=Canvas(rec);final outScale=min(2048.0/max(frame.width,frame.height),1/(baseScale()*zoom));final w=max(1,(frame.width*outScale).round());final h=max(1,(frame.height*outScale).round());canvas.scale(w/frame.width,h/frame.height);paintCrop(canvas,frame,image!,turns,baseScale()*zoom,offset);final pic=rec.endRecording();final output=await pic.toImage(w,h);final data=await output.toByteData(format:ui.ImageByteFormat.png);output.dispose();pic.dispose();if(data==null)throw Exception('Recorte indisponível');if(mounted)Navigator.pop(context,data.buffer.asUint8List(data.offsetInBytes,data.lengthInBytes));}catch(e){if(mounted)notice(context,e);}finally{if(mounted)setState(()=>busy=false);}}
- @override Widget build(BuildContext c)=>Scaffold(appBar:AppBar(title:const Text('Ajustar imagem'),actions:[TextButton(onPressed:busy?null:()=>Navigator.pop(c,widget.bytes),child:const Text('Pular')),IconButton(tooltip:'Confirmar recorte',onPressed:busy||image==null?null:confirm,icon:const Icon(Icons.check))]),body:Column(children:[Expanded(child:Center(child:LayoutBuilder(builder:(c,b){if(image==null)return const Text('Carregando imagem…');final w=min(b.maxWidth-24,(b.maxHeight-24)*widget.aspect);frame=Size(max(1.0,w),max(1.0,w/widget.aspect));return GestureDetector(onScaleStart:(d){startZoom=zoom;startOffset=offset;startPoint=d.localFocalPoint;},onScaleUpdate:(d)=>setState((){zoom=(startZoom*d.scale).clamp(1.0,6.0).toDouble();offset=bounded(startOffset+d.localFocalPoint-startPoint);}),child:ClipRRect(borderRadius:BorderRadius.circular(widget.circle?frame.width/2:8),child:CustomPaint(size:frame,painter:CropPainter(image!,turns,baseScale()*zoom,offset))));}))),const Text('Arraste e use dois dedos para aproximar'),Slider(value:zoom,min:1,max:6,onChanged:image==null?null:(v)=>setState((){zoom=v;offset=bounded(offset);})),SafeArea(top:false,child:Row(mainAxisAlignment:MainAxisAlignment.center,children:[IconButton(tooltip:'Girar',onPressed:busy||image==null?null:()=>setState((){turns=(turns+1)%4;zoom=1;offset=Offset.zero;}),icon:const Icon(Icons.rotate_right)),TextButton(onPressed:busy?null:()=>Navigator.pop(c),child:const Text('Cancelar')),FilledButton(onPressed:busy||image==null?null:confirm,child:const Text('Confirmar'))]))]));
+ @override Widget build(BuildContext c)=>Scaffold(appBar:AppBar(title:const Text('Ajustar imagem'),actions:[TextButton(onPressed:busy?null:()=>Navigator.pop(c,widget.bytes),child:const Text('Pular')),IconButton(tooltip:'Confirmar recorte',onPressed:busy||image==null?null:confirm,icon:const Icon(Icons.check))]),body:Column(children:[Expanded(child:Center(child:LayoutBuilder(builder:(c,b){if(image==null)return const Text('Carregando imagem…');final w=min(b.maxWidth-24,(b.maxHeight-24)*widget.aspect);frame=Size(max(1.0,w),max(1.0,w/widget.aspect));return GestureDetector(onScaleStart:(d){startZoom=zoom;startOffset=offset;startPoint=d.localFocalPoint;},onScaleUpdate:(d)=>setState((){zoom=(startZoom*d.scale).clamp(1.0,6.0).toDouble();offset=bounded(startOffset+d.localFocalPoint-startPoint);}),child:ClipRRect(borderRadius:BorderRadius.circular(widget.circle?frame.width/2:8),child:Stack(children:[CustomPaint(size:frame,painter:CropPainter(image!,turns,baseScale()*zoom,offset)),if(widget.showAvatarGuide)Positioned(left:frame.width*.37,bottom:-frame.width*.13,width:frame.width*.26,height:frame.width*.26,child:IgnorePointer(child:DecoratedBox(decoration:BoxDecoration(shape:BoxShape.circle,color:Colors.black26,border:Border.all(color:Colors.white70,width:2)))))])));}))),const Text('Arraste e use dois dedos para aproximar'),Slider(value:zoom,min:1,max:6,onChanged:image==null?null:(v)=>setState((){zoom=v;offset=bounded(offset);})),SafeArea(top:false,child:Row(mainAxisAlignment:MainAxisAlignment.center,children:[IconButton(tooltip:'Girar',onPressed:busy||image==null?null:()=>setState((){turns=(turns+1)%4;zoom=1;offset=Offset.zero;}),icon:const Icon(Icons.rotate_right)),TextButton(onPressed:busy?null:()=>Navigator.pop(c),child:const Text('Cancelar')),FilledButton(onPressed:busy||image==null?null:confirm,child:const Text('Confirmar'))]))]));
 }
 void paintCrop(Canvas c,Size size,ui.Image image,int turns,double scale,Offset offset){c.save();c.clipRect(Offset.zero&size);c.translate(size.width/2+offset.dx,size.height/2+offset.dy);c.rotate(turns*pi/2);c.scale(scale);c.drawImage(image,Offset(-image.width/2,-image.height/2),Paint()..filterQuality=FilterQuality.high);c.restore();}
 class CropPainter extends CustomPainter{final ui.Image image;final int turns;final double scale;final Offset offset;CropPainter(this.image,this.turns,this.scale,this.offset);@override void paint(Canvas canvas,Size size)=>paintCrop(canvas,size,image,turns,scale,offset);@override bool shouldRepaint(covariant CropPainter old)=>old.image!=image||old.turns!=turns||old.scale!=scale||old.offset!=offset;}
@@ -3042,7 +3267,7 @@ class MeowAccountHeader extends StatelessWidget {
  const MeowAccountHeader({super.key,required this.uid,this.onTap,this.showPresence=false});
  @override Widget build(BuildContext c)=>InkWell(onTap:onTap,child:MeowStreamBuilder<DocumentSnapshot<Map<String,dynamic>>>(stream:db.collection('users').doc(uid).meowSnapshots(),builder:(c,s){
   final d=s.data?.data()??{};final presence=currentPresence(d);
-  return Row(children:[Stack(clipBehavior:Clip.none,children:[PrivateImage(scope:'profile',id:uid,slot:'avatar',size:38),Positioned(bottom:0,right:0,child:PresenceDot(uid:uid))]),const SizedBox(width:10),Expanded(child:Column(crossAxisAlignment:CrossAxisAlignment.start,mainAxisSize:MainAxisSize.min,children:[Text(userLabel(d),maxLines:1,overflow:TextOverflow.ellipsis,style:const TextStyle(fontSize:16,fontWeight:FontWeight.bold)),Text(showPresence?(presenceLabels[presence]??'Offline'):meowPublicId(d),style:const TextStyle(fontSize:12,color:Colors.white54),maxLines:1,overflow:TextOverflow.ellipsis)]))]);
+  return Row(children:[Stack(clipBehavior:Clip.none,children:[PrivateImage(scope:'profile',id:uid,slot:'avatar',size:38),Positioned(bottom:0,right:0,child:PresenceDot(uid:uid))]),const SizedBox(width:10),Expanded(child:Column(crossAxisAlignment:CrossAxisAlignment.start,mainAxisSize:MainAxisSize.min,children:[Text(userLabel(d),maxLines:1,overflow:TextOverflow.ellipsis,style:const TextStyle(fontSize:16,fontWeight:FontWeight.bold)),if(showPresence)Text(presenceLabels[presence]??'Offline',style:const TextStyle(fontSize:12,color:Colors.white54),maxLines:1,overflow:TextOverflow.ellipsis)]))]);
  }));
 }
 class MeowAccountDrawer extends StatelessWidget {
@@ -3054,7 +3279,7 @@ class MeowAccountDrawer extends StatelessWidget {
    Container(height:188,decoration:BoxDecoration(gradient:profileGradient(d))),
    if(d['bannerHidden']!=true)Positioned.fill(child:PrivateImage(scope:'profile',id:uid,slot:'banner',size:188,borderRadius:BorderRadius.zero)),
    Positioned.fill(child:DecoratedBox(decoration:BoxDecoration(gradient:LinearGradient(begin:Alignment.topCenter,end:Alignment.bottomCenter,colors:[Colors.transparent,Colors.black.withOpacity(.7)])))),
-   Positioned(left:16,right:16,bottom:14,child:Column(crossAxisAlignment:CrossAxisAlignment.start,children:[PrivateImage(scope:'profile',id:uid,slot:'avatar',size:66),const SizedBox(height:8),Text(userLabel(d),style:const TextStyle(fontSize:22,fontWeight:FontWeight.bold,color:Colors.white)),Text(meowPublicId(d),style:const TextStyle(color:Colors.white70))])),
+   Positioned(left:16,right:16,bottom:14,child:Column(crossAxisAlignment:CrossAxisAlignment.start,children:[PrivateImage(scope:'profile',id:uid,slot:'avatar',size:66),const SizedBox(height:8),Text(userLabel(d),style:const TextStyle(fontSize:22,fontWeight:FontWeight.bold,color:Colors.white))])),
   ]));}),
   ListTile(leading:const Icon(Icons.person_outline),title:const Text('Meu perfil'),onTap:()=>profile(c)),
   ListTile(leading:const Icon(Icons.edit_outlined),title:const Text('Editar perfil'),onTap:()=>go(c,EditProfilePage(uid:uid))),
@@ -3103,7 +3328,7 @@ class _MeowDiscoverState extends State<MeowDiscover>{
   finally{if(mounted&&g==generation)setState(()=>busy=false);}
  }
  @override Widget build(BuildContext c)=>Column(children:[Padding(padding:const EdgeInsets.all(12),child:TextField(controller:search,textInputAction:TextInputAction.search,onSubmitted:(_)=>find(),decoration:InputDecoration(hintText:'Nome de exibição ou ID',prefixIcon:const Icon(Icons.search),suffixIcon:IconButton(tooltip:'Pesquisar',icon:const Icon(Icons.arrow_forward),onPressed:()=>find())))),
-  Expanded(child:!searched?const Center(child:Column(mainAxisSize:MainAxisSize.min,children:[Icon(Icons.people_outline,size:46,color:purple),SizedBox(height:12),Text('Encontre seus amigos')])):ListView(children:[for(final d in results)ListTile(leading:ProfileAvatar(uid:d.id),title:Text(userLabel(d.data())),subtitle:Text(meowPublicId(d.data())),onTap:()=>openProfile(c,d.id)),if(busy)const Center(child:Padding(padding:EdgeInsets.all(16),child:CircularProgressIndicator())),if(error!=null)ListTile(title:Text(error!),trailing:TextButton(onPressed:()=>find(next:results.isNotEmpty),child:const Text('Tentar'))),if(!busy&&error==null&&results.isEmpty&&!more)const Center(child:Padding(padding:EdgeInsets.all(20),child:Text('Nenhum usuário encontrado.'))),if(more&&!busy)TextButton(onPressed:()=>find(next:true),child:const Text('Buscar mais resultados'))])),
+  Expanded(child:!searched?const Center(child:Column(mainAxisSize:MainAxisSize.min,children:[Icon(Icons.people_outline,size:46,color:purple),SizedBox(height:12),Text('Encontre seus amigos')])):ListView(children:[for(final d in results)ListTile(leading:ProfileAvatar(uid:d.id),title:Text(userLabel(d.data())),onTap:()=>openProfile(c,d.id)),if(busy)const Center(child:Padding(padding:EdgeInsets.all(16),child:CircularProgressIndicator())),if(error!=null)ListTile(title:Text(error!),trailing:TextButton(onPressed:()=>find(next:results.isNotEmpty),child:const Text('Tentar'))),if(!busy&&error==null&&results.isEmpty&&!more)const Center(child:Padding(padding:EdgeInsets.all(20),child:Text('Nenhum usuário encontrado.'))),if(more&&!busy)TextButton(onPressed:()=>find(next:true),child:const Text('Buscar mais resultados'))])),
  ]);
 }
 
@@ -3117,9 +3342,86 @@ class MeowOnlineCount extends StatefulWidget {
 }
 class _MeowOnlineCountState extends State<MeowOnlineCount>{
  final users=<String,Map<String,dynamic>>{};final subs=<String,StreamSubscription<DocumentSnapshot<Map<String,dynamic>>>>{};Timer? timer;
- void sync(){final visible=TickerMode.of(context);final ids=visible?widget.ids.toSet():<String>{};for(final id in subs.keys.toList()){if(!ids.contains(id)){subs.remove(id)?.cancel();users.remove(id);}}for(final id in ids){subs.putIfAbsent(id,()=>db.collection('users').doc(id).meowSnapshots().listen((d){if(mounted&&subs.containsKey(id))setState(()=>users[id]=d.data()??{});},onError:(Object _){}));}timer?.cancel();timer=visible?Timer.periodic(const Duration(seconds:15),(_){if(mounted)setState((){});}):null;}
+ void sync(){final visible=TickerMode.of(context);final ids=visible?widget.ids.toSet():<String>{};for(final id in subs.keys.toList()){if(!ids.contains(id)){subs.remove(id)?.cancel();users.remove(id);}}for(final id in ids){subs.putIfAbsent(id,()=>db.collection('users').doc(id).meowSnapshots().listen((d){if(mounted&&subs.containsKey(id))setState(()=>users[id]=d.data()??{});},onError:(Object _){}));}timer?.cancel();timer=visible?Timer.periodic(const Duration(seconds:5),(_){if(mounted)setState((){});}):null;}
  @override void didChangeDependencies(){super.didChangeDependencies();sync();}
  @override void didUpdateWidget(covariant MeowOnlineCount old){super.didUpdateWidget(old);if(old.ids.length!=widget.ids.length||!old.ids.toSet().containsAll(widget.ids))sync();}
  @override void dispose(){timer?.cancel();for(final s in subs.values){s.cancel();}super.dispose();}
  @override Widget build(BuildContext c){final n=users.values.where((d)=>currentPresence(d)!='offline').length;return Row(mainAxisSize:MainAxisSize.min,children:[const Icon(Icons.circle,size:9,color:Colors.green),const SizedBox(width:6),Text('$n online',style:const TextStyle(fontSize:12,color:Colors.white54))]);}
+}
+
+
+// Meow 0.9.1: message search restricted to the exact conversation path.
+// Firestore does not support arbitrary full text queries. Scan bounded cursor pages
+// until a dedicated permission-checked search index is available.
+class MeowChannelHistoryPage extends StatelessWidget {
+ final String server,channel,name,uid;final String? initialMessageId;
+ const MeowChannelHistoryPage({super.key,required this.server,required this.channel,required this.name,required this.uid,this.initialMessageId});
+ @override Widget build(BuildContext c){
+  final collection=db.collection('servers').doc(server).collection('channels').doc(channel).collection('messages');
+  return Scaffold(appBar:AppBar(title:MeowChannelTitle(server:server,name:name),actions:[MuteButton(thread:'server:$server:$channel'),MeowSearchButton(collection:collection,openResult:(c,message)=>Navigator.pushReplacement(c,MaterialPageRoute(builder:(_)=>MeowChannelHistoryPage(server:server,channel:channel,name:name,uid:uid,initialMessageId:message))))]),body:MessageThread(collection:collection,uid:uid,serverId:server,threadId:'server:$server:$channel',initialMessageId:initialMessageId));
+ }
+}
+class MeowSearchButton extends StatelessWidget {
+ final CollectionReference<Map<String,dynamic>> collection;
+ final void Function(BuildContext,String) openResult;
+ const MeowSearchButton({super.key,required this.collection,required this.openResult});
+ @override Widget build(BuildContext c)=>IconButton(tooltip:'Pesquisar mensagens',icon:const Icon(Icons.search),onPressed:()=>Navigator.push(c,MaterialPageRoute<void>(builder:(_)=>MeowMessageSearchPage(collection:collection,openResult:openResult))));
+}
+class MeowMessageSearchPage extends StatefulWidget {
+ final CollectionReference<Map<String,dynamic>> collection;final void Function(BuildContext,String) openResult;
+ const MeowMessageSearchPage({super.key,required this.collection,required this.openResult});
+ @override State<MeowMessageSearchPage> createState()=>_MeowMessageSearchPageState();
+}
+class _MeowMessageSearchPageState extends State<MeowMessageSearchPage>{
+ final query=TextEditingController();final author=TextEditingController();
+ String kind='all';DateTimeRange? dates;
+ final results=<QueryDocumentSnapshot<Map<String,dynamic>>>[];
+ QueryDocumentSnapshot<Map<String,dynamic>>? cursor;
+ bool busy=false,started=false,more=true;int scanned=0;String? error;
+ String savedQuery='',savedAuthor='',savedKind='all';DateTimeRange? savedDates;
+ @override void dispose(){query.dispose();author.dispose();super.dispose();}
+ bool matches(Map<String,dynamic> d){
+  final text=d['text']?.toString()??'',sender=d['author']?.toString()??'';
+  if(savedQuery.isNotEmpty&&!text.toLowerCase().contains(savedQuery))return false;
+  if(savedAuthor.isNotEmpty&&!sender.toLowerCase().contains(savedAuthor)&&(d['authorId']?.toString().toLowerCase()??'')!=savedAuthor)return false;
+  final attachments=meowAttachments(d);final expression=d['expression'];
+  return switch(savedKind){'image'=>attachments.any((a)=>a['contentType'].toString().startsWith('image/')),'video'=>attachments.any((a)=>a['contentType'].toString().startsWith('video/')),'link'=>RegExp(r'https?://',caseSensitive:false).hasMatch(text),'file'=>attachments.isNotEmpty,'expression'=>expression is Map,_=>true};
+ }
+ Future<void> chooseDates()async{
+  final now=DateTime.now();final picked=await showDateRangePicker(context:context,firstDate:DateTime(2020),lastDate:now,initialDateRange:dates);
+  if(picked!=null&&mounted)setState(()=>dates=picked);
+ }
+ Future<void> search({bool next=false})async{
+  if(busy)return;
+  if(!next&&query.text.trim().isEmpty&&author.text.trim().isEmpty&&kind=='all'&&dates==null){notice(context,'Informe um termo ou filtro.');return;}
+  FocusManager.instance.primaryFocus?.unfocus();
+  setState((){busy=true;error=null;if(!next){started=true;results.clear();cursor=null;more=true;scanned=0;savedQuery=query.text.trim().toLowerCase();savedAuthor=author.text.trim().toLowerCase();savedKind=kind;savedDates=dates;}});
+  try{
+   Query<Map<String,dynamic>> base=widget.collection.orderBy('createdAt',descending:true);
+   final range=savedDates;
+   if(range!=null){final start=DateTime(range.start.year,range.start.month,range.start.day),end=DateTime(range.end.year,range.end.month,range.end.day+1);base=base.where('createdAt',isGreaterThanOrEqualTo:Timestamp.fromDate(start)).where('createdAt',isLessThan:Timestamp.fromDate(end));}
+   // At most 150 reads per explicit request; users can continue through all history.
+   for(var page=0;page<3&&more;page++){
+    final snap=await (cursor==null?base:base.startAfterDocument(cursor!)).limit(50).get(const GetOptions(source:Source.server));
+    if(!mounted)return;
+    setState((){scanned+=snap.docs.length;if(snap.docs.isNotEmpty)cursor=snap.docs.last;more=snap.docs.length==50;results.addAll(snap.docs.where((d)=>matches(d.data())));});
+    if(results.length>=50&&!next)break;
+   }
+  }catch(e){if(mounted)setState(()=>error='Não foi possível pesquisar. Verifique o acesso à conversa e a conexão.');}
+  finally{if(mounted)setState(()=>busy=false);}
+ }
+ @override Widget build(BuildContext c)=>Scaffold(appBar:AppBar(title:const Text('Pesquisar mensagens')),body:CustomScrollView(slivers:[SliverToBoxAdapter(child:Column(children:[
+  Padding(padding:const EdgeInsets.fromLTRB(12,8,12,4),child:TextField(controller:query,enabled:!busy,textInputAction:TextInputAction.search,onSubmitted:(_)=>search(),decoration:const InputDecoration(hintText:'Palavra ou frase',prefixIcon:Icon(Icons.search)))),
+  Padding(padding:const EdgeInsets.symmetric(horizontal:12,vertical:4),child:TextField(controller:author,enabled:!busy,decoration:const InputDecoration(labelText:'Autor (nome exibido na mensagem)',prefixIcon:Icon(Icons.person_outline)),onSubmitted:(_)=>search())),
+  Padding(padding:const EdgeInsets.symmetric(horizontal:12,vertical:4),child:Row(children:[Expanded(child:DropdownButtonFormField<String>(value:kind,isExpanded:true,decoration:const InputDecoration(labelText:'Tipo'),items:const [DropdownMenuItem(value:'all',child:Text('Todos')),DropdownMenuItem(value:'image',child:Text('Imagens')),DropdownMenuItem(value:'video',child:Text('Vídeos')),DropdownMenuItem(value:'link',child:Text('Links')),DropdownMenuItem(value:'file',child:Text('Anexos')),DropdownMenuItem(value:'expression',child:Text('Emojis / figurinhas'))],onChanged:busy?null:(v){if(v!=null)setState(()=>kind=v);})),const SizedBox(width:6),IconButton(tooltip:'Filtrar por data',onPressed:busy?null:chooseDates,icon:Icon(Icons.date_range,color:dates==null?null:purple)),if(dates!=null)IconButton(tooltip:'Limpar datas',onPressed:busy?null:()=>setState(()=>dates=null),icon:const Icon(Icons.close))])),
+  if(dates!=null)Text('${dates!.start.day}/${dates!.start.month}/${dates!.start.year} – ${dates!.end.day}/${dates!.end.month}/${dates!.end.year}',style:const TextStyle(fontSize:12)),
+  FilledButton.icon(onPressed:busy?null:()=>search(),icon:const Icon(Icons.search),label:const Text('Pesquisar')),
+  if(busy)const LinearProgressIndicator(),
+  if(started)Padding(padding:const EdgeInsets.all(6),child:Text('${results.length} resultado(s) • $scanned mensagens consultadas',style:const TextStyle(fontSize:12,color:Colors.white54))),
+  ])),if(!started)const SliverToBoxAdapter(child:Padding(padding:EdgeInsets.all(24),child:Center(child:Text('Pesquise no histórico desta conversa.'))))else SliverList(delegate:SliverChildBuilderDelegate((c,i){
+   if(i==results.length)return Padding(padding:const EdgeInsets.all(12),child:Column(children:[if(error!=null)Text(error!),if(!busy&&more)OutlinedButton(onPressed:()=>search(next:true),child:Text(error==null?'Buscar mais mensagens antigas':'Tentar novamente')),if(!busy&&!more)Text(results.isEmpty?'Nenhuma mensagem encontrada.':'Fim do histórico pesquisado.')]));
+   final doc=results[i],d=doc.data();final t=d['createdAt'];final raw=d['text']?.toString()??'';final who=d['authorId']?.toString()??'';
+   return ListTile(leading:who.isEmpty?const Icon(Icons.person):ProfileAvatar(uid:who,size:32),title:Text(d['author']?.toString()??'Usuário',maxLines:1,overflow:TextOverflow.ellipsis),subtitle:Text(raw.isEmpty?'Mídia ou anexo':raw,maxLines:2,overflow:TextOverflow.ellipsis),trailing:Text(t is Timestamp?formatMeowTime(t.toDate()):'',style:const TextStyle(fontSize:11)),onTap:()=>widget.openResult(context,doc.id));
+  },childCount:results.length+1)),
+ ]));
 }
