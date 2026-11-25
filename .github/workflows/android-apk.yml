@@ -1,4 +1,3 @@
-
 name: Gerar APK Meow
 
 on:
@@ -7,58 +6,104 @@ on:
 jobs:
   build:
     runs-on: ubuntu-latest
-
     steps:
       - name: Baixar projeto
         uses: actions/checkout@v4
-
       - name: Instalar Java
         uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: '21'
-
       - name: Instalar Flutter
         uses: subosito/flutter-action@v2
         with:
           channel: stable
-
       - name: Configurar JDK 21 para Flutter e Gradle
         run: |
           flutter config --jdk-dir="$JAVA_HOME"
           java -version
           flutter --version
-
       - name: Preparar projeto Android
         run: flutter create --platforms=android --project-name=meow .
-
       - name: Verificar Java utilizado pelo Gradle
         working-directory: android
         run: bash ./gradlew --version
-
-      - name: Configurar permissoes Android do Meow
+      - name: Preparar icone de notificacao
         run: |
-          python3 - <<'PYCODE'
+          python3 -m venv "$RUNNER_TEMP/meow-image-tools"
+          "$RUNNER_TEMP/meow-image-tools/bin/python" -m pip install Pillow
+      - name: Integrar notificacoes nativas 0.9.0
+        run: |
+          "$RUNNER_TEMP/meow-image-tools/bin/python" - <<'PYCODE'
+          KOTLIN_SOURCE = 'package com.example.meow\n\nimport android.Manifest\nimport android.app.Notification\nimport android.app.NotificationChannel\nimport android.app.NotificationManager\nimport android.app.PendingIntent\nimport android.content.BroadcastReceiver\nimport android.content.Context\nimport android.content.Intent\nimport android.content.pm.PackageManager\nimport android.os.Build\nimport android.os.Bundle\nimport io.flutter.embedding.android.FlutterActivity\nimport io.flutter.embedding.engine.FlutterEngine\nimport io.flutter.plugin.common.MethodChannel\nimport java.security.MessageDigest\n\nprivate const val CHANNEL = "meow_messages_v1"\nprivate const val CLICK = "com.example.meow.OPEN_NOTIFICATION"\nprivate const val TAG_PREFIX = "meow:"\nprivate val fields = listOf("messagePath", "recipientId", "senderId", "threadKey", "notificationGroup", "notificationTitle", "notificationBody", "senderName", "conversationTitle", "kind", "messageCreatedAt")\nprivate fun prefs(c: Context) = c.getSharedPreferences("meow_notifications_v1", Context.MODE_PRIVATE)\nprivate fun manager(c: Context) = c.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager\nprivate fun hash(s: String) = MessageDigest.getInstance("SHA-256").digest(s.toByteArray(Charsets.UTF_8)).joinToString("") { "%02x".format(it.toInt() and 255) }\nprivate fun clearNotifications(c: Context) {\n    if (Build.VERSION.SDK_INT >= 23) manager(c).activeNotifications.filter { it.tag?.startsWith(TAG_PREFIX) == true }.forEach { manager(c).cancel(it.tag, it.id) }\n    else manager(c).cancelAll()\n}\nprivate fun notificationData(intent: Intent?): Map<String, String>? {\n    if (intent?.action != CLICK) return null\n    val result = fields.mapNotNull { k -> intent.getStringExtra(k)?.let { k to it } }.toMap()\n    return result.takeIf { it["recipientId"] != null && it["messagePath"] != null }\n}\nprivate object MeowActivityState { var foreground = false; var thread: String? = null }\n\nclass MainActivity : FlutterActivity() {\n    private var bridge: MethodChannel? = null\n    private var pending: Map<String, String>? = null\n    private var dartReady = false\n    override fun onCreate(savedInstanceState: Bundle?) {\n        pending = notificationData(intent)\n        super.onCreate(savedInstanceState)\n    }\n    override fun onResume() { super.onResume(); MeowActivityState.foreground = true }\n    override fun onPause() { MeowActivityState.foreground = false; MeowActivityState.thread = null; super.onPause() }\n    override fun onNewIntent(intent: Intent) {\n        super.onNewIntent(intent)\n        setIntent(intent)\n        val data = notificationData(intent) ?: return\n        if (dartReady && data["recipientId"] == prefs(this).getString("uid", null)) bridge?.invokeMethod("openNotification", data)\n        else pending = data\n    }\n    override fun configureFlutterEngine(flutterEngine: FlutterEngine) {\n        super.configureFlutterEngine(flutterEngine)\n        bridge = MethodChannel(flutterEngine.dartExecutor.binaryMessenger, "meow/notifications")\n        bridge?.setMethodCallHandler { call, result ->\n            when (call.method) {\n                "setSession" -> {\n                    val uid = call.arguments as? String\n                    if (uid.isNullOrEmpty()) result.success(false)\n                    else {\n                        if (prefs(this).getString("uid", null) != uid) {\n                            clearNotifications(this)\n                            prefs(this).edit().clear().apply()\n                        }\n                        prefs(this).edit().putString("uid", uid).apply()\n                        result.success(true)\n                    }\n                }\n                "clearSession" -> {\n                    if (call.arguments == prefs(this).getString("uid", null)) {\n                        clearNotifications(this); prefs(this).edit().clear().apply()\n                        pending = null; dartReady = false; MeowActivityState.thread = null\n                    }\n                    result.success(null)\n                }\n                "getInitialNotification" -> {\n                    dartReady = true\n                    val data = pending?.takeIf { it["recipientId"] == prefs(this).getString("uid", null) }\n                    pending = null\n                    result.success(data)\n                }\n                "setActiveThread" -> {\n                    val args = call.arguments as? Map<*, *>\n                    MeowActivityState.thread = if (args?.get("recipientId") == prefs(this).getString("uid", null)) args?.get("threadKey") as? String else null\n                    val thread = MeowActivityState.thread\n                    if (thread != null && Build.VERSION.SDK_INT >= 23) manager(this).activeNotifications.filter {\n                        it.tag?.startsWith(TAG_PREFIX) == true && it.notification.extras.getString("meowThread") == thread\n                    }.forEach { manager(this).cancel(it.tag, it.id) }\n                    result.success(null)\n                }\n                else -> result.notImplemented()\n            }\n        }\n    }\n    override fun cleanUpFlutterEngine(flutterEngine: FlutterEngine) {\n        bridge?.setMethodCallHandler(null); bridge = null; dartReady = false\n        super.cleanUpFlutterEngine(flutterEngine)\n    }\n}\n\n// Receives only authenticated Google Play Services FCM broadcasts; the Flutter\n// receiver remains registered for foreground banners and legacy payloads.\nclass MeowPushReceiver : BroadcastReceiver() {\n    override fun onReceive(context: Context, intent: Intent) {\n        if (intent.action != "com.google.android.c2dm.intent.RECEIVE" || intent.getStringExtra("meowNative") != "1") return\n        val data = fields.mapNotNull { k -> intent.getStringExtra(k)?.let { k to it } }.toMap()\n        val recipient = data["recipientId"] ?: return\n        val sender = data["senderId"] ?: return\n        val path = data["messagePath"] ?: return\n        val thread = data["threadKey"] ?: return\n        val group = data["notificationGroup"] ?: return\n        val body = data["notificationBody"]?.take(500) ?: return\n        if (recipient != prefs(context).getString("uid", null) || sender == recipient || group != "v1:$recipient:$sender:$thread") return\n        if (!Regex("^(dms/[\\\\w-]+|servers/[\\\\w-]+/channels/[\\\\w-]+)/messages/[\\\\w-]+$").matches(path)) return\n        if (MeowActivityState.foreground) return // Dart handles the in-app banner.\n        if (Build.VERSION.SDK_INT >= 33 && context.checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED) return\n        val nm = manager(context)\n        if (Build.VERSION.SDK_INT >= 24 && !nm.areNotificationsEnabled()) return\n        val tag = TAG_PREFIX + hash(group)\n        val pathHash = hash(path)\n        val store = prefs(context)\n        val seen = store.getString("seen", "").orEmpty().split(\',\').filter { it.isNotEmpty() }\n        if (pathHash in seen) return\n        val previous = if (Build.VERSION.SDK_INT >= 23) nm.activeNotifications.firstOrNull { it.tag == tag && it.id == 1 }?.notification else null\n        val history = previous?.extras?.getStringArrayList("meowHistory")?.toMutableList() ?: mutableListOf()\n        history.add(body)\n        while (history.size > 25) history.removeAt(0)\n        if (Build.VERSION.SDK_INT >= 26) nm.createNotificationChannel(NotificationChannel(CHANNEL, "Mensagens Meow", NotificationManager.IMPORTANCE_HIGH))\n        val title = data["notificationTitle"]?.take(160) ?: "Meow"\n        val senderName = data["senderName"]?.take(60) ?: title\n        val click = Intent(context, MainActivity::class.java).setAction(CLICK).setData(android.net.Uri.parse("meow://notification/${hash(group)}")).addFlags(Intent.FLAG_ACTIVITY_CLEAR_TOP or Intent.FLAG_ACTIVITY_SINGLE_TOP)\n        data.forEach { (k,v) -> click.putExtra(k,v) }\n        val pi = PendingIntent.getActivity(context, 0, click, PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE)\n        val b = if (Build.VERSION.SDK_INT >= 26) Notification.Builder(context, CHANNEL) else Notification.Builder(context)\n        val extras = Bundle().apply { putStringArrayList("meowHistory", ArrayList(history)); putString("meowThread", thread) }\n        b.setSmallIcon(R.drawable.ic_meow_notification).setContentTitle(title).setContentText(body)\n            .setContentIntent(pi).setAutoCancel(true).setVisibility(Notification.VISIBILITY_PRIVATE).setCategory(Notification.CATEGORY_MESSAGE)\n            .setNumber(history.size).setExtras(extras)\n        if (Build.VERSION.SDK_INT >= 24) {\n            val style = Notification.MessagingStyle("Você")\n            data["conversationTitle"]?.takeIf { it.isNotBlank() }?.let { style.setConversationTitle(it) }\n            history.forEach { style.addMessage(it, System.currentTimeMillis(), senderName) }\n            b.setStyle(style)\n        } else b.setStyle(Notification.InboxStyle().setBigContentTitle(title).also { style -> history.forEach { style.addLine(it) } })\n        if (Build.VERSION.SDK_INT < 26) b.setPriority(Notification.PRIORITY_HIGH).setDefaults(Notification.DEFAULT_ALL)\n        try { nm.notify(tag, 1, b.build()); store.edit().putString("seen", (seen + pathHash).takeLast(200).joinToString(",")).apply() }\n        catch (_: SecurityException) { /* Permission was revoked. */ }\n    }\n}\n'
           from pathlib import Path
-          path = Path('android/app/src/main/AndroidManifest.xml')
-          text = path.read_text()
-          permissions = [
-              ('android.permission.INTERNET', ''),
-              ('android.permission.POST_NOTIFICATIONS', ''),
-              ('android.permission.WRITE_EXTERNAL_STORAGE', ' android:maxSdkVersion="28"'),
-          ]
-          for name, extra in permissions:
-              if name not in text:
-                  text = text.replace('<application', f'<uses-permission android:name="{name}"{extra} />\n    <application', 1)
-          path.write_text(text)
+          import xml.etree.ElementTree as ET
+          from PIL import Image
+          
+          # flutter create regenerates these files. All changes are applied afterward.
+          manifest = Path('android/app/src/main/AndroidManifest.xml')
+          ns = 'http://schemas.android.com/apk/res/android'
+          ET.register_namespace('android', ns)
+          a = lambda name: '{'+ns+'}'+name
+          root = ET.parse(manifest).getroot()
+          app = root.find('application')
+          assert app is not None
+          for name, extra in [('android.permission.INTERNET', {}), ('android.permission.POST_NOTIFICATIONS', {}), ('android.permission.WRITE_EXTERNAL_STORAGE', {a('maxSdkVersion'):'28'})]:
+              if not any(x.get(a('name')) == name for x in root.findall('uses-permission')):
+                  root.insert(0, ET.Element('uses-permission', {a('name'):name, **extra}))
+          for old in app.findall('receiver'):
+              if old.get(a('name')) == '.MeowPushReceiver': app.remove(old)
+          receiver = ET.SubElement(app, 'receiver', {a('name'):'.MeowPushReceiver', a('exported'):'true', a('permission'):'com.google.android.c2dm.permission.SEND'})
+          f = ET.SubElement(receiver, 'intent-filter')
+          ET.SubElement(f, 'action', {a('name'):'com.google.android.c2dm.intent.RECEIVE'})
+          for name, value in [('com.google.firebase.messaging.default_notification_icon','@drawable/ic_meow_notification')]:
+              for old in app.findall('meta-data'):
+                  if old.get(a('name')) == name: app.remove(old)
+              ET.SubElement(app, 'meta-data', {a('name'):name, a('resource'):value})
+          ET.ElementTree(root).write(manifest, encoding='utf-8', xml_declaration=True)
+          
+          # Extract the existing official foreground, not a redesigned logo.
+          source = Image.open('assets/meow_foreground.png').convert('RGBA')
+          alpha = source.getchannel('A')
+          if alpha.getextrema() == (255,255):
+              # An opaque asset may have a dark or purple background; retain only white pixels.
+              alpha = Image.new('L', source.size)
+              alpha.putdata([min(r,g,b) if min(r,g,b) >= 180 and max(r,g,b)-min(r,g,b) <= 45 else 0 for r,g,b,_ in source.getdata()])
+          bounds = alpha.getbbox()
+          assert bounds and alpha.getextrema()[0] < 255, 'O icone oficial precisa de fundo transparente ou escuro.'
+          alpha = alpha.crop(bounds)
+          alpha.thumbnail((80,80), Image.Resampling.LANCZOS)
+          icon = Image.new('RGBA',(96,96),(255,255,255,0))
+          mask = Image.new('RGBA',alpha.size,(255,255,255,0)); mask.putalpha(alpha)
+          icon.paste(mask,((96-alpha.width)//2,(96-alpha.height)//2))
+          res = Path('android/app/src/main/res/drawable-xxxhdpi'); res.mkdir(parents=True,exist_ok=True)
+          icon.save(res/'ic_meow_notification.png')
+          
+          # Keep the checked-in main.dart unchanged; capability registration is applied
+          # to this build's working copy only. Fail rather than silently patch a wrong file.
+          dart = Path('lib/main.dart')
+          s = dart.read_text()
+          old = "await _nativeNotification<void>('setSession',registeredUid);"
+          new = "final nativeReady=await _nativeNotification<bool>('setSession',registeredUid)==true;"
+          assert s.count(old)==1, 'main.dart nao corresponde a versao 0.9.0 esperada'
+          s=s.replace(old,new)
+          old="'token':token,\n        'updatedAt':FieldValue.serverTimestamp()"
+          assert s.count(old)==1
+          s=s.replace(old,"'token':token,\n        if(nativeReady)'nativeNotifications':true,\n        'updatedAt':FieldValue.serverTimestamp()")
+          old="'token':token,\n            'updatedAt':FieldValue.serverTimestamp()"
+          assert s.count(old)==1
+          s=s.replace(old,"'token':token,\n            if(nativeReady)'nativeNotifications':true,\n            'updatedAt':FieldValue.serverTimestamp()")
+          dart.write_text(s)
+          
+          # Native activity and receiver. Validate the package generated by Flutter.
+          activity=Path('android/app/src/main/kotlin/com/example/meow/MainActivity.kt')
+          assert activity.is_file() and 'package com.example.meow' in activity.read_text(), 'Pacote Android inesperado'
+          activity.write_text(KOTLIN_SOURCE)
           PYCODE
-
       - name: Instalar dependencias
         run: flutter pub get
-
       - name: Gerar icone oficial do Meow
         run: dart run flutter_launcher_icons
-
       - name: Verificar configuracao Firebase
         env:
           FB_API_KEY: ${{ secrets.FB_API_KEY }}
@@ -72,7 +117,6 @@ jobs:
               exit 1
             fi
           done
-
       - name: Gerar APKs Release (Beta)
         env:
           FB_API_KEY: ${{ secrets.FB_API_KEY }}
@@ -85,21 +129,18 @@ jobs:
             --dart-define="FB_APP_ID=$FB_APP_ID" \
             --dart-define="FB_SENDER_ID=$FB_SENDER_ID" \
             --dart-define="FB_PROJECT_ID=$FB_PROJECT_ID"
-
       - name: Disponibilizar APK ARM64
         uses: actions/upload-artifact@v4
         with:
           name: Meow-Release-ARM64
           path: build/app/outputs/flutter-apk/app-arm64-v8a-release.apk
           if-no-files-found: error
-
       - name: Disponibilizar APK ARM32
         uses: actions/upload-artifact@v4
         with:
           name: Meow-Release-ARM32
           path: build/app/outputs/flutter-apk/app-armeabi-v7a-release.apk
           if-no-files-found: error
-
       - name: Disponibilizar APK x86-64
         uses: actions/upload-artifact@v4
         with:
