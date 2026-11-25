@@ -1,0 +1,162 @@
+rules_version = '2';
+service cloud.firestore {
+ match /databases/{database}/documents {
+ function signed() { return request.auth != null; }
+ function me() { return request.auth.uid; }
+ function srv(s) { return /databases/$(database)/documents/servers/$(s); }
+ // Meow 0.8.1: freeze server access during trusted backend deletion.
+ function serverActive(s) { return exists(srv(s)) && get(srv(s)).data.get('deleting',false)==false; }
+ function isMember(s) { return signed() && serverActive(s) && me() in get(srv(s)).data.members; }
+ function isOwner(s) { return signed() && serverActive(s) && get(srv(s)).data.ownerId == me(); }
+ function canCreateChannel(s) { return signed() && (isOwner(s) || (!exists(srv(s)) && existsAfter(srv(s)) && getAfter(srv(s)).data.get('deleting',false)==false && getAfter(srv(s)).data.ownerId == me() && getAfter(srv(s)).data.members == [me()])); }
+ function isAdmin(s) { return isMember(s) && (isOwner(s) || me() in get(srv(s)).data.get('adminIds', [])); }
+ function dmPath(d) { return /databases/$(database)/documents/dms/$(d); }
+ function requestPath(d) { return /databases/$(database)/documents/dmRequests/$(d); }
+ function mutualFollowing(a, b) {
+  return exists(/databases/$(database)/documents/users/$(a)/following/$(b))
+    && exists(/databases/$(database)/documents/users/$(b)/following/$(a));
+ }
+ function dmOther(d) {
+  return get(dmPath(d)).data.members[0] == me()
+    ? get(dmPath(d)).data.members[1]
+    : get(dmPath(d)).data.members[0];
+ }
+ function dmMember(d) {
+  return signed() && exists(dmPath(d)) && me() in get(dmPath(d)).data.members;
+ }
+ function dmAllowed(d) {
+  return dmMember(d) && (mutualFollowing(me(), dmOther(d)) || !exists(requestPath(d))
+    || get(requestPath(d)).data.status in ['accepted','pending']);
+ }
+ function dmCanSend(d) {
+  return dmMember(d) && (mutualFollowing(me(),dmOther(d))
+    || (existsAfter(requestPath(d)) && (getAfter(requestPath(d)).data.status=='accepted'
+    || (getAfter(requestPath(d)).data.status=='pending' && getAfter(requestPath(d)).data.from==me()))));
+ }
+ function expressionPath(e) { return /databases/$(database)/documents/servers/$(e.serverId)/expressions/$(e.id); }
+ function validExpression(e) {
+  return e is map && e.keys().hasOnly(['serverId','id','kind']) && e.keys().hasAll(['serverId','id','kind'])
+   && e.serverId is string && e.serverId.matches('^[A-Za-z0-9_-]{1,128}$')
+   && e.id is string && e.id.matches('^[A-Za-z0-9_-]{1,128}$') && e.kind in ['emoji','sticker']
+   && isMember(e.serverId) && exists(expressionPath(e)) && get(expressionPath(e)).data.active == true
+   && get(expressionPath(e)).data.kind == e.kind;
+ }
+ function validTyping(u) { return signed() && me()==u && request.resource.data.keys().hasOnly(['at']) && request.resource.data.at==request.time; }
+ function validReaction(u) {
+  let r=request.resource.data;
+  return signed() && me()==u && r.keys().hasOnly(['emoji','expression','at']) && r.at==request.time
+   && ((r.keys().hasAll(['emoji','at']) && !r.keys().hasAny(['expression']) && r.emoji is string && r.emoji.size()>0 && r.emoji.size()<=32)
+    || (r.keys().hasAll(['expression','at']) && !r.keys().hasAny(['emoji']) && validExpression(r.expression) && r.expression.kind=='emoji'));
+ }
+ function validReply(path) {
+  let d=request.resource.data;
+  return !d.keys().hasAny(['replyAuthorId']) || (d.keys().hasAll(['replyToId','replyText','replyAuthor','replyAuthorId']) && d.replyAuthorId is string && d.replyToId.matches('^[A-Za-z0-9_-]{1,150}$') && exists(path) && get(path).data.authorId==d.replyAuthorId);
+ }
+ function validEveryone(s) {
+  let d=request.resource.data;
+  return !d.keys().hasAny(['everyoneMention']) || (d.everyoneMention==true && (isOwner(s) || get(srv(s)).data.get('everyoneEnabled',false)==true));
+ }
+ function validAttachment(a) { return a is map && a.keys().hasOnly(['id','name','contentType','size','thumbnailId']) && a.keys().hasAll(['id','name','contentType','size']) && a.id is string && a.id.size()>0 && a.name is string && a.contentType is string && a.size is int && a.size>0 && a.size<=26214400 && (!a.keys().hasAny(['thumbnailId']) || (a.contentType.matches('^video/.*$') && a.thumbnailId is string && a.thumbnailId.matches('^[A-Za-z0-9_-]{4,500}[.][0-9a-f-]{36}$'))); }
+ function validAttachments(d) { let a=d.get('attachments',[]);return !d.keys().hasAny(['attachments']) || (a is list && a.size()>=2 && a.size()<=5 && d.keys().hasAll(['attachment']) && a[0]==d.attachment && validAttachment(a[0]) && validAttachment(a[1]) && (a.size()<3||validAttachment(a[2])) && (a.size()<4||validAttachment(a[3])) && (a.size()<5||validAttachment(a[4]))); }
+ function validMsg() { let d=request.resource.data; return signed() && d.keys().hasOnly(['text','authorId','author','createdAt','replyToId','replyText','replyAuthor','attachment','attachments','expression','replyAuthorId','everyoneMention']) && d.keys().hasAll(['text','authorId','author','createdAt']) && d.authorId==me() && validAttachments(d) && (!d.keys().hasAny(['expression']) || validExpression(d.expression)) && d.text is string && d.text.size()<=2000 && (d.text.size()>0 || d.keys().hasAny(['attachment','expression'])) && d.author is string && d.author.size()<=40 && d.createdAt==request.time && (!d.keys().hasAny(['attachment']) || validAttachment(d.attachment)) && (!d.keys().hasAny(['replyToId','replyText','replyAuthor']) || (d.keys().hasAll(['replyToId','replyText','replyAuthor']) && d.replyToId is string && d.replyText is string && d.replyAuthor is string)); }
+ function editMsg() { return signed() && resource.data.authorId==me() && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['text','editedAt']) && request.resource.data.text is string && request.resource.data.text.size()<=2000 && (request.resource.data.text.size()>0 || request.resource.data.keys().hasAny(['attachment','expression'])) && request.resource.data.editedAt==request.time; }
+ match /users/{u} {
+  allow get: if signed();
+  allow list: if signed() && request.query.limit != null && request.query.limit<=20;
+  // Meow 0.8.0: somente o backend cria perfis.
+  allow create: if false;
+  allow update: if signed() && me()==u && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['displayName','pronouns','bio','presence','customStatus','lastSeen','presenceClosedAt','themeColorA','themeColorB','themeGradient','bannerHidden','backgroundEnabled','avatarRevision','bannerRevision','backgroundRevision','status0Revision','status1Revision','status2Revision','status3Revision']) && request.resource.data.get('displayName','') is string && request.resource.data.get('displayName','').size()<=15 && request.resource.data.get('pronouns','') is string && request.resource.data.get('pronouns','').size()<=40 && request.resource.data.get('bio','') is string && request.resource.data.get('bio','').size()<=300 && request.resource.data.get('customStatus','') is string && request.resource.data.get('customStatus','').size()<=120 && request.resource.data.get('presence','online') in ['online','idle','dnd','invisible'] && request.resource.data.get('themeColorA','#1C1D28') is string && request.resource.data.get('themeColorA','#1C1D28').matches('^#[0-9A-Fa-f]{6}$') && request.resource.data.get('themeColorB','#8B5CF6') is string && request.resource.data.get('themeColorB','#8B5CF6').matches('^#[0-9A-Fa-f]{6}$') && request.resource.data.get('themeGradient',false) is bool && request.resource.data.get('bannerHidden',false) is bool && request.resource.data.get('backgroundEnabled',false) is bool && request.resource.data.get('avatarRevision','') is string && request.resource.data.get('avatarRevision','').matches('^([0-9a-f]{32})?$') && request.resource.data.get('bannerRevision','') is string && request.resource.data.get('bannerRevision','').matches('^([0-9a-f]{32})?$') && request.resource.data.get('backgroundRevision','') is string && request.resource.data.get('backgroundRevision','').matches('^([0-9a-f]{32})?$') && request.resource.data.get('status0Revision','') is string && request.resource.data.get('status0Revision','').matches('^([0-9a-f]{32})?$') && request.resource.data.get('status1Revision','') is string && request.resource.data.get('status1Revision','').matches('^([0-9a-f]{32})?$') && request.resource.data.get('status2Revision','') is string && request.resource.data.get('status2Revision','').matches('^([0-9a-f]{32})?$') && request.resource.data.get('status3Revision','') is string && request.resource.data.get('status3Revision','').matches('^([0-9a-f]{32})?$') && (!request.resource.data.diff(resource.data).affectedKeys().hasAny(['lastSeen']) || request.resource.data.lastSeen==request.time) && (!request.resource.data.diff(resource.data).affectedKeys().hasAny(['presenceClosedAt']) || request.resource.data.presenceClosedAt==request.time);
+  allow delete: if false;
+  match /preferences/{pref} {
+   allow read: if signed() && me()==u && pref=='notifications';
+   allow create,update: if signed() && me()==u && pref=='notifications' && request.resource.data.keys().hasOnly(['enabled']) && request.resource.data.enabled is bool;
+   allow delete: if signed() && me()==u && pref=='notifications';
+  }
+  match /mutedThreads/{thread} {
+   allow read,delete: if signed() && me()==u;
+   allow create,update: if signed() && me()==u && request.resource.data.keys().hasOnly(['thread']) && request.resource.data.thread is string && request.resource.data.thread.size()<=300;
+  }
+  match /devices/{token} { allow get,list: if signed() && me()==u; allow create,update: if signed() && me()==u && request.resource.data.keys().hasOnly(['token','updatedAt','nativeNotifications']) && request.resource.data.get('nativeNotifications',false) is bool && request.resource.data.token==token && request.resource.data.updatedAt==request.time; allow delete: if signed() && me()==u; }
+  match /reads/{thread} { allow read: if signed() && me()==u; allow create,update: if signed() && me()==u && request.resource.data.keys().hasOnly(['at']) && request.resource.data.at==request.time; }
+  match /following/{target} { allow read: if signed(); allow create: if signed() && me()==u && target!=u && request.resource.data.keys().hasOnly(['createdAt']) && request.resource.data.createdAt==request.time && exists(/databases/$(database)/documents/users/$(target)); allow delete: if signed() && me()==u; allow update: if false; }
+  match /followers/{follower} { allow read: if signed(); allow create: if signed() && me()==follower && u!=follower && request.resource.data.keys().hasOnly(['createdAt']) && request.resource.data.createdAt==request.time && existsAfter(/databases/$(database)/documents/users/$(follower)/following/$(u)); allow delete: if signed() && me()==follower; allow update: if false; }
+  match /friends/{friend} { allow read: if signed() && me()==u; allow write: if false; }
+ }
+ match /servers/{s} {
+  allow get,list: if signed() && me() in resource.data.members;
+  allow create: if signed() && !exists(/databases/$(database)/documents/serverDeletionJobs/$(s)) && request.resource.data.keys().hasOnly(['name','ownerId','members','createdAt']) && request.resource.data.name is string && request.resource.data.name.size()>0 && request.resource.data.name.size()<=40 && request.resource.data.ownerId==me() && request.resource.data.members==[me()] && request.resource.data.createdAt==request.time;
+  allow update: if resource.data.get('deleting',false)==false && (isOwner(s) && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['name','everyoneEnabled']) && request.resource.data.get('everyoneEnabled',false) is bool && request.resource.data.name is string && request.resource.data.name.size()>0 && request.resource.data.name.size()<=40 || signed() && me()!=resource.data.ownerId && me() in resource.data.members && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['members']) && !(me() in request.resource.data.members) && request.resource.data.members.size()==resource.data.members.size()-1 && resource.data.members.hasAll(request.resource.data.members));
+  allow delete: if false;
+  match /expressions/{e} {
+   allow read: if isMember(s);
+   allow create: if isAdmin(s) && e.matches('^[0-9a-f-]{36}$') && request.resource.data.keys().hasOnly(['id','serverId','kind','name','contentType','size','active','createdAt']) && request.resource.data.keys().hasAll(['id','serverId','kind','name','contentType','size','active','createdAt']) && request.resource.data.id==e && request.resource.data.serverId==s && request.resource.data.kind in ['emoji','sticker'] && request.resource.data.name is string && request.resource.data.name.size()>=2 && request.resource.data.name.size()<=32 && request.resource.data.contentType in ['image/png','image/jpeg','image/webp','image/gif'] && request.resource.data.size is int && request.resource.data.size>0 && request.resource.data.size<=5000000 && request.resource.data.active==true && request.resource.data.createdAt==request.time;
+   allow update: if isAdmin(s) && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['name','active']) && request.resource.data.name is string && request.resource.data.name.size()>=2 && request.resource.data.name.size()<=32 && request.resource.data.active is bool && (resource.data.active==true || request.resource.data.active==false);
+   allow delete: if false;
+  }
+  match /categories/{cat} { allow read: if isMember(s); allow create: if isOwner(s) && request.resource.data.keys().hasOnly(['name','order','createdAt']) && request.resource.data.name is string && request.resource.data.name.size()>0 && request.resource.data.name.size()<=40 && request.resource.data.order is int && request.resource.data.createdAt==request.time; allow update: if isOwner(s) && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['name','order']) && request.resource.data.name is string && request.resource.data.name.size()>0 && request.resource.data.name.size()<=40 && request.resource.data.order is int; allow delete: if false; }
+  match /channels/{ch} { allow read: if isMember(s); allow create: if canCreateChannel(s) && request.resource.data.keys().hasOnly(['name','category','createdAt','order']) && request.resource.data.name is string && request.resource.data.name.size()>0 && request.resource.data.name.size()<=40 && request.resource.data.get('category','GERAL') is string && request.resource.data.createdAt==request.time; allow update: if isOwner(s) && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['name','category','order']) && request.resource.data.name is string && request.resource.data.name.size()>0 && request.resource.data.name.size()<=40 && request.resource.data.get('category','GERAL') is string; allow delete: if false;
+   match /typing/{u} { allow read: if isMember(s); allow create,update: if isMember(s) && validTyping(u); allow delete: if isMember(s) && me()==u; }
+   match /messages/{m} { match /reactions/{u} { allow read: if isMember(s); allow create,update: if isMember(s) && validReaction(u) && exists(/databases/$(database)/documents/servers/$(s)/channels/$(ch)/messages/$(m)); allow delete: if isMember(s) && me()==u; } allow read: if isMember(s); allow create: if isMember(s) && validMsg() && validEveryone(s) && (!request.resource.data.keys().hasAny(['replyAuthorId']) || validReply(/databases/$(database)/documents/servers/$(s)/channels/$(ch)/messages/$(request.resource.data.replyToId))); allow update: if isMember(s) && editMsg(); allow delete: if isMember(s) && (resource.data.authorId==me() || isAdmin(s)); }
+  }
+ }
+ match /dms/{d} {
+  allow get: if signed() && (!exists(dmPath(d)) || me() in resource.data.members);
+  allow list: if signed() && me() in resource.data.members;
+  allow create: if signed()
+    && request.resource.data.keys().hasOnly(['members'])
+    && request.resource.data.members is list
+    && request.resource.data.members.size() == 2
+    && request.resource.data.members[0] is string
+    && request.resource.data.members[1] is string
+    && request.resource.data.members[0] != request.resource.data.members[1]
+    && me() in request.resource.data.members
+    && (d == request.resource.data.members[0] + '_' + request.resource.data.members[1]
+      || d == request.resource.data.members[1] + '_' + request.resource.data.members[0])
+    && exists(/databases/$(database)/documents/users/$(request.resource.data.members[0]))
+    && exists(/databases/$(database)/documents/users/$(request.resource.data.members[1]));
+  allow update: if signed() && me() in resource.data.members
+    && request.resource.data == resource.data;
+  match /typing/{u} { allow read: if dmAllowed(d); allow create,update: if dmCanSend(d) && validTyping(u); allow delete: if dmAllowed(d) && me()==u; }
+  match /messages/{m} {
+   match /reactions/{u} { allow read: if dmAllowed(d); allow create,update: if dmCanSend(d) && validReaction(u) && exists(/databases/$(database)/documents/dms/$(d)/messages/$(m)); allow delete: if dmAllowed(d) && me()==u; }
+   allow read: if dmAllowed(d);
+   allow create: if dmCanSend(d) && validMsg() && !request.resource.data.keys().hasAny(['everyoneMention']) && (!request.resource.data.keys().hasAny(['replyAuthorId']) || validReply(/databases/$(database)/documents/dms/$(d)/messages/$(request.resource.data.replyToId)));
+   allow update: if dmAllowed(d) && editMsg();
+   allow delete: if dmAllowed(d) && resource.data.authorId == me();
+  }
+ }
+ // The recipient-scoped query uses where('to', isEqualTo: uid).
+ // Firestore rules prove the query cannot include another user's requests.
+ match /dmRequests/{d} {
+  allow get: if dmMember(d);
+  allow list: if signed() && resource.data.to == me();
+  allow create: if dmMember(d)
+    && request.resource.data.keys().hasOnly(['from', 'to', 'status', 'createdAt','firstMessageId'])
+    && request.resource.data.keys().hasAll(['from', 'to', 'status', 'createdAt','firstMessageId'])
+    && request.resource.data.from == me()
+    && request.resource.data.to == dmOther(d)
+    && request.resource.data.status == 'pending'
+    && request.resource.data.createdAt == request.time
+    && request.resource.data.firstMessageId is string
+    && request.resource.data.firstMessageId.matches('^[A-Za-z0-9_-]{1,150}$')
+    && !exists(/databases/$(database)/documents/dms/$(d)/messages/$(request.resource.data.firstMessageId))
+    && existsAfter(/databases/$(database)/documents/dms/$(d)/messages/$(request.resource.data.firstMessageId))
+    && getAfter(/databases/$(database)/documents/dms/$(d)/messages/$(request.resource.data.firstMessageId)).data.authorId==me();
+  allow update: if signed() && resource.data.to == me()
+    && resource.data.status == 'pending'
+    && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['status'])
+    && request.resource.data.status in ['accepted', 'declined'];
+  allow delete: if false;
+ }
+ // Deletion jobs and tombstones are accessible only through the trusted backend.
+ match /serverDeletionJobs/{s} { allow read, write: if false; }
+ match /serverDeletionRequests/{s} {
+  allow get: if isOwner(s);
+  allow list: if false;
+  allow create: if isOwner(s) && request.resource.data.keys().hasOnly(['ownerId','requestedAt']) && request.resource.data.ownerId==me() && request.resource.data.requestedAt==request.time;
+  allow update,delete: if false;
+ }
+ match /invites/{code} { allow read,write: if false; }
+ match /joinProofs/{s}/users/{u} { allow get: if signed() && me()==u; allow write: if false; }
+ }
+}
