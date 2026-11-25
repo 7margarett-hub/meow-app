@@ -31,7 +31,7 @@ import 'package:photo_manager/photo_manager.dart' as gallery;
 late final AppLinks meowAppLinks;
 const bg = Color(0xFF1A1A1E), panel = Color(0xFF242429), purple = Color(0xFF8B5CF6);
 const meowComposerColor = Color(0xFF29292F);
-const double meowChatAvatarSize = 54;
+const double meowChatAvatarSize = 44;
 const avatarLimit = 8 * 1024 * 1024, bannerLimit = 15 * 1024 * 1024, attachmentLimit = 25 * 1024 * 1024;
 const imageHost = 'ffxsvctvcsldumxnkiob.supabase.co';
 final changedImage = ValueNotifier<Uri?>(null);
@@ -188,109 +188,95 @@ class MeowStreamBuilder<T> extends StatelessWidget {
     stream: TickerMode.of(context) ? stream : null, builder:builder);
 }
 
-// Cache privado em memoria por sessao. Nunca persiste imagens privadas no disco.
-// Compartilha requisicoes entre avatares repetidos e evita novos downloads ao navegar.
+// Private, bounded session cache. No private media is written to disk.
+// Reuse connections, prefer small profile media, and collapse duplicate requests.
 class PrivateMediaCache {
-  static final _pending = <String, Future<Uint8List?>>{};
-  static final _completed = <String, ({Uint8List bytes, DateTime time, Future<Uint8List?> future})>{};
-  static final _generation = <String, int>{};
-  static const int maxBytes = 40 * 1024 * 1024;
-  static const Duration lifetime = Duration(minutes: 5);
-  static const Duration attachmentLifetime = Duration(minutes: 10);
-  static int _inFlight=0;
-  static final _queue=<Completer<void>>[];
-  static Future<void> _acquire()async{if(_inFlight<4){_inFlight++;return;}final gate=Completer<void>();_queue.add(gate);await gate.future;}
-  static void _release(){if(_queue.isNotEmpty){_queue.removeAt(0).complete();}else{_inFlight--;}}
-  static int _usedBytes = 0;
-  static int _session = 0;
-  static String _key(Uri url) => '${FirebaseAuth.instance.currentUser?.uid ?? ''}|$url';
-  static bool _valid(Uri url, String key, int generation, int session) =>
-      _session == session && FirebaseAuth.instance.currentUser != null &&
-      _key(url) == key && (_generation[key] ?? 0) == generation;
-
-  static final _progress=<String,Set<ValueChanged<double?>>> {};
+  static final _pending=<String,Future<Uint8List?>>{};
+  static final _completed=<String,({Uint8List bytes,DateTime time,Future<Uint8List?> future})>{};
+  static final _missing=<String,DateTime>{};
+  static final _generation=<String,int>{};
+  static final _progress=<String,Set<ValueChanged<double?>>>{};
+  static const int maxBytes=48*1024*1024;
+  static const int maxEntries=256;
+  static const Duration lifetime=Duration(minutes:5);
+  static const Duration revisionLifetime=Duration(minutes:30);
+  static const Duration attachmentLifetime=Duration(minutes:10);
+  static const Duration missingLifetime=Duration(seconds:60);
+  static int _usedBytes=0,_session=0,_inFlight=0,_priorityBurst=0;
+  static String? _owner;
+  static http.Client? _client;
+  static final _priorityQueue=<Completer<void>>[],_queue=<Completer<void>>[];
+  static String _key(Uri url)=>'${FirebaseAuth.instance.currentUser?.uid??''}|$url';
+  static bool _image(Uri url)=>url.path.endsWith('/meow-imagens');
+  static Duration _lifetime(Uri url)=>url.path.endsWith('/meow-anexos')?attachmentLifetime:_image(url)&&url.queryParameters.containsKey('revision')?revisionLifetime:lifetime;
+  static String _family(String key)=>key.split('&revision=').first;
+  static bool _valid(Uri url,String key,int generation,int session)=>_session==session&&FirebaseAuth.instance.currentUser!=null&&_key(url)==key&&(_generation[key]??0)==generation;
+  static Future<void> _acquire(bool priority)async{if(_inFlight<4){_inFlight++;return;}final gate=Completer<void>();(priority?_priorityQueue:_queue).add(gate);await gate.future;}
+  static void _release(){if(_priorityQueue.isNotEmpty&&(_queue.isEmpty||_priorityBurst<3)){_priorityBurst++;_priorityQueue.removeAt(0).complete();}else if(_queue.isNotEmpty){_priorityBurst=0;_queue.removeAt(0).complete();}else{_inFlight--;_priorityBurst=0;}}
   static void _report(String key,double? value){for(final listener in List<ValueChanged<double?>>.from(_progress[key]??{})){try{listener(value);}catch(_){}}}
   static Future<Uint8List?> get(Uri url,{ValueChanged<double?>? onProgress}) {
-    final key = _key(url);
-    final entry = _completed.remove(key);
-    if (entry != null) {
-      if (DateTime.now().difference(entry.time) < (url.path.endsWith('/meow-anexos')?attachmentLifetime:lifetime)) {
-        _completed[key] = entry;
-        if(onProgress!=null)onProgress(1);return entry.future;
-      }
-      _usedBytes -= entry.bytes.lengthInBytes;
-    }
+    final uid=FirebaseAuth.instance.currentUser?.uid;
+    if(uid==null)return Future<Uint8List?>.value(null);
+    if(_owner!=uid){clear();_owner=uid;}
+    final key=_key(url);final now=DateTime.now();
+    final entry=_completed.remove(key);
+    if(entry!=null){if(now.difference(entry.time)<_lifetime(url)){_completed[key]=entry;if(onProgress!=null)onProgress(1);return entry.future;}_usedBytes-=entry.bytes.lengthInBytes;}
+    final missing=_missing[key];if(missing!=null){if(now.difference(missing)<missingLifetime)return Future<Uint8List?>.value(null);_missing.remove(key);}
     Future<Uint8List?> observe(Future<Uint8List?> future){if(onProgress==null)return future;final listeners=_progress.putIfAbsent(key,()=> <ValueChanged<double?>>{});listeners.add(onProgress);return future.whenComplete((){listeners.remove(onProgress);if(listeners.isEmpty&&identical(_progress[key],listeners))_progress.remove(key);});}
-    final existing = _pending[key];
-    if (existing != null) return observe(existing);
-    final generation=_generation[key]??0, session=_session;
-    final task=()async{await _acquire();try{return await _download(url,key,generation,session);}finally{_release();}}();
-    _pending[key] = task;
-    task.whenComplete(() {
-      if (identical(_pending[key], task)) _pending.remove(key);
-    });
+    final existing=_pending[key];if(existing!=null)return observe(existing);
+    final generation=_generation[key]??0,session=_session;
+    final task=()async{await _acquire(_image(url));try{return await _download(url,key,generation,session);}finally{_release();}}();
+    _pending[key]=task;
+    task.whenComplete((){if(identical(_pending[key],task))_pending.remove(key);});
     return observe(task);
   }
-
-  static void _store(String key, Uint8List bytes) {
-    final old = _completed.remove(key);
-    if (old != null) _usedBytes -= old.bytes.lengthInBytes;
-    if (bytes.isEmpty || bytes.lengthInBytes > maxBytes) return;
-    while (_completed.isNotEmpty && _usedBytes + bytes.lengthInBytes > maxBytes) {
-      _usedBytes -= _completed.remove(_completed.keys.first)!.bytes.lengthInBytes;
-    }
-    _completed[key] = (bytes: bytes, time: DateTime.now(), future: Future<Uint8List?>.value(bytes));
-    _usedBytes += bytes.lengthInBytes;
+  static void _store(String key,Uint8List bytes){
+    _missing.remove(key);final old=_completed.remove(key);if(old!=null)_usedBytes-=old.bytes.lengthInBytes;
+    if(bytes.isEmpty||bytes.lengthInBytes>maxBytes)return;
+    while(_completed.isNotEmpty&&(_usedBytes+bytes.lengthInBytes>maxBytes||_completed.length>=maxEntries)){_usedBytes-=_completed.remove(_completed.keys.first)!.bytes.lengthInBytes;}
+    _completed[key]=(bytes:bytes,time:DateTime.now(),future:Future<Uint8List?>.value(bytes));_usedBytes+=bytes.lengthInBytes;
   }
-
-  static Future<Uint8List?> _download(Uri url, String key, int generation, int session) async {
-    // Never persist a failed response as a successful or missing image.
-    // Only repeat safe GETs on transient failures, never upload requests.
-    for (var attempt = 0; attempt < 2; attempt++) {
-      if (!_valid(url, key, generation, session)) return null;
-      final client = http.Client();
-      try {
-        final headers = await authHeaders();
-        if (!_valid(url, key, generation, session)) return null;
+  static Future<Uint8List?> _download(Uri url,String key,int generation,int session)async{
+    for(var attempt=0;attempt<2;attempt++){
+      if(!_valid(url,key,generation,session))return null;
+      // Use an individual client for each large attachment, so its timeout cannot
+      // disturb profile requests. Small image requests share the session pool.
+      final pooled=_image(url);final client=pooled?(_client??=http.Client()):http.Client();
+      try{
+        final headers=await authHeaders();if(!_valid(url,key,generation,session))return null;
         final request=http.Request('GET',url)..headers.addAll(headers)..followRedirects=false;
         final response=await client.send(request).timeout(const Duration(seconds:20));
-        if (!_valid(url, key, generation, session)) return null;
-        if(response.statusCode==200){final total=response.contentLength;final limit=url.path.endsWith('/meow-anexos')?attachmentLimit:maxBytes;if(total!=null&&total>limit)return null;final builder=BytesBuilder(copy:false);var received=0;var report=DateTime.fromMillisecondsSinceEpoch(0);
+        if(!_valid(url,key,generation,session)){await response.stream.listen((_){}).cancel();return null;}
+        if(response.statusCode==200){
+          final total=response.contentLength;final limit=url.path.endsWith('/meow-anexos')?attachmentLimit:maxBytes;
+          if(total!=null&&total>limit)throw const FormatException('Mídia acima do limite.');
+          final builder=BytesBuilder(copy:false);var received=0;var report=DateTime.fromMillisecondsSinceEpoch(0);
           _report(key,total!=null&&total>0?0:null);
-          await for(final chunk in response.stream.timeout(const Duration(seconds:20))){if(!_valid(url,key,generation,session))return null;received+=chunk.length;if(received>limit)return null;builder.add(chunk);final now=DateTime.now();if(now.difference(report)>=const Duration(milliseconds:120)){report=now;_report(key,total!=null&&total>0?(received/total).clamp(0.0,1.0).toDouble():null);}}
+          await for(final chunk in response.stream.timeout(const Duration(seconds:20))){if(!_valid(url,key,generation,session))return null;received+=chunk.length;if(received>limit)throw const FormatException('Mídia acima do limite.');builder.add(chunk);final now=DateTime.now();if(now.difference(report)>=const Duration(milliseconds:120)){report=now;_report(key,total!=null&&total>0?(received/total).clamp(0.0,1.0).toDouble():null);}}
           if(received==0||!_valid(url,key,generation,session))return null;final bytes=builder.takeBytes();_store(key,bytes);_report(key,1);return bytes;
         }
-        debugPrint('Meow media: HTTP ${response.statusCode} em ${url.path}');
-        if (response.statusCode != 429 && response.statusCode < 500) return null;
-      } catch (e) {
-        debugPrint('Meow media: falha no download (${url.path}): $e');
-      } finally {
-        client.close();
-      }
-      if (attempt == 0) await Future<void>.delayed(const Duration(milliseconds: 400));
+        // Drain error bodies before reusing the connection.
+        await response.stream.drain<void>().timeout(const Duration(seconds:5));
+        if(!_valid(url,key,generation,session))return null;
+        if(response.statusCode==404&&_image(url)){if(_missing.length>=maxEntries)_missing.remove(_missing.keys.first);_missing[key]=DateTime.now();return null;}
+        if(response.statusCode!=429&&response.statusCode<500)return null;
+      }catch(e){debugPrint('Meow media: falha no download (${url.path}): $e');if(pooled&&identical(_client,client)){_client=null;client.close();}}
+      finally{if(!pooled)client.close();}
+      if(attempt==0)await Future<void>.delayed(const Duration(milliseconds:400));
     }
     return null;
   }
-
-  static void invalidate(Uri url) {
-    final key = _key(url);
-    _generation[key] = (_generation[key] ?? 0) + 1;
-    final old = _completed.remove(key);
-    if (old != null) _usedBytes -= old.bytes.lengthInBytes;
-    _pending.remove(key);
+  static void invalidate(Uri url){
+    final key=_key(url);final family=_family(key);
+    final keys=<String>{key,..._completed.keys,..._pending.keys,..._missing.keys}.where((k)=>_family(k)==family).toList();
+    for(final k in keys){_generation[k]=(_generation[k]??0)+1;final old=_completed.remove(k);if(old!=null)_usedBytes-=old.bytes.lengthInBytes;_pending.remove(k);_missing.remove(k);}
   }
-
-  static void purgeCompleted(){_completed.clear();_usedBytes=0;PaintingBinding.instance.imageCache.clear();}
-  static void clear() {
-    _session++;
-    _generation.clear();
-    _progress.clear();
-    _completed.clear();
-    _pending.clear();
-    _usedBytes = 0;
-    PaintingBinding.instance.imageCache.clear();
-    PaintingBinding.instance.imageCache.clearLiveImages();
+  static void pruneExpired(){
+    final now=DateTime.now();for(final k in _completed.keys.toList()){final uri=Uri.tryParse(k.substring(k.indexOf('|')+1));final entry=_completed[k]!;if(uri==null||now.difference(entry.time)>=_lifetime(uri)){_completed.remove(k);_usedBytes-=entry.bytes.lengthInBytes;}}
+    _missing.removeWhere((_,time)=>now.difference(time)>=missingLifetime);
   }
+  static void purgeCompleted(){_completed.clear();_missing.clear();_usedBytes=0;PaintingBinding.instance.imageCache.clear();}
+  static void clear(){_session++;_owner=null;_client?.close();_client=null;_generation.clear();_progress.clear();_completed.clear();_missing.clear();_pending.clear();_usedBytes=0;PaintingBinding.instance.imageCache.clear();PaintingBinding.instance.imageCache.clearLiveImages();}
 }
 
 String get myUid => FirebaseAuth.instance.currentUser!.uid;
@@ -325,6 +311,8 @@ Future<Map<String, String>> authHeaders() async {
 }
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
+  PaintingBinding.instance.imageCache.maximumSize=180;
+  PaintingBinding.instance.imageCache.maximumSizeBytes=64*1024*1024;
   meowAppLinks=AppLinks();
   const apiKey = String.fromEnvironment('FB_API_KEY');
   const appId = String.fromEnvironment('FB_APP_ID');
@@ -487,10 +475,27 @@ class _LoginPageState extends State<LoginPage> {
   ])))))));
 }
 
-// Restore the 0.7.0 image decoder. Original bytes and GIF frames stay intact.
-// Keep the stable futures, private byte cache and other UI optimizations.
-Widget meowPreview(BuildContext context, Uint8List bytes, {required double width,required double height,required BoxFit fit,ImageErrorWidgetBuilder? errorBuilder,bool gapless=true}) {
-  return Image.memory(bytes,fit:fit,gaplessPlayback:gapless,errorBuilder:errorBuilder);
+// Decode static previews close to the display size. Keep animated GIF/WebP
+// and full-size image viewers on the original decoder path.
+int meowPreviewPixels(double logical,double dpr){
+  if(!logical.isFinite||logical<=0)return 0;
+  final target=(logical*dpr.clamp(1.0,4.0)).ceil();
+  for(final n in const [64,128,256,512,768,1024,1536]){if(target<=n)return n;}
+  return 1536;
+}
+bool meowStaticPreview(Uint8List bytes)=>bytes.length>=8&&((bytes[0]==0xff&&bytes[1]==0xd8)||(bytes[0]==0x89&&bytes[1]==0x50&&bytes[2]==0x4e&&bytes[3]==0x47&&!_meowAnimatedPng(bytes)));
+bool _meowAnimatedPng(Uint8List bytes){
+  // APNG declares acTL before the first IDAT. Never change animated decoding.
+  final data=ByteData.sublistView(bytes);var offset=8;
+  while(offset+12<=bytes.length){final n=data.getUint32(offset);final type=data.getUint32(offset+4);if(type==0x6163544c)return true;if(type==0x49444154||type==0x49454e44)return false;if(n>bytes.length-offset-12)return false;offset+=n+12;}return false;
+}
+Widget meowPreview(BuildContext context,Uint8List bytes,{required double width,required double height,required BoxFit fit,ImageErrorWidgetBuilder? errorBuilder,bool gapless=true}){
+  return LayoutBuilder(builder:(c,b){
+    final w=b.hasBoundedWidth?b.maxWidth:width;final h=b.hasBoundedHeight?b.maxHeight:height;
+    final dpr=MediaQuery.devicePixelRatioOf(c);final px=meowPreviewPixels(w,dpr),py=meowPreviewPixels(h,dpr);
+    final ImageProvider provider=meowStaticPreview(bytes)&&px>0&&py>0?ResizeImage(MemoryImage(bytes),width:px,height:py,policy:ResizeImagePolicy.fit):MemoryImage(bytes);
+    return Image(image:provider,fit:fit,gaplessPlayback:gapless,errorBuilder:errorBuilder);
+  });
 }
 class PrivateImage extends StatefulWidget {
   final String scope,
@@ -513,53 +518,33 @@ class PrivateImage extends StatefulWidget {
   @override State<PrivateImage> createState()=>_PrivateImageState();
 }
 
-class _PrivateImageState extends State<PrivateImage> {
-  late Future<Uint8List?> future;
+class _PrivateImageState extends State<PrivateImage>{
+  Future<Uint8List?>? future;
   StreamSubscription<DocumentSnapshot<Map<String,dynamic>>>? revisionSub;
-  String revision=''; int revisionEpoch=0;
+  String revision='';int revisionEpoch=0;bool revisionKnown=false,profileExists=false;
   Uri get revisionUrl=>revision.isEmpty?widget.url:widget.url.replace(queryParameters:{...widget.url.queryParameters,'revision':revision});
-  Future<Uint8List?> fetch() => PrivateMediaCache.get(revisionUrl);
+  Future<Uint8List?> fetch()=>PrivateMediaCache.get(revisionUrl);
   void watchRevision(){
-    revisionSub?.cancel();revisionSub=null;final epoch=++revisionEpoch;
-    if(widget.scope!='profile'||!TickerMode.of(context))return;
+    if(widget.scope!='profile'||!TickerMode.of(context)){if(revisionSub!=null){revisionEpoch++;revisionSub?.cancel();revisionSub=null;}return;}
+    if(revisionSub!=null)return;final epoch=++revisionEpoch;
     revisionSub=db.collection('users').doc(widget.id).meowSnapshots().listen((snap){
-      if(!mounted||epoch!=revisionEpoch)return;final next=snap.data()?['${widget.slot}Revision']?.toString()??'';
-      if(next!=revision)setState((){revision=next;future=fetch();});
-    },onError:(Object _){});
+      if(!mounted||epoch!=revisionEpoch)return;
+      final next=snap.data()?['${widget.slot}Revision']?.toString()??'';
+      if(!revisionKnown||next!=revision||snap.exists!=profileExists){setState((){revisionKnown=true;profileExists=snap.exists;revision=next;future=snap.exists?fetch():Future<Uint8List?>.value(null);});}
+    },onError:(Object _){if(mounted&&epoch==revisionEpoch&&!revisionKnown)setState(()=>future=Future<Uint8List?>.value(null));});
   }
   @override void didChangeDependencies(){super.didChangeDependencies();watchRevision();}
-  void refresh(){
-    if(changedImage.value==widget.url&&mounted){
-      setState(()=>future=fetch());
-    }
-}
-  @override void initState(){
-    super.initState();
-    future=fetch();
-    changedImage.addListener(refresh);
-}
-  @override void didUpdateWidget(covariant PrivateImage old){
-    super.didUpdateWidget(old);
-    if(old.url!=widget.url){revision='';future=fetch();watchRevision();}
-}
-  @override void dispose(){
-    revisionEpoch++;revisionSub?.cancel();changedImage.removeListener(refresh);
-    super.dispose();
-}
+  void refresh(){if(mounted&&changedImage.value==widget.url&&(widget.scope!='profile'||revisionKnown))setState(()=>future=fetch());}
+  @override void initState(){super.initState();if(widget.scope!='profile')future=fetch();changedImage.addListener(refresh);}
+  @override void didUpdateWidget(covariant PrivateImage old){super.didUpdateWidget(old);if(old.url!=widget.url){revisionEpoch++;revisionSub?.cancel();revisionSub=null;revision='';revisionKnown=false;profileExists=false;future=widget.scope=='profile'?null:fetch();watchRevision();}}
+  @override void dispose(){revisionEpoch++;revisionSub?.cancel();changedImage.removeListener(refresh);super.dispose();}
   @override Widget build(BuildContext c){
     final banner=widget.slot=='banner';final statusIcon=widget.slot.startsWith('status');
-      return SizedBox(width:widget.width??(banner?double.infinity:widget.size), height:widget.size, child:ClipRRect(borderRadius:widget.borderRadius??BorderRadius.circular(banner?8:widget.size),
-      child:FutureBuilder<Uint8List?>(key:ValueKey(revisionUrl),future:future, builder:(c, s){
-          final placeholder=ColoredBox(color:panel, child:Center(child:Icon(banner?Icons.landscape:widget.scope=='server'?Icons.groups:Icons.person,
-        color:Colors.white54, size:banner?38:widget.size*.5
-)));
-          return s.data==null?placeholder:meowPreview(c,s.data!,width:widget.width??widget.size,height:widget.size,fit:statusIcon?BoxFit.contain:BoxFit.cover,errorBuilder:(c,
-        e, st
-){ debugPrint('Meow: falha ao decodificar imagem: $e'); return placeholder; });
-}
-)
-));
-}
+    return SizedBox(width:widget.width??(banner?double.infinity:widget.size),height:widget.size,child:ClipRRect(borderRadius:widget.borderRadius??BorderRadius.circular(banner?8:widget.size),child:FutureBuilder<Uint8List?>(key:ValueKey(widget.url),future:future,builder:(c,s){
+      final placeholder=ColoredBox(color:panel,child:Center(child:Icon(banner?Icons.landscape:widget.scope=='server'?Icons.groups:Icons.person,color:Colors.white54,size:banner?38:widget.size*.5)));
+      return s.data==null?placeholder:meowPreview(c,s.data!,width:widget.width??widget.size,height:widget.size,fit:statusIcon?BoxFit.contain:BoxFit.cover,errorBuilder:(c,e,st){debugPrint('Meow: falha ao decodificar imagem: $e');return placeholder;});
+    })));
+  }
 }
 
 class ChangeImage extends StatefulWidget {
@@ -814,6 +799,7 @@ const meowBadgeDefinitions=[
  MeowBadgeDefinition('beta_tester','Testador Beta','Participou dos testes da versão Beta.',Icons.science_outlined,Color(0xFF60A5FA)),
  MeowBadgeDefinition('bug_hunter','Caçador de Bugs','Contribuiu identificando problemas no Meow.',Icons.bug_report_outlined,Color(0xFF4ADE80)),
 ];
+Widget meowBadgeArt(MeowBadgeDefinition badge,{double size=38})=>Image.asset('assets/badges/${badge.id}.png',width:size,height:size,fit:BoxFit.contain);
 Set<String> meowBadges(Map<String,dynamic> data){
  final raw=data['badges'];
  return raw is List?raw.whereType<String>().where((id)=>meowBadgeDefinitions.any((b)=>b.id==id)).toSet():<String>{};
@@ -829,7 +815,7 @@ class _MeowProfileBadgesState extends State<MeowProfileBadges> {
  void show(MeowBadgeDefinition badge){
    dismiss();shown=true;
    final overlay=Overlay.of(context,rootOverlay:true);
-   entry=OverlayEntry(builder:(c)=>Positioned(top:MediaQuery.viewPaddingOf(c).top+5,left:16,right:16,child:IgnorePointer(child:TweenAnimationBuilder<double>(tween:Tween<double>(begin:0,end:shown?1:0),duration:const Duration(milliseconds:230),curve:Curves.easeOutCubic,builder:(c,value,child)=>Opacity(opacity:value,child:Transform.translate(offset:Offset(0,-12*(1-value)),child:child)),child:Center(child:ConstrainedBox(constraints:const BoxConstraints(maxWidth:340),child:Material(color:const Color(0xFF0A0A0E),borderRadius:BorderRadius.circular(30),elevation:8,child:Padding(padding:const EdgeInsets.symmetric(horizontal:15,vertical:11),child:Row(mainAxisSize:MainAxisSize.min,children:[Icon(badge.icon,color:badge.color,size:22),const SizedBox(width:10),Flexible(child:Column(mainAxisSize:MainAxisSize.min,crossAxisAlignment:CrossAxisAlignment.start,children:[Text(badge.title,style:const TextStyle(color:Colors.white,fontSize:13,fontWeight:FontWeight.bold)),Text(badge.description,style:const TextStyle(color:Colors.white70,fontSize:11))]))])))))))));
+   entry=OverlayEntry(builder:(c)=>Positioned(top:MediaQuery.viewPaddingOf(c).top+5,left:16,right:16,child:IgnorePointer(child:TweenAnimationBuilder<double>(tween:Tween<double>(begin:0,end:shown?1:0),duration:const Duration(milliseconds:230),curve:Curves.easeOutCubic,builder:(c,value,child)=>Opacity(opacity:value,child:Transform.translate(offset:Offset(0,-12*(1-value)),child:child)),child:Center(child:ConstrainedBox(constraints:const BoxConstraints(maxWidth:340),child:Material(color:const Color(0xFF0A0A0E),borderRadius:BorderRadius.circular(30),elevation:8,child:Padding(padding:const EdgeInsets.symmetric(horizontal:15,vertical:11),child:Row(mainAxisSize:MainAxisSize.min,children:[meowBadgeArt(badge,size:36),const SizedBox(width:10),Flexible(child:Column(mainAxisSize:MainAxisSize.min,crossAxisAlignment:CrossAxisAlignment.start,children:[Text(badge.title,style:const TextStyle(color:Colors.white,fontSize:13,fontWeight:FontWeight.bold)),Text(badge.description,style:const TextStyle(color:Colors.white70,fontSize:11))]))])))))))));
    overlay.insert(entry!);
    fadeTimer=Timer(const Duration(milliseconds:4750),(){shown=false;entry?.markNeedsBuild();});
    removeTimer=Timer(const Duration(seconds:5),dismiss);
@@ -838,7 +824,7 @@ class _MeowProfileBadgesState extends State<MeowProfileBadges> {
  @override Widget build(BuildContext c){
    final ids=meowBadges(widget.data);if(ids.isEmpty)return const SizedBox.shrink();
    return Center(child:Container(margin:const EdgeInsets.symmetric(vertical:6),padding:const EdgeInsets.symmetric(horizontal:6),decoration:BoxDecoration(color:widget.background,borderRadius:BorderRadius.circular(18)),child:Wrap(alignment:WrapAlignment.center,crossAxisAlignment:WrapCrossAlignment.center,spacing:2,children:[
-     for(final badge in meowBadgeDefinitions)if(ids.contains(badge.id))IconButton(tooltip:badge.title,constraints:const BoxConstraints(minWidth:44,minHeight:44),padding:const EdgeInsets.all(2),icon:Image.asset('assets/badges/${badge.id}.png',width:38,height:38,fit:BoxFit.contain),onPressed:()=>show(badge))
+     for(final badge in meowBadgeDefinitions)if(ids.contains(badge.id))IconButton(tooltip:badge.title,constraints:const BoxConstraints(minWidth:44,minHeight:44),padding:const EdgeInsets.all(2),icon:meowBadgeArt(badge),onPressed:()=>show(badge))
    ])));
  }
 }
@@ -891,7 +877,7 @@ class _MeowBadgeAdminPageState extends State<MeowBadgeAdminPage> {
    TextField(controller:search,enabled:!busy,keyboardType:TextInputType.number,decoration:const InputDecoration(labelText:'ID Meow'),onSubmitted:(_)=>find()),
    const SizedBox(height:8),FilledButton(onPressed:busy?null:find,child:const Text('Buscar conta')),
    if(target!=null)...[const SizedBox(height:12),ListTile(leading:ProfileAvatar(uid:target!.id),title:Text(userLabel(target!.data()??{})),subtitle:Text(meowPublicId(target!.data()))),
-    for(final b in meowBadgeDefinitions)CheckboxListTile(secondary:Icon(b.icon,color:b.color),title:Text(b.title),subtitle:Text(b.description),value:selected.contains(b.id),onChanged:busy?null:(v)=>setState((){if(v==true){selected.add(b.id);}else{selected.remove(b.id);}})),
+    for(final b in meowBadgeDefinitions)CheckboxListTile(secondary:meowBadgeArt(b,size:36),title:Text(b.title),subtitle:Text(b.description),value:selected.contains(b.id),onChanged:busy?null:(v)=>setState((){if(v==true){selected.add(b.id);}else{selected.remove(b.id);}})),
     FilledButton(onPressed:busy?null:save,child:const Text('Salvar alterações'))],
    if(busy)const Padding(padding:EdgeInsets.all(12),child:LinearProgressIndicator())]));
 }
@@ -1007,8 +993,8 @@ class AppSettingsPage extends StatelessWidget {
 class MeowCacheMaintenance {
  static const key='meow_last_cache_cleanup_091';static bool busy=false;
  static Future<DateTime?> last()async{final p=await SharedPreferences.getInstance();final n=p.getInt(key);return n==null?null:DateTime.fromMillisecondsSinceEpoch(n);}
- static Future<void> maybeClean()async{try{final p=await last();if(p==null||DateTime.now().difference(p)>=const Duration(hours:12))await clean();}catch(e){debugPrint('Meow cache: $e');}}
- static Future<void> clean()async{if(busy)return;busy=true;try{PrivateMediaCache.purgeCompleted();await MeowVideoCache.clear();final prefs=await SharedPreferences.getInstance();await prefs.setInt(key,DateTime.now().millisecondsSinceEpoch);}finally{busy=false;}}
+ static Future<void> maybeClean()async{try{final p=await last();if(p==null||DateTime.now().difference(p)>=const Duration(hours:12))await clean(automatic:true);}catch(e){debugPrint('Meow cache: $e');}}
+ static Future<void> clean({bool automatic=false})async{if(busy)return;busy=true;try{if(automatic){PrivateMediaCache.pruneExpired();}else{PrivateMediaCache.purgeCompleted();}await MeowVideoCache.clear();final prefs=await SharedPreferences.getInstance();await prefs.setInt(key,DateTime.now().millisecondsSinceEpoch);}finally{busy=false;}}
 }
 class MeowStoragePage extends StatefulWidget{const MeowStoragePage({super.key});@override State<MeowStoragePage> createState()=>_MeowStoragePageState();}
 class _MeowStoragePageState extends State<MeowStoragePage>{
@@ -1020,7 +1006,7 @@ class _MeowStoragePageState extends State<MeowStoragePage>{
   if(!s.hasData&&!s.hasError)return const Center(child:CircularProgressIndicator());final d=s.data??{};
   final app=(d['app'] as num?)?.toInt(),user=(d['data'] as num?)?.toInt(),cache=(d['cache'] as num?)?.toInt();final total=app!=null&&user!=null&&cache!=null?app+user+cache:null;
   final values=[app,user,cache];final colors=[purple,Colors.lightBlueAccent,Colors.amber];final names=['Tamanho do aplicativo','Dados do usuário','Cache temporário'];
-  return ListView(padding:const EdgeInsets.all(18),children:[const SizedBox(height:12),const Text('Espaço total utilizado',textAlign:TextAlign.center,style:TextStyle(color:Colors.white70)),Text(total==null?'Indisponível':fileSizeLabel(total),textAlign:TextAlign.center,style:const TextStyle(fontSize:32,fontWeight:FontWeight.bold)),const SizedBox(height:20),if(total!=null&&total>0)ClipRRect(borderRadius:BorderRadius.circular(8),child:SizedBox(height:12,child:Row(children:[for(var i=0;i<3;i++)if((values[i]??0)>0)Expanded(flex:max(1,((values[i]??0)/total*1000).round()),child:ColoredBox(color:colors[i]))]))),const SizedBox(height:12),for(var i=0;i<3;i++)ListTile(contentPadding:EdgeInsets.zero,leading:Icon(Icons.circle,color:colors[i],size:12),title:Text(names[i]),trailing:Text(values[i]==null?'Indisponível':fileSizeLabel(values[i]!,preferMB:i==1),style:const TextStyle(fontWeight:FontWeight.w600))),const Divider(),const ListTile(contentPadding:EdgeInsets.zero,title:Text('Limpeza automática'),subtitle:Text('A cada 12 horas enquanto a Meow estiver em uso, ou na próxima abertura.'),trailing:Icon(Icons.schedule,color:purple)),Text('Última limpeza: ${d['last'] is DateTime?formatMeowTime(d['last'] as DateTime):'Ainda não realizada'}',style:const TextStyle(color:Colors.white54)),const SizedBox(height:16),FilledButton.icon(onPressed:busy?null:clean,icon:const Icon(Icons.delete_outline),label:Text(busy?'Limpando…':'Limpar cache temporário')),const SizedBox(height:8),const Text('A limpeza remove somente mídias temporárias da Meow. Os dados de login, mensagens, downloads e arquivos em uso são preservados.',style:TextStyle(color:Colors.white54,fontSize:12))]);
+  return ListView(padding:const EdgeInsets.all(18),children:[const SizedBox(height:12),const Text('Espaço total utilizado',textAlign:TextAlign.center,style:TextStyle(color:Colors.white70)),Text(total==null?'Indisponível':fileSizeLabel(total),textAlign:TextAlign.center,style:const TextStyle(fontSize:32,fontWeight:FontWeight.bold)),const SizedBox(height:20),if(total!=null&&total>0)ClipRRect(borderRadius:BorderRadius.circular(8),child:SizedBox(height:12,child:Row(children:[for(var i=0;i<3;i++)if((values[i]??0)>0)Expanded(flex:max(1,((values[i]??0)/total*1000).round()),child:ColoredBox(color:colors[i]))]))),const SizedBox(height:12),for(var i=0;i<3;i++)ListTile(contentPadding:EdgeInsets.zero,leading:Icon(Icons.circle,color:colors[i],size:12),title:Text(names[i]),trailing:Text(values[i]==null?'Indisponível':fileSizeLabel(values[i]!,preferMB:i==1),style:const TextStyle(fontWeight:FontWeight.w600))),const Divider(),const ListTile(contentPadding:EdgeInsets.zero,title:Text('Limpeza automática'),subtitle:Text('A cada 12 horas em uso, ou na próxima abertura. Remove mídias vencidas sem descartar o cache recente.'),trailing:Icon(Icons.schedule,color:purple)),Text('Última limpeza: ${d['last'] is DateTime?formatMeowTime(d['last'] as DateTime):'Ainda não realizada'}',style:const TextStyle(color:Colors.white54)),const SizedBox(height:16),FilledButton.icon(onPressed:busy?null:clean,icon:const Icon(Icons.delete_outline),label:Text(busy?'Limpando…':'Limpar cache temporário')),const SizedBox(height:8),const Text('A limpeza remove somente mídias temporárias da Meow. Os dados de login, mensagens, downloads e arquivos em uso são preservados.',style:TextStyle(color:Colors.white54,fontSize:12))]);
  }));
 }
 class NotificationSettingsPage extends StatefulWidget {
@@ -1195,12 +1181,33 @@ class ServerSettingsPage extends StatelessWidget {
         Widget section(String title,List<Widget> children)=>children.isEmpty?const SizedBox.shrink():Padding(padding:const EdgeInsets.fromLTRB(14,16,14,6),child:Column(crossAxisAlignment:CrossAxisAlignment.start,children:[Text(title,style:const TextStyle(color:Colors.white70,fontSize:14)),const SizedBox(height:8),Card(color:panel,margin:EdgeInsets.zero,child:Column(children:[for(var i=0;i<children.length;i++)...[if(i>0)const Divider(height:1,indent:54),children[i]]]))]));
         Widget link(IconData icon,String title,VoidCallback action)=>ListTile(leading:Icon(icon),title:Text(title),trailing:const Icon(Icons.chevron_right),onTap:action);
         void go(Widget page)=>Navigator.push(c,MaterialPageRoute(builder:(_)=>page));
-        return ListView(children:[const SizedBox(height:28),Center(child:PrivateImage(scope:'server',id:id,slot:'avatar',size:88)),const SizedBox(height:12),Text(d['name']?.toString()??'Servidor',textAlign:TextAlign.center,style:const TextStyle(fontSize:22,fontWeight:FontWeight.bold)),const SizedBox(height:16),
-        section('Configurações',[link(Icons.info_outline,'Visão geral',()=>go(Scaffold(appBar:AppBar(title:const Text('Visão geral')),body:ListView(padding:const EdgeInsets.all(16),children:[PrivateImage(scope:'server',id:id,slot:'banner',size:160),const SizedBox(height:12),Text(d['name']?.toString()??'Servidor'),if(owner)...[ListTile(title:const Text('Renomear servidor'),trailing:const Icon(Icons.edit),onTap:()async{try{final v=await showTextPrompt(c,'Nome do servidor',d['name']?.toString()??'');if(v!=null&&v.isNotEmpty)await db.collection('servers').doc(id).update({'name':v});if(c.mounted)Navigator.pop(c);}catch(e){if(c.mounted)notice(c,e);}}),ChangeImage('server',id,'avatar','Trocar ícone (${fileSizeLabel(avatarLimit)})'),ChangeImage('server',id,'banner','Trocar banner (${fileSizeLabel(bannerLimit)})'),MeowEveryoneSetting(server:id)]])))),if(owner)link(Icons.list,'Canais e categorias',()=>go(ServerOrganizationPage(id:id)))]),
+        return ListView(children:[
+        section('Configurações',[link(Icons.info_outline,'Visão geral',()=>go(MeowServerOverview(id:id))),if(owner)link(Icons.list,'Canais e categorias',()=>go(ServerOrganizationPage(id:id)))]),
         section('Expressões',[if(canExpress)link(Icons.emoji_emotions_outlined,'Emojis e figurinhas',()=>go(ExpressionSettings(server:id)))]),
         section('Pessoas',[link(Icons.group_outlined,'Membros',()=>showMeowMembers(c,id)),if(owner)link(Icons.link,'Convites',()=>go(Scaffold(appBar:AppBar(title:const Text('Convites')),body:MeowInvitesPage(server:id,name:d['name']?.toString()??'Servidor')))),if(owner)link(Icons.waving_hand_outlined,'Boas-vindas',()=>go(MeowWelcomeSettings(server:id)))]),
         section('Gerenciamento',[if(owner)ListTile(leading:const Icon(Icons.delete_outline,color:Colors.redAccent),title:const Text('Apagar servidor',style:TextStyle(color:Colors.redAccent)),onTap:()async{final done=await confirmServerDelete(pageContext,id);if(done&&pageContext.mounted&&ModalRoute.of(pageContext)?.isCurrent==true)Navigator.pop(pageContext);})else ListTile(leading:const Icon(Icons.logout),title:const Text('Sair do servidor'),onTap:()=>confirmLeaveServer(c,id))]),const SizedBox(height:20)]);
       }));
+}
+class MeowServerOverview extends StatelessWidget {
+ final String id;
+ const MeowServerOverview({super.key,required this.id});
+ @override Widget build(BuildContext c)=>Scaffold(appBar:AppBar(title:const Text('Visão geral')),
+   body:MeowStreamBuilder<DocumentSnapshot<Map<String,dynamic>>>(stream:db.collection('servers').doc(id).meowSnapshots(),builder:(c,s){
+     if(s.hasError)return const Center(child:Text('Não foi possível carregar o servidor.'));
+     if(!s.hasData)return const Center(child:CircularProgressIndicator());
+     final d=s.data?.data();if(d==null||d['deleting']==true)return const Center(child:Text('Servidor indisponível.'));
+     final owner=d['ownerId']==myUid;
+     return ListView(padding:const EdgeInsets.all(16),children:[
+       SizedBox(height:202,child:Stack(alignment:Alignment.topCenter,children:[
+         PrivateImage(scope:'server',id:id,slot:'banner',size:160),
+         Positioned(bottom:0,child:Container(padding:const EdgeInsets.all(3),decoration:const BoxDecoration(color:bg,shape:BoxShape.circle),child:PrivateImage(scope:'server',id:id,slot:'avatar',size:84))),
+       ])),
+       const SizedBox(height:12),Text(d['name']?.toString()??'Servidor',textAlign:TextAlign.center,style:const TextStyle(fontSize:22,fontWeight:FontWeight.bold)),
+       if(owner)...[const SizedBox(height:20),ListTile(title:const Text('Renomear servidor'),trailing:const Icon(Icons.edit),onTap:()async{try{final v=await showTextPrompt(c,'Nome do servidor',d['name']?.toString()??'');if(v!=null&&v.isNotEmpty){await db.collection('servers').doc(id).update({'name':v});if(c.mounted)notice(c,'Nome atualizado.');}}catch(e){if(c.mounted)notice(c,e);}}),
+         ChangeImage('server',id,'avatar','Trocar ícone (${fileSizeLabel(avatarLimit)})'),
+         ChangeImage('server',id,'banner','Trocar banner (${fileSizeLabel(bannerLimit)})'),MeowEveryoneSetting(server:id)],
+     ]);
+   }));
 }
 class MeowEveryoneSetting extends StatelessWidget{
  final String server;const MeowEveryoneSetting({super.key,required this.server});
@@ -1465,10 +1472,6 @@ class _SocialHomeState extends State<SocialHome> with WidgetsBindingObserver {
       if (mounted) notice(context, 'Não foi possível criar o canal: $e');
     }
   }
-  Future<void> createInvite()async{
-    final id=serverId;if(id==null)return;
-    try{final d=(await db.collection('servers').doc(id).get()).data();if(!mounted)return;if(d?['ownerId']!=myUid){notice(context,'Somente o proprietário pode criar convites.');return;}await showModalBottomSheet<void>(context:context,isScrollControlled:true,showDragHandle:true,backgroundColor:panel,builder:(c)=>SafeArea(child:SizedBox(height:MediaQuery.sizeOf(c).height*.78,child:MeowInvitesPage(server:id,name:d?['name']?.toString()??'Servidor'))));}catch(e){if(mounted)notice(context,e);}
-  }
   Future<void> openInviteLink(Uri uri)async{
     final code=meowInviteCode(uri.toString());if(code==null||openingInvite||lastInviteLink==code||!mounted)return;lastInviteLink=code;openingInvite=true;
     try{await joinWithCode(code);}finally{openingInvite=false;lastInviteLink=null;}
@@ -1556,7 +1559,7 @@ class _SocialHomeState extends State<SocialHome> with WidgetsBindingObserver {
         final activeDoc=docs.where((d)=>d.id==active);
         final activeName=activeDoc.isEmpty?'canal':activeDoc.first.data()['name']?.toString()??'canal';
         return ChannelSlide(open:showingChannels,onMembers:()=>showMeowMembers(context,selected),onChange:(v){if(v)FocusManager.instance.primaryFocus?.unfocus();setState(()=>showingChannels=v);},
-          list:Row(children:[rail(),Expanded(child:ColoredBox(color:panel,child:Column(children:[MeowCompactServerHeader(id:serverId!),Row(children:[const Expanded(child:Padding(padding:EdgeInsets.all(12),child:Text('Canais',style:TextStyle(fontSize:18)))),IconButton(onPressed:createChannel,icon:const Icon(Icons.add)),IconButton(onPressed:createInvite,icon:const Icon(Icons.share))]),Expanded(child:channelList(docs))])))]),
+          list:Row(children:[rail(),Expanded(child:ColoredBox(color:panel,child:Column(children:[MeowCompactServerHeader(id:serverId!),Row(children:[const Expanded(child:Padding(padding:EdgeInsets.all(12),child:Text('Canais',style:TextStyle(fontSize:18)))),IconButton(onPressed:createChannel,icon:const Icon(Icons.add))]),Expanded(child:channelList(docs))])))]),
           chat:Column(children:[ListTile(leading:IconButton(icon:const Icon(Icons.arrow_back),onPressed:(){FocusManager.instance.primaryFocus?.unfocus();setState(()=>showingChannels=true);}),title:InkWell(onTap:()=>showMeowMembers(context,selected),child:MeowChannelTitle(server:selected,name:activeName)),trailing:active==null?null:Row(mainAxisSize:MainAxisSize.min,children:[MuteButton(thread:'server:$selected:$active'),MeowSearchButton(collection:db.collection('servers').doc(selected).collection('channels').doc(active).collection('messages'),openResult:(c,message)=>Navigator.pushReplacement(c,MaterialPageRoute(builder:(_)=>MeowChannelHistoryPage(server:selected,channel:active,name:activeName,uid:myUid,initialMessageId:message))))])),Expanded(child:active==null?const Center(child:Text('Sem canais')):MessageThread(key:ValueKey('$serverId/$active'),collection:db.collection('servers').doc(serverId).collection('channels').doc(active).collection('messages'),uid:myUid,serverId:serverId,threadId:'server:$serverId:$active',visible:!showingChannels&&tab==2))]));
       });
   }
@@ -2800,18 +2803,18 @@ class ProfileBackground extends StatefulWidget {
  final String uid; const ProfileBackground({super.key,required this.uid});
  @override State<ProfileBackground> createState()=>_ProfileBackgroundState();
 }
-class _ProfileBackgroundState extends State<ProfileBackground> {
- late Future<Uint8List?> future;String revision='';int epoch=0;
+class _ProfileBackgroundState extends State<ProfileBackground>{
+ Future<Uint8List?>? future;String revision='';int epoch=0;bool known=false,profileExists=false;
  StreamSubscription<DocumentSnapshot<Map<String,dynamic>>>? sub;
  Uri get url=>mediaUrl('profile',widget.uid,'background');
  Uri get versionUrl=>revision.isEmpty?url:url.replace(queryParameters:{...url.queryParameters,'revision':revision});
- void refresh(){if(mounted&&changedImage.value==url)setState(()=>future=PrivateMediaCache.get(versionUrl));}
- void watch(){sub?.cancel();sub=null;final generation=++epoch;if(!TickerMode.of(context))return;sub=db.collection('users').doc(widget.uid).meowSnapshots().listen((snap){if(!mounted||generation!=epoch)return;final next=snap.data()?['backgroundRevision']?.toString()??'';if(next!=revision)setState((){revision=next;future=PrivateMediaCache.get(versionUrl);});},onError:(Object _){});}
- @override void initState(){super.initState();future=PrivateMediaCache.get(url);changedImage.addListener(refresh);}
+ void refresh(){if(mounted&&known&&changedImage.value==url)setState(()=>future=PrivateMediaCache.get(versionUrl));}
+ void watch(){if(!TickerMode.of(context)){if(sub!=null){epoch++;sub?.cancel();sub=null;}return;}if(sub!=null)return;final generation=++epoch;sub=db.collection('users').doc(widget.uid).meowSnapshots().listen((snap){if(!mounted||generation!=epoch)return;final next=snap.data()?['backgroundRevision']?.toString()??'';if(!known||next!=revision||snap.exists!=profileExists)setState((){known=true;profileExists=snap.exists;revision=next;future=snap.exists?PrivateMediaCache.get(versionUrl):Future<Uint8List?>.value(null);});},onError:(Object _){});}
+ @override void initState(){super.initState();changedImage.addListener(refresh);}
  @override void didChangeDependencies(){super.didChangeDependencies();watch();}
- @override void didUpdateWidget(covariant ProfileBackground old){super.didUpdateWidget(old);if(old.uid!=widget.uid){revision='';future=PrivateMediaCache.get(url);watch();}}
+ @override void didUpdateWidget(covariant ProfileBackground old){super.didUpdateWidget(old);if(old.uid!=widget.uid){epoch++;sub?.cancel();sub=null;revision='';known=false;profileExists=false;future=null;watch();}}
  @override void dispose(){epoch++;sub?.cancel();changedImage.removeListener(refresh);super.dispose();}
- @override Widget build(BuildContext c)=>FutureBuilder<Uint8List?>(key:ValueKey(versionUrl),future:future,builder:(c,s)=>s.data==null?const SizedBox.shrink():Stack(fit:StackFit.expand,children:[meowPreview(c,s.data!,width:0,height:0,fit:BoxFit.cover,errorBuilder:(c,e,st)=>const SizedBox.shrink()),const ColoredBox(color:Color(0x99000000))]));
+ @override Widget build(BuildContext c)=>FutureBuilder<Uint8List?>(key:ValueKey(url),future:future,builder:(c,s)=>s.data==null?const SizedBox.shrink():Stack(fit:StackFit.expand,children:[meowPreview(c,s.data!,width:0,height:0,fit:BoxFit.cover,errorBuilder:(c,e,st)=>const SizedBox.shrink()),const ColoredBox(color:Color(0x99000000))]));
 }
 class TypingLabel extends StatefulWidget {
  final CollectionReference<Map<String,dynamic>> collection;final String uid;
@@ -3352,10 +3355,58 @@ class MeowAccountDrawer extends StatelessWidget {
   const Divider(),ListTile(leading:const Icon(Icons.settings_outlined),title:const Text('Configurações'),onTap:()=>go(c,const AppSettingsPage())),
  ])));
 }
-class MeowSectionUnread extends StatelessWidget{
+class MeowUnreadMark extends StatelessWidget{
+ final bool unread;const MeowUnreadMark({super.key,required this.unread});
+ @override Widget build(BuildContext c)=>SizedBox(width:10,height:10,child:unread?const Semantics(label:'Mensagens não lidas',child:DecoratedBox(decoration:BoxDecoration(color:Color(0xFF39F57A),shape:BoxShape.circle))):null);
+}
+class _SectionThread {
+ final CollectionReference<Map<String,dynamic>> collection;
+ StreamSubscription<QuerySnapshot<Map<String,dynamic>>>? messages;
+ StreamSubscription<DocumentSnapshot<Map<String,dynamic>>>? receipt;
+ List<QueryDocumentSnapshot<Map<String,dynamic>>> items=[];Timestamp? seen;bool receiptReady=false;
+ _SectionThread(this.collection);
+ bool unread(String uid)=>receiptReady&&items.any((d){final m=d.data();final t=m['createdAt'];return m['authorId']!=uid&&t is Timestamp&&(seen==null||t.compareTo(seen!)>0);});
+ void close(){messages?.cancel();receipt?.cancel();}
+}
+class MeowSectionUnread extends StatefulWidget{
  final String uid;final bool servers;const MeowSectionUnread({super.key,required this.uid,required this.servers});
- Widget thread(String id,CollectionReference<Map<String,dynamic>> collection)=>MeowStreamBuilder<DocumentSnapshot<Map<String,dynamic>>>(stream:receiptRef(id,uid).meowSnapshots(),builder:(c,r){if(!r.hasData)return const SizedBox.shrink();final seen=r.data?.data()?['at'];Query<Map<String,dynamic>> q=collection.orderBy('createdAt',descending:true);if(seen is Timestamp)q=q.where('createdAt',isGreaterThan:seen);return MeowStreamBuilder<QuerySnapshot<Map<String,dynamic>>>(stream:q.limit(100).meowSnapshots(),builder:(c,s)=>s.data?.docs.any((d)=>d.data()['authorId']!=uid)==true?const Icon(Icons.circle,color:Color(0xFF39F57A),size:10):const SizedBox.shrink());});
- @override Widget build(BuildContext c)=>SizedBox(width:10,height:10,child:MeowStreamBuilder<QuerySnapshot<Map<String,dynamic>>>(stream:db.collection(servers?'servers':'dms').where('members',arrayContains:uid).meowSnapshots(),builder:(c,s)=>Stack(fit:StackFit.expand,children:[for(final d in s.data?.docs??[])if(servers)MeowStreamBuilder<QuerySnapshot<Map<String,dynamic>>>(key:ValueKey(d.id),stream:d.reference.collection('channels').meowSnapshots(),builder:(c,ch)=>Stack(fit:StackFit.expand,children:[for(final x in ch.data?.docs??[])KeyedSubtree(key:ValueKey(x.id),child:thread('server:${d.id}:${x.id}',x.reference.collection('messages')))]))else KeyedSubtree(key:ValueKey(d.id),child:thread('dm:${d.id}',d.reference.collection('messages')))])));
+ @override State<MeowSectionUnread> createState()=>_MeowSectionUnreadState();
+}
+class _MeowSectionUnreadState extends State<MeowSectionUnread>{
+ StreamSubscription<QuerySnapshot<Map<String,dynamic>>>? root;
+ final channels=<String,StreamSubscription<QuerySnapshot<Map<String,dynamic>>>>{};
+ final threads=<String,_SectionThread>{};
+ int epoch=0;bool queued=false,unread=false;
+ void refresh(){if(queued)return;queued=true;WidgetsBinding.instance.addPostFrameCallback((_){queued=false;if(!mounted)return;final next=threads.values.any((t)=>t.unread(widget.uid));if(next!=unread)setState(()=>unread=next);});WidgetsBinding.instance.ensureVisualUpdate();}
+ void drop(String id){threads.remove(id)?.close();}
+ void watchThread(String id,CollectionReference<Map<String,dynamic>> collection){
+   if(threads.containsKey(id))return;final t=_SectionThread(collection);threads[id]=t;final generation=epoch;
+   bool valid()=>mounted&&generation==epoch&&identical(threads[id],t);
+   t.receipt=receiptRef(id,widget.uid).meowSnapshots().listen((s){if(!valid())return;final value=s.data()?['at'];t.seen=value is Timestamp?value:null;t.receiptReady=true;refresh();},onError:(Object _){if(valid()){t.receiptReady=false;refresh();}});
+   // Share identical query with the chat list and server unread indicators.
+   t.messages=collection.orderBy('createdAt',descending:true).limit(100).meowSnapshots().listen((s){if(valid()){t.items=s.docs;refresh();}},onError:(Object _){if(valid()){t.items=[];refresh();}});
+ }
+ void removeServer(String id){channels.remove(id)?.cancel();for(final key in threads.keys.where((k)=>k.startsWith('server:$id:')).toList()){drop(key);}}
+ void resume(){if(root!=null)return;final generation=++epoch;
+   root=db.collection(widget.servers?'servers':'dms').where('members',arrayContains:widget.uid).meowSnapshots().listen((s){
+     if(!mounted||generation!=epoch)return;
+     final docs=s.docs.where((d)=>d.data()['deleting']!=true).toList();final ids=docs.map((d)=>d.id).toSet();
+     if(widget.servers){
+       for(final id in channels.keys.toList()){if(!ids.contains(id))removeServer(id);}
+       for(final d in docs){if(channels.containsKey(d.id))continue;
+         late StreamSubscription<QuerySnapshot<Map<String,dynamic>>> sub;
+         sub=d.reference.collection('channels').meowSnapshots().listen((cs){if(!mounted||generation!=epoch||!identical(channels[d.id],sub))return;final keys=cs.docs.map((x)=>'server:${d.id}:${x.id}').toSet();for(final key in threads.keys.where((k)=>k.startsWith('server:${d.id}:')&&!keys.contains(k)).toList()){drop(key);}for(final x in cs.docs){watchThread('server:${d.id}:${x.id}',x.reference.collection('messages'));}refresh();},onError:(Object _){if(mounted&&generation==epoch&&identical(channels[d.id],sub)){for(final key in threads.keys.where((k)=>k.startsWith('server:${d.id}:')).toList()){drop(key);}refresh();}});
+         channels[d.id]=sub;
+       }
+     }else{for(final key in threads.keys.toList()){if(!ids.contains(key.substring(3)))drop(key);}for(final d in docs){watchThread('dm:${d.id}',d.reference.collection('messages'));}}
+     refresh();
+   },onError:(Object _){if(mounted&&generation==epoch){for(final id in channels.keys.toList()){removeServer(id);}for(final key in threads.keys.toList()){drop(key);}refresh();}});
+ }
+ void suspend(){epoch++;root?.cancel();root=null;for(final sub in channels.values){sub.cancel();}channels.clear();for(final t in threads.values){t.close();}threads.clear();unread=false;}
+ @override void didChangeDependencies(){super.didChangeDependencies();if(TickerMode.of(context)){resume();}else{suspend();}}
+ @override void didUpdateWidget(covariant MeowSectionUnread old){super.didUpdateWidget(old);if(old.uid!=widget.uid||old.servers!=widget.servers){suspend();if(TickerMode.of(context))resume();}}
+ @override void dispose(){suspend();super.dispose();}
+ @override Widget build(BuildContext c)=>MeowUnreadMark(unread:unread);
 }
 class MeowBottomBar extends StatelessWidget {
  final int index;final ValueChanged<int> onSelected;
