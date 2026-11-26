@@ -2146,23 +2146,50 @@ class _MessageThreadState extends State<MessageThread> with RouteAware,WidgetsBi
       if(expression!=null)data['expression']=expression;
       if(widget.serverId!=null&&everyoneAllowed&&mentionNames(text).contains('everyone'))data['everyoneMention']=true;
       final sent=widget.collection.doc();
-      if(widget.serverId==null){
-        final dm=widget.collection.parent!;
-        final request=db.collection('dmRequests').doc(dm.id);
-        await db.runTransaction((tx)async{
-          final room=await tx.get(dm);final members=List<String>.from(room.data()?['members']??[]);
-          if(members.length!=2||!members.contains(widget.uid))throw Exception('Conversa indisponível.');
-          final other=members.firstWhere((x)=>x!=widget.uid);
-          final req=await tx.get(request);
-          final a=await tx.get(db.collection('users').doc(widget.uid).collection('following').doc(other));
-          final b=await tx.get(db.collection('users').doc(other).collection('following').doc(widget.uid));
-          final direct=a.exists&&b.exists;
-          final status=req.data()?['status'];
-          if(!direct&&req.exists&&status!='accepted'&&!(status=='pending'&&req.data()?['from']==widget.uid))throw Exception('É necessário aceitar a conversa antes de responder.');
-          if(!direct&&!req.exists)tx.set(request,{'from':widget.uid,'to':other,'status':'pending','createdAt':FieldValue.serverTimestamp(),'firstMessageId':sent.id});
-          tx.set(sent,data);
-        });
-      }else{await sent.set(data);}
+      Future<void> writeMessage() async {
+        if(widget.serverId==null){
+          final dm=widget.collection.parent!;
+          final request=db.collection('dmRequests').doc(dm.id);
+          await db.runTransaction((tx)async{
+            final room=await tx.get(dm);final members=List<String>.from(room.data()?['members']??[]);
+            if(members.length!=2||!members.contains(widget.uid))throw Exception('Conversa indisponível.');
+            final other=members.firstWhere((x)=>x!=widget.uid);
+            final req=await tx.get(request);
+            final a=await tx.get(db.collection('users').doc(widget.uid).collection('following').doc(other));
+            final b=await tx.get(db.collection('users').doc(other).collection('following').doc(widget.uid));
+            final direct=a.exists&&b.exists;
+            final status=req.data()?['status'];
+            if(!direct&&req.exists&&status!='accepted'&&!(status=='pending'&&req.data()?['from']==widget.uid))throw Exception('É necessário aceitar a conversa antes de responder.');
+            if(!direct&&!req.exists)tx.set(request,{'from':widget.uid,'to':other,'status':'pending','createdAt':FieldValue.serverTimestamp(),'firstMessageId':sent.id});
+            tx.set(sent,data);
+          });
+        }else{await sent.set(data);}
+      }
+      try {
+        await writeMessage();
+      } on FirebaseException catch (error) {
+        final canRetry = error.code == 'permission-denied' &&
+            FirebaseAuth.instance.currentUser?.uid == widget.uid &&
+            attachments.any((a) => a['contentType'] is String &&
+                (a['contentType'] as String).startsWith('video/') &&
+                a.containsKey('thumbnailId'));
+        if (!canRetry) rethrow;
+        // A rejected write did not create the message. Reuse the same document
+        // and uploaded files, omitting only optional video previews.
+        final withoutPreviews = attachments.map((a) {
+          final copy = Map<String, dynamic>.from(a);
+          if (copy['contentType'] is String &&
+              (copy['contentType'] as String).startsWith('video/')) {
+            copy.remove('thumbnailId');
+          }
+          return copy;
+        }).toList();
+        data['attachment'] = withoutPreviews.first;
+        if (withoutPreviews.length > 1) {
+          data['attachments'] = withoutPreviews;
+        }
+        await writeMessage();
+      }
       unawaited(notifyMessage(sent.path));
       if(!mounted)return true;
       if(input.text==draftAtSend){input.clear();unawaited(stopTyping());}
@@ -3808,8 +3835,9 @@ class _MeowWelcomeSettingsState extends State<MeowWelcomeSettings>{
  @override Widget build(BuildContext c)=>Scaffold(appBar:AppBar(title:const Text('Boas-vindas')),body:MeowStreamBuilder<DocumentSnapshot<Map<String,dynamic>>>(stream:db.collection('servers').doc(widget.server).meowSnapshots(),builder:(c,s){if(!s.hasData)return const Center(child:CircularProgressIndicator());final d=s.data!.data()??{};final enabled=d['welcomeEnabled']!=false;final selected=d['welcomeChannelId']?.toString()??'';return MeowStreamBuilder<QuerySnapshot<Map<String,dynamic>>>(stream:db.collection('servers').doc(widget.server).collection('channels').meowSnapshots(),builder:(c,ch){final docs=ch.data?.docs??[];return ListView(padding:const EdgeInsets.all(12),children:[SwitchListTile(title:const Text('Mensagens de boas-vindas'),value:enabled,onChanged:busy?null:(v)=>save(v,selected)),ListTile(title:const Text('Canal de boas-vindas'),subtitle:const Text('O canal geral é usado por padrão.')),DropdownButtonFormField<String>(value:docs.any((x)=>x.id==selected)?selected:'',items:[const DropdownMenuItem(value:'',child:Text('Canal principal')),for(final x in docs)DropdownMenuItem(value:x.id,child:Text('# ${x.data()['name']??'canal'}'))],onChanged:busy?null:(v){if(v!=null)save(enabled,v);})]);});}));
 }
 
-// Permission is requested only on opening the gallery explicitly. The OS
-// picker remains available without granting the app broad photo access.
+// Load the gallery when the attachment sheet opens. Check the current OS
+// permission before requesting it, and never prompt repeatedly after denial.
+// The native picker remains available without broad photo access.
 class MeowAttachmentPicker extends StatefulWidget {
  final int maxCount;const MeowAttachmentPicker({super.key,required this.maxCount});
  @override State<MeowAttachmentPicker> createState()=>_MeowAttachmentPickerState();
@@ -3820,9 +3848,26 @@ class _MeowAttachmentPickerState extends State<MeowAttachmentPicker>{
  final thumbs=<String,Future<Uint8List?>>{};
  gallery.AssetPathEntity? album;
  bool busy=false,opened=false,more=true;String? error;int page=0;
- Future<void> openGallery()async{
-  if(busy)return;setState((){busy=true;error=null;});
-  try{final permission=await gallery.PhotoManager.requestPermissionExtend();if(!mounted)return;if(permission!=gallery.PermissionState.authorized&&permission!=gallery.PermissionState.limited){setState(()=>error='Sem acesso à galeria. Use o seletor do celular.');return;}
+ static const _galleryAskedKey='meow.gallery.permissionAsked.v1';
+ @override void initState(){
+  super.initState();
+  WidgetsBinding.instance.addPostFrameCallback((_) {if(mounted)unawaited(openGallery(automatic:true));});
+ }
+ bool hasGalleryAccess(gallery.PermissionState state)=>state==gallery.PermissionState.authorized||state==gallery.PermissionState.limited;
+ Future<void> openGallery({bool automatic=false})async{
+  if(!mounted||busy)return;setState((){busy=true;error=null;});
+  try{
+   const option=gallery.PermissionRequestOption();
+   var permission=await gallery.PhotoManager.getPermissionState(requestOption:option);
+   if(!mounted)return;
+   if(!hasGalleryAccess(permission)){
+    final prefs=await SharedPreferences.getInstance();if(!mounted)return;
+    if(!automatic||prefs.getBool(_galleryAskedKey)!=true){
+     await prefs.setBool(_galleryAskedKey,true);if(!mounted)return;
+     permission=await gallery.PhotoManager.requestPermissionExtend(requestOption:option);if(!mounted)return;
+    }
+   }
+   if(!hasGalleryAccess(permission)){setState(()=>error='Sem acesso à galeria. Permita nas configurações ou use o seletor do celular.');return;}
    final albums=await gallery.PhotoManager.getAssetPathList(onlyAll:true,type:gallery.RequestType.common);if(!mounted)return;
    setState((){opened=true;items.clear();selected.clear();thumbs.clear();page=0;album=albums.isEmpty?null:albums.first;more=album!=null;});if(album!=null)await fetchPage();
   }catch(_){if(mounted)setState(()=>error='Não foi possível abrir a galeria.');}finally{if(mounted)setState(()=>busy=false);}
@@ -3832,5 +3877,5 @@ class _MeowAttachmentPickerState extends State<MeowAttachmentPicker>{
  Future<void> native(bool documents)async{if(busy)return;setState(()=>busy=true);try{final result=documents?await files.openFiles():await ImagePicker().pickMultipleMedia(requestFullMetadata:false);if(mounted&&result.isNotEmpty)Navigator.pop(context,result.take(widget.maxCount).toList());}catch(_){if(mounted)setState(()=>error='Não foi possível abrir o seletor.');}finally{if(mounted)setState(()=>busy=false);}}
  Future<void> confirm()async{if(busy||selected.isEmpty)return;setState(()=>busy=true);try{final result=<files.XFile>[];for(final asset in selected.values){final f=await asset.originFile;if(f!=null)result.add(files.XFile(f.path));}if(!mounted)return;if(result.length!=selected.length){setState(()=>error='Alguma mídia não está disponível. Tente o seletor do celular.');return;}Navigator.pop(context,result);}catch(_){if(mounted)setState(()=>error='Não foi possível preparar os anexos.');}finally{if(mounted)setState(()=>busy=false);}}
  Future<Uint8List?> thumb(gallery.AssetEntity a){if(thumbs.length>=120&&!thumbs.containsKey(a.id))thumbs.remove(thumbs.keys.first);return thumbs.putIfAbsent(a.id,()=>a.thumbnailDataWithSize(const gallery.ThumbnailSize(160,160)));}
- @override Widget build(BuildContext c)=>SafeArea(child:SizedBox(height:MediaQuery.sizeOf(c).height*.68,child:Column(children:[Padding(padding:const EdgeInsets.symmetric(horizontal:16),child:Row(children:[const Expanded(child:Text('Adicionar anexos',style:TextStyle(fontSize:18,fontWeight:FontWeight.bold))),Text('${selected.length}/${widget.maxCount}')])),if(busy)const LinearProgressIndicator(),if(error!=null)Padding(padding:const EdgeInsets.all(8),child:Text(error!,style:const TextStyle(color:Colors.orangeAccent))),Expanded(child:!opened?Center(child:FilledButton.icon(onPressed:busy?null:openGallery,icon:const Icon(Icons.photo_library_outlined),label:const Text('Mostrar galeria'))):items.isEmpty?const Center(child:Text('Nenhuma mídia disponível.')):GridView.builder(padding:const EdgeInsets.all(8),gridDelegate:const SliverGridDelegateWithFixedCrossAxisCount(crossAxisCount:4,crossAxisSpacing:4,mainAxisSpacing:4),itemCount:items.length+(more?1:0),itemBuilder:(c,i){if(i==items.length)return IconButton(onPressed:busy?null:next,icon:const Icon(Icons.expand_more),tooltip:'Carregar mais');final a=items[i];final checked=selected.containsKey(a.id);return InkWell(onTap:busy?null:(){setState((){if(checked){selected.remove(a.id);}else if(selected.length<widget.maxCount){selected[a.id]=a;}});},child:Stack(fit:StackFit.expand,children:[FutureBuilder<Uint8List?>(future:thumb(a),builder:(c,s)=>s.data==null?const ColoredBox(color:meowComposerColor,child:Icon(Icons.image_outlined)):Image.memory(s.data!,fit:BoxFit.cover,cacheWidth:160,gaplessPlayback:true)),if(a.type==gallery.AssetType.video)const Positioned(left:4,bottom:4,child:Icon(Icons.play_circle_fill,color:Colors.white,size:20)),if(checked)Container(decoration:BoxDecoration(border:Border.all(color:purple,width:3),color:Colors.black26)),Positioned(top:3,right:3,child:Icon(checked?Icons.check_circle:Icons.radio_button_unchecked,color:checked?purple:Colors.white,size:23))]));})),const Divider(height:1),Padding(padding:const EdgeInsets.all(8),child:Row(children:[Expanded(child:TextButton.icon(onPressed:busy?null:()=>native(false),icon:const Icon(Icons.photo_outlined),label:const Text('Galeria'))),Expanded(child:TextButton.icon(onPressed:busy?null:()=>native(true),icon:const Icon(Icons.attach_file),label:const Text('Arquivos'))),FilledButton(onPressed:busy||selected.isEmpty?null:confirm,child:const Text('Adicionar'))])),Text('Até ${fileSizeLabel(attachmentLimit)} por arquivo',style:const TextStyle(fontSize:12,color:Colors.white54)),const SizedBox(height:6)])));
+ @override Widget build(BuildContext c)=>SafeArea(child:SizedBox(height:MediaQuery.sizeOf(c).height*.68,child:Column(children:[Padding(padding:const EdgeInsets.symmetric(horizontal:16),child:Row(children:[const Expanded(child:Text('Adicionar anexos',style:TextStyle(fontSize:18,fontWeight:FontWeight.bold))),Text('${selected.length}/${widget.maxCount}')])),if(busy)const LinearProgressIndicator(),if(error!=null)Padding(padding:const EdgeInsets.all(8),child:Text(error!,style:const TextStyle(color:Colors.orangeAccent))),Expanded(child:!opened?Center(child:busy?const CircularProgressIndicator():FilledButton.icon(onPressed:()=>openGallery(),icon:const Icon(Icons.photo_library_outlined),label:const Text('Permitir acesso à galeria'))):items.isEmpty?Center(child:busy?const CircularProgressIndicator():const Text('Nenhuma mídia disponível.')):GridView.builder(padding:const EdgeInsets.all(8),gridDelegate:const SliverGridDelegateWithFixedCrossAxisCount(crossAxisCount:4,crossAxisSpacing:4,mainAxisSpacing:4),itemCount:items.length+(more?1:0),itemBuilder:(c,i){if(i==items.length)return IconButton(onPressed:busy?null:next,icon:const Icon(Icons.expand_more),tooltip:'Carregar mais');final a=items[i];final checked=selected.containsKey(a.id);return InkWell(onTap:busy?null:(){setState((){if(checked){selected.remove(a.id);}else if(selected.length<widget.maxCount){selected[a.id]=a;}});},child:Stack(fit:StackFit.expand,children:[FutureBuilder<Uint8List?>(future:thumb(a),builder:(c,s)=>s.data==null?const ColoredBox(color:meowComposerColor,child:Icon(Icons.image_outlined)):Image.memory(s.data!,fit:BoxFit.cover,cacheWidth:160,gaplessPlayback:true)),if(a.type==gallery.AssetType.video)const Positioned(left:4,bottom:4,child:Icon(Icons.play_circle_fill,color:Colors.white,size:20)),if(checked)Container(decoration:BoxDecoration(border:Border.all(color:purple,width:3),color:Colors.black26)),Positioned(top:3,right:3,child:Icon(checked?Icons.check_circle:Icons.radio_button_unchecked,color:checked?purple:Colors.white,size:23))]));})),const Divider(height:1),Padding(padding:const EdgeInsets.all(8),child:Row(children:[Expanded(child:TextButton.icon(onPressed:busy?null:()=>native(false),icon:const Icon(Icons.photo_outlined),label:const Text('Galeria'))),Expanded(child:TextButton.icon(onPressed:busy?null:()=>native(true),icon:const Icon(Icons.attach_file),label:const Text('Arquivos'))),FilledButton(onPressed:busy||selected.isEmpty?null:confirm,child:const Text('Adicionar'))])),Text('Até ${fileSizeLabel(attachmentLimit)} por arquivo',style:const TextStyle(fontSize:12,color:Colors.white54)),const SizedBox(height:6)])));
 }
