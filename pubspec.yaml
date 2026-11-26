@@ -1,7 +1,7 @@
 name: meow
 description: Meow - chat privado para amigos
 publish_to: 'none'
-version: 0.9.3+13
+version: 0.9.4+14
 environment:
   sdk: '>=3.4.0 <4.0.0'
 dependencies:
