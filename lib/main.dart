@@ -1886,7 +1886,7 @@ class _MeowDmTypingPreviewState extends State<_MeowDmTypingPreview>{
   final t=s.data?.data()?['at'];
   final typing=TickerMode.of(c)&&t is Timestamp&&DateTime.now().difference(t.toDate()).inMilliseconds<6000;
   if(typing){timer??=Timer.periodic(const Duration(milliseconds:350),(_){if(mounted)setState(()=>frame=(frame+1)%3);});return Row(children:[const Text('Digitando',style:TextStyle(color:purple)),const SizedBox(width:4),for(var i=0;i<3;i++)AnimatedOpacity(opacity:frame==i?1:.3,duration:const Duration(milliseconds:180),child:const Text('•',style:TextStyle(color:purple)))]);}
-  timer?.cancel();timer=null;final d=widget.latest;final t=(d['text']?.toString()??'').isNotEmpty?d['text'].toString():d['attachment'] is Map?'📎 Anexo':'Mensagem';return Text('${d['authorId']==widget.uid?'Você: ':''}$t',maxLines:1,overflow:TextOverflow.ellipsis);
+  timer?.cancel();timer=null;final d=widget.latest;final previewText=(d['text']?.toString()??'').isNotEmpty?d['text'].toString():d['attachment'] is Map?'📎 Anexo':'Mensagem';return Text('${d['authorId']==widget.uid?'Você: ':''}$previewText',maxLines:1,overflow:TextOverflow.ellipsis);
  });}
 }
 class DmChatPage extends StatelessWidget {
