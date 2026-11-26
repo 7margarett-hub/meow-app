@@ -32,6 +32,18 @@ late final AppLinks meowAppLinks;
 const bg = Color(0xFF1A1A1E), panel = Color(0xFF242429), purple = Color(0xFF8B5CF6);
 const meowComposerColor = Color(0xFF29292F);
 const double meowChatAvatarSize = 44;
+// The heartbeat and its local expiry must always use the same constants.
+const meowPresenceInterval = Duration(minutes:2);
+const meowPresenceExpiry = Duration(minutes:5);
+class MeowQuietLog {
+  static final _last=<String,DateTime>{};
+  static void warning(String key,String message){
+    final now=DateTime.now();final last=_last[key];
+    if(last!=null&&now.difference(last)<const Duration(minutes:5))return;
+    if(_last.length>=64&&!_last.containsKey(key))_last.remove(_last.keys.first);
+    _last[key]=now;debugPrint(message);
+  }
+}
 const avatarLimit = 8 * 1024 * 1024, bannerLimit = 15 * 1024 * 1024, attachmentLimit = 25 * 1024 * 1024;
 const imageHost = 'ffxsvctvcsldumxnkiob.supabase.co';
 final changedImage = ValueNotifier<Uri?>(null);
@@ -81,14 +93,14 @@ Future<void> meowAccountAction(Map<String,dynamic> body) async {
 String currentPresence(Map<String,dynamic>? d) {
   final p=d?['presence']?.toString()??'offline';
   final t=d?['lastSeen'];final closed=d?['presenceClosedAt'];
-  if(p=='invisible'||t is! Timestamp||(closed is Timestamp&&closed.compareTo(t)>=0)||DateTime.now().difference(t.toDate())>const Duration(seconds:80))return 'offline';
+  if(p=='invisible'||t is! Timestamp||(closed is Timestamp&&closed.compareTo(t)>=0)||DateTime.now().difference(t.toDate())>meowPresenceExpiry)return 'offline';
   return presenceLabels.containsKey(p)?p:'offline';
 }
 Future<void> notifyMessage(String path) async {
   try {
     final r=await http.post(Uri.https(imageHost,'/functions/v1/meow-notificacoes'),headers:{...await authHeaders(),'Content-Type':'application/json'},body:jsonEncode({'messagePath':path})).timeout(const Duration(seconds:45));
-    if(r.statusCode!=200)debugPrint('Meow FCM: HTTP ${r.statusCode}');
-  }catch(e){debugPrint('Meow FCM indisponível: $e');}
+    if(r.statusCode!=200)MeowQuietLog.warning('fcm:${r.statusCode}','Meow FCM: HTTP ${r.statusCode}');
+  }catch(e){MeowQuietLog.warning('fcm-network','Meow FCM temporariamente indisponível.');}
 }
 Future<void> logoutMeow(BuildContext c) async {
   try {
@@ -99,9 +111,10 @@ Future<void> logoutMeow(BuildContext c) async {
     try {await f.deleteToken();}catch(_){}
   }catch(e){if(c.mounted)notice(c,'Não foi possível desregistrar as notificações: $e');return;}
   await _nativeNotification<void>('clearSession',myUid);
-   PrivateMediaCache.clear();await MeowVideoCache.clear();MeowStreams.clear();activeThread.value=null;
+   PrivateMediaCache.clear();await PrivateMediaCache.purgeDisk();await MeowVideoCache.clear();MeowStreams.clear();activeThread.value=null;
   meowNavigator.currentState?.popUntil((route)=>route.isFirst);
   await FirebaseAuth.instance.signOut();
+  PrivateMediaCache.clear();await PrivateMediaCache.purgeDisk();
 }
 
 // 0.7.0 hotfix: shared Firestore subscriptions, scoped to the authenticated session.
@@ -190,10 +203,102 @@ class MeowStreamBuilder<T> extends StatelessWidget {
     stream: TickerMode.of(context) ? stream : null, builder:builder);
 }
 
-// Private, bounded session cache. No private media is written to disk.
-// Reuse connections, prefer small profile media, and collapse duplicate requests.
+// Bounded RAM cache plus account-scoped, revisioned profile image cache in the OS cache directory.
+// Server/channel/DM attachments, legacy unversioned images and other private media stay off disk here.
+// Reuse connections and collapse duplicate requests.
 class PrivateMediaCache {
   static final _pending=<String,Future<Uint8List?>>{};
+  static const diskMaxBytes=512*1024*1024;
+  static const diskMaxEntries=2048;
+  static const diskTtl=Duration(hours:24);
+  static Future<void> _diskTail=Future<void>.value();
+  static int _diskEpoch=0;
+  static final _safeId=RegExp(r'^[A-Za-z0-9_-]{1,128}$');
+  static final _safeRevision=RegExp(r'^[0-9a-f]{32}$');
+  static Future<T> _diskSerial<T>(Future<T> Function() action){
+    final next=_diskTail.then((_)=>action());
+    _diskTail=next.then<void>((_) {},onError:(Object _,StackTrace __){});
+    return next;
+  }
+  static Future<Directory> _diskRoot()async{
+    final base=await getTemporaryDirectory();
+    return Directory('${base.path}/meow_profile_cache_v1');
+  }
+  static bool _diskEligible(Uri url){
+    final q=url.queryParameters;
+    return url.scheme=='https'&&url.host==imageHost&&_image(url)&&q['scope']=='profile'&&
+      _safeId.hasMatch(q['id']??'')&&(const {'avatar','banner'}).contains(q['slot'])&&
+      _safeRevision.hasMatch(q['revision']??'')&&q.length==4;
+  }
+  static String _diskAccount(String key)=>key.split('|').first;
+  static Future<Directory> _diskFamily(Uri url,String key)async{
+    final root=await _diskRoot();final q=url.queryParameters;
+    return Directory('${root.path}/${_diskAccount(key)}/${q['id']}/${q['slot']}');
+  }
+  static Future<Uint8List?> _readDisk(Uri url,String key,int generation,int session,int diskEpoch)async{
+    if(!_diskEligible(url)||!_safeId.hasMatch(_diskAccount(key)))return null;
+    return _diskSerial(()async{
+      try{
+        if(diskEpoch!=_diskEpoch||!_valid(url,key,generation,session))return null;
+        final dir=await _diskFamily(url,key);final file=File('${dir.path}/${url.queryParameters['revision']}.bin');
+        final stat=await file.stat();final age=DateTime.now().difference(stat.modified);
+        final limit=url.queryParameters['slot']=='avatar'?avatarLimit:bannerLimit;
+        if(stat.type!=FileSystemEntityType.file)return null;
+        if(age.isNegative||age>=diskTtl||stat.size<=0||stat.size>limit){await file.delete();return null;}
+        final bytes=await file.readAsBytes();
+        return diskEpoch==_diskEpoch&&_valid(url,key,generation,session)&&bytes.length==stat.size?bytes:null;
+      }catch(_){return null;}
+    });
+  }
+  static Future<void> _pruneDiskUnlocked()async{
+    final root=await _diskRoot();if(!await root.exists())return;
+    final entries=<({File file,FileStat stat})>[];var size=0;
+    final now=DateTime.now();
+    await for(final item in root.list(recursive:true,followLinks:false)){
+      if(item is! File)continue;
+      try{
+        final stat=await item.stat();final age=now.difference(stat.modified);
+        if(!item.path.endsWith('.bin')||age.isNegative||age>=diskTtl||stat.size<=0||stat.size>bannerLimit){await item.delete();continue;}
+        entries.add((file:item,stat:stat));size+=stat.size;
+      }catch(_){}
+    }
+    entries.sort((a,b)=>a.stat.modified.compareTo(b.stat.modified));
+    var count=entries.length;
+    for(final entry in entries){
+      if(size<=diskMaxBytes&&count<=diskMaxEntries)break;
+      try{await entry.file.delete();size-=entry.stat.size;count--;}catch(_){}
+    }
+  }
+  static Future<void> _writeDisk(Uri url,String key,int generation,int session,int diskEpoch,Uint8List bytes)async{
+    if(!_diskEligible(url)||!_safeId.hasMatch(_diskAccount(key)))return;
+    final limit=url.queryParameters['slot']=='avatar'?avatarLimit:bannerLimit;
+    if(bytes.isEmpty||bytes.length>limit)return;
+    await _diskSerial(()async{
+      File? tmp;
+      try{
+        if(diskEpoch!=_diskEpoch||!_valid(url,key,generation,session))return;
+        final dir=await _diskFamily(url,key);await dir.create(recursive:true);
+        final file=File('${dir.path}/${url.queryParameters['revision']}.bin');
+        tmp=File('${file.path}.tmp');await tmp.writeAsBytes(bytes,flush:true);
+        if(diskEpoch!=_diskEpoch||!_valid(url,key,generation,session))return;
+        await tmp.rename(file.path);
+        await _pruneDiskUnlocked();
+      }catch(_){}finally{if(tmp!=null){try{if(await tmp.exists())await tmp.delete();}catch(_){}}}
+    });
+  }
+  static Future<void> pruneDisk()=>_diskSerial(()async{try{await _pruneDiskUnlocked();}catch(_){}});
+  static Future<void> purgeDisk(){
+    _diskEpoch++;
+    return _diskSerial(()async{try{final root=await _diskRoot();if(await root.exists())await root.delete(recursive:true);}catch(_){}});
+  }
+  static void _invalidateDisk(Uri url,String key){
+    final q=url.queryParameters;
+    if(!_image(url)||q['scope']!='profile'||!_safeId.hasMatch(_diskAccount(key))||!_safeId.hasMatch(q['id']??'')||!(const {'avatar','banner'}).contains(q['slot']))return;
+    unawaited(_diskSerial(()async{try{final dir=await _diskFamily(url,key);if(await dir.exists())await dir.delete(recursive:true);}catch(_){}}));
+  }
+  static Future<int> diskBytes()=>_diskSerial(()async{
+    var size=0;try{final root=await _diskRoot();if(await root.exists()){await for(final e in root.list(recursive:true,followLinks:false)){if(e is File)size+=await e.length();}}}catch(_){}return size;
+  });
   static final _completed=<String,({Uint8List bytes,DateTime time,Future<Uint8List?> future})>{};
   static final _missing=<String,DateTime>{};
   static final _failed=<String,DateTime>{};
@@ -242,22 +347,30 @@ class PrivateMediaCache {
   static Future<Uint8List?> get(Uri url,{ValueChanged<double?>? onProgress}) {
     final uid=FirebaseAuth.instance.currentUser?.uid;
     if(uid==null)return Future<Uint8List?>.value(null);
-    if(_owner!=uid){clear();_owner=uid;}
+    if(_owner!=uid){if(_owner!=null)unawaited(purgeDisk());clear();_owner=uid;}
     final key=_key(url);final now=DateTime.now();
     final entry=_completed.remove(key);
     if(entry!=null){
       if(now.difference(entry.time)<_lifetime(url)){_completed[key]=entry;if(onProgress!=null)onProgress(1);return entry.future;}
       if(_image(url)&&(url.queryParameters['scope']!='server'||now.difference(entry.time)<const Duration(minutes:10))){_completed[key]=entry;}else{_usedBytes-=entry.bytes.lengthInBytes;}
     }
-    if(_blocked(url)||(_image(url)&&_failed[key]?.isAfter(now)==true)){
+    if(!_diskEligible(url)&&(_blocked(url)||(_image(url)&&_failed[key]?.isAfter(now)==true))){
       if(_blocked(url))_failImage(key);
       return Future<Uint8List?>.value(_stale(url,key));
     }
     final missing=_missing[key];if(missing!=null){if(now.difference(missing)<missingLifetime)return Future<Uint8List?>.value(null);_missing.remove(key);}
     Future<Uint8List?> observe(Future<Uint8List?> future){if(onProgress==null)return future;final listeners=_progress.putIfAbsent(key,()=> <ValueChanged<double?>>{});listeners.add(onProgress);return future.whenComplete((){listeners.remove(onProgress);if(listeners.isEmpty&&identical(_progress[key],listeners))_progress.remove(key);});}
     final existing=_pending[key];if(existing!=null)return observe(existing);
-    final generation=_generation[key]??0,session=_session;
-    final task=()async{await _acquire(_image(url));try{return await _download(url,key,generation,session);}finally{_release();}}();
+    final generation=_generation[key]??0,session=_session,diskEpoch=_diskEpoch;
+    final task=()async{
+      final disk=await _readDisk(url,key,generation,session,diskEpoch);
+      if(!_valid(url,key,generation,session))return null;
+      if(disk!=null){_store(key,disk);_report(key,1);return disk;}
+      if(_blocked(url)||(_image(url)&&_failed[key]?.isAfter(DateTime.now())==true)){
+        if(_blocked(url))_failImage(key);return _stale(url,key);
+      }
+      await _acquire(_image(url));try{return await _download(url,key,generation,session,diskEpoch);}finally{_release();}
+    }();
     _pending[key]=task;
     task.whenComplete((){if(identical(_pending[key],task))_pending.remove(key);});
     return observe(task);
@@ -268,7 +381,7 @@ class PrivateMediaCache {
     while(_completed.isNotEmpty&&(_usedBytes+bytes.lengthInBytes>maxBytes||_completed.length>=maxEntries)){_usedBytes-=_completed.remove(_completed.keys.first)!.bytes.lengthInBytes;}
     _completed[key]=(bytes:bytes,time:DateTime.now(),future:Future<Uint8List?>.value(bytes));_usedBytes+=bytes.lengthInBytes;
   }
-  static Future<Uint8List?> _download(Uri url,String key,int generation,int session)async{
+  static Future<Uint8List?> _download(Uri url,String key,int generation,int session,int diskEpoch)async{
     var refreshToken=false;
     for(var attempt=0;attempt<2;attempt++){
       if(!_valid(url,key,generation,session))return null;
@@ -286,7 +399,7 @@ class PrivateMediaCache {
           final builder=BytesBuilder(copy:false);var received=0;var report=DateTime.fromMillisecondsSinceEpoch(0);
           _report(key,total!=null&&total>0?0:null);
           await for(final chunk in response.stream.timeout(const Duration(seconds:20))){if(!_valid(url,key,generation,session))return null;received+=chunk.length;if(received>limit)throw const FormatException('Mídia acima do limite.');builder.add(chunk);final now=DateTime.now();if(now.difference(report)>=const Duration(milliseconds:120)){report=now;_report(key,total!=null&&total>0?(received/total).clamp(0.0,1.0).toDouble():null);}}
-          if(!_valid(url,key,generation,session))return null;if(received==0){if(pooled){_failImage(key);return _stale(url,key);}return null;}final bytes=builder.takeBytes();if(pooled&&!_blocked(url))_quotaStreak=0;_store(key,bytes);_report(key,1);return bytes;
+          if(!_valid(url,key,generation,session))return null;if(received==0){if(pooled){_failImage(key);return _stale(url,key);}return null;}final bytes=builder.takeBytes();if(pooled&&!_blocked(url))_quotaStreak=0;_store(key,bytes);unawaited(_writeDisk(url,key,generation,session,diskEpoch,bytes));_report(key,1);return bytes;
         }
         // Drain error bodies before reusing the connection.
         await response.stream.drain<void>().timeout(const Duration(seconds:5));
@@ -308,7 +421,7 @@ class PrivateMediaCache {
         }
         if(response.statusCode!=429&&response.statusCode<500)return null;
       }catch(e){
-        debugPrint('Meow media: falha no download (${url.path}): $e');
+        MeowQuietLog.warning('media:${url.path}','Meow: falha temporária ao baixar mídia (${url.path}).');
         // Do not close the shared client while other images are downloading.
         if(pooled&&_valid(url,key,generation,session)){_failImage(key);return _stale(url,key);}
       }
@@ -318,7 +431,7 @@ class PrivateMediaCache {
     return null;
   }
   static void invalidate(Uri url){
-    final key=_key(url);final family=_family(key);
+    final key=_key(url);final family=_family(key);_invalidateDisk(url,key);
     final keys=<String>{key,..._completed.keys,..._pending.keys,..._missing.keys,..._failed.keys}.where((k)=>_family(k)==family).toList();
     for(final k in keys){_generation[k]=(_generation[k]??0)+1;final old=_completed.remove(k);if(old!=null)_usedBytes-=old.bytes.lengthInBytes;_pending.remove(k);_missing.remove(k);_failed.remove(k);}
   }
@@ -442,7 +555,7 @@ class _MeowIdentityGateState extends State<MeowIdentityGate> {
       const Text('Sua conta continua existente. Verifique a conexão e tente novamente.',textAlign:TextAlign.center),
        if(_meowSignup?.bytes!=null)TextButton(onPressed:(){_meowSignup?.bytes=null;setState(()=>ready=prepare());},child:const Text('Continuar sem foto')), 
       const SizedBox(height:12),FilledButton(onPressed:()=>setState(()=>ready=prepare()),child:const Text('Tentar novamente')),
-      TextButton(onPressed:()async{_meowSignup=null;PrivateMediaCache.clear();MeowStreams.clear();await FirebaseAuth.instance.signOut();},child:const Text('Sair da conta'))
+      TextButton(onPressed:()async{_meowSignup=null;PrivateMediaCache.clear();await PrivateMediaCache.purgeDisk();MeowStreams.clear();await FirebaseAuth.instance.signOut();PrivateMediaCache.clear();await PrivateMediaCache.purgeDisk();},child:const Text('Sair da conta'))
     ]))));
   });
 }
@@ -606,7 +719,7 @@ class _PrivateImageState extends State<PrivateImage>{
     final banner=widget.slot=='banner';final statusIcon=widget.slot.startsWith('status');
     return SizedBox(width:widget.width??(banner?double.infinity:widget.size),height:widget.size,child:ClipRRect(borderRadius:widget.borderRadius??BorderRadius.circular(banner?8:widget.size),child:FutureBuilder<Uint8List?>(key:ValueKey(widget.url),future:future,builder:(c,s){
       final placeholder=ColoredBox(color:panel,child:Center(child:Icon(banner?Icons.landscape:widget.scope=='server'?Icons.groups:Icons.person,color:Colors.white54,size:banner?38:widget.size*.5)));
-      return s.data==null?placeholder:meowPreview(c,s.data!,width:widget.width??widget.size,height:widget.size,fit:statusIcon?BoxFit.contain:BoxFit.cover,errorBuilder:(c,e,st){debugPrint('Meow: falha ao decodificar imagem: $e');return placeholder;});
+      return s.data==null?placeholder:meowPreview(c,s.data!,width:widget.width??widget.size,height:widget.size,fit:statusIcon?BoxFit.contain:BoxFit.cover,errorBuilder:(c,e,st){MeowQuietLog.warning('image-decode','Meow: falha ao decodificar imagem.');return placeholder;});
     })));
   }
 }
@@ -729,7 +842,7 @@ class _PresenceGlyphState extends State<_PresenceGlyph>{
     if(!TickerMode.of(context)||currentPresence(widget.data)=='offline')return;
     final t=widget.data?['lastSeen'];
     if(t is! Timestamp)return;
-    final remaining=t.toDate().add(const Duration(seconds:80,milliseconds:50)).difference(DateTime.now());
+    final remaining=t.toDate().add(meowPresenceExpiry+const Duration(milliseconds:50)).difference(DateTime.now());
     if(remaining>Duration.zero)timer=Timer(remaining,(){if(mounted)setState((){});});
   }
   @override void didChangeDependencies(){super.didChangeDependencies();schedule();}
@@ -1057,14 +1170,14 @@ class AppSettingsPage extends StatelessWidget {
 class MeowCacheMaintenance {
  static const key='meow_last_cache_cleanup_091';static bool busy=false;
  static Future<DateTime?> last()async{final p=await SharedPreferences.getInstance();final n=p.getInt(key);return n==null?null:DateTime.fromMillisecondsSinceEpoch(n);}
- static Future<void> maybeClean()async{try{final p=await last();if(p==null||DateTime.now().difference(p)>=const Duration(hours:12))await clean(automatic:true);}catch(e){debugPrint('Meow cache: $e');}}
- static Future<void> clean({bool automatic=false})async{if(busy)return;busy=true;try{if(automatic){PrivateMediaCache.pruneExpired();}else{PrivateMediaCache.purgeCompleted();}await MeowVideoCache.clear();final prefs=await SharedPreferences.getInstance();await prefs.setInt(key,DateTime.now().millisecondsSinceEpoch);}finally{busy=false;}}
+ static Future<void> maybeClean()async{try{final p=await last();if(p==null||DateTime.now().difference(p)>=const Duration(hours:12))await clean(automatic:true);}catch(e){MeowQuietLog.warning('cache-clean','Meow: falha temporária na limpeza do cache.');}}
+ static Future<void> clean({bool automatic=false})async{if(busy)return;busy=true;try{if(automatic){PrivateMediaCache.pruneExpired();await PrivateMediaCache.pruneDisk();}else{PrivateMediaCache.purgeCompleted();await PrivateMediaCache.purgeDisk();}await MeowVideoCache.clear();final prefs=await SharedPreferences.getInstance();await prefs.setInt(key,DateTime.now().millisecondsSinceEpoch);}finally{busy=false;}}
 }
 class MeowStoragePage extends StatefulWidget{const MeowStoragePage({super.key});@override State<MeowStoragePage> createState()=>_MeowStoragePageState();}
 class _MeowStoragePageState extends State<MeowStoragePage>{
  late Future<Map<String,dynamic>> data;bool busy=false;
  @override void initState(){super.initState();data=read();}
- Future<Map<String,dynamic>> read()async{final native=await _nativeNotification<Map<dynamic,dynamic>>('storageStats');final last=await MeowCacheMaintenance.last();return {if(native!=null)...Map<String,dynamic>.from(native),'last':last,'media':await MeowVideoCache.bytes()};}
+ Future<Map<String,dynamic>> read()async{final native=await _nativeNotification<Map<dynamic,dynamic>>('storageStats');final last=await MeowCacheMaintenance.last();return {if(native!=null)...Map<String,dynamic>.from(native),'last':last,'media':(await MeowVideoCache.bytes())+(await PrivateMediaCache.diskBytes())};}
  Future<void> clean()async{if(busy)return;setState(()=>busy=true);try{await MeowCacheMaintenance.clean();if(mounted){setState(()=>data=read());notice(context,'Cache temporário da Meow limpo.');}}catch(e){if(mounted)notice(context,'Não foi possível limpar o cache: $e');}finally{if(mounted)setState(()=>busy=false);}}
  @override Widget build(BuildContext c)=>Scaffold(appBar:AppBar(title:const Text('Armazenamento'),actions:[IconButton(tooltip:'Atualizar',onPressed:busy?null:()=>setState(()=>data=read()),icon:const Icon(Icons.refresh))]),body:FutureBuilder<Map<String,dynamic>>(future:data,builder:(c,s){
   if(!s.hasData&&!s.hasError)return const Center(child:CircularProgressIndicator());final d=s.data??{};
@@ -1349,6 +1462,11 @@ class _SocialHomeState extends State<SocialHome> with WidgetsBindingObserver {
   Timer? presenceTimer;
   StreamSubscription<QuerySnapshot<Map<String,dynamic>>>? deletionSub;
   bool appActive = true;DateTime? pausedAt;Timer? cacheTimer;
+  bool _presenceWriting=false;
+  bool? _presencePending;
+  bool? _presenceInFlightClosed;
+  bool? _presenceLastClosed;
+  DateTime? _presenceLastAttempt;
   @override void initState(){
     super.initState();
     WidgetsBinding.instance.addObserver(this);
@@ -1365,16 +1483,30 @@ class _SocialHomeState extends State<SocialHome> with WidgetsBindingObserver {
       final selected=serverId;
       if(selected!=null&&!snapshot.metadata.isFromCache&&!snapshot.docs.any((d)=>d.id==selected&&d.data()['deleting']!=true))setState((){serverId=null;channelId=null;showingChannels=true;});
     },onError:(Object e){debugPrint('Meow exclusões pendentes: $e');});
-    presenceTimer = Timer.periodic(const Duration(seconds: 35), (_) {
+    presenceTimer = Timer.periodic(meowPresenceInterval, (_) {
       if (appActive) touchPresence();
     });
 }
   Future<void> touchPresence({bool closed=false})async{
-    try{final user=FirebaseAuth.instance.currentUser;if(user==null)return;await db.collection('users').doc(user.uid).update({'lastSeen':FieldValue.serverTimestamp(),if(closed)'presenceClosedAt':FieldValue.serverTimestamp()});}catch(_){}
+    final user=FirebaseAuth.instance.currentUser;if(user==null||!mounted)return;
+    if(_presenceWriting){
+      // Keep only the latest lifecycle intent; do not enqueue heartbeats while offline.
+      _presencePending=closed==_presenceInFlightClosed?null:closed;return;
+    }
+    final now=DateTime.now();final last=_presenceLastAttempt;
+    if(_presenceLastClosed==closed&&last!=null&&now.difference(last)<meowPresenceInterval)return;
+    _presenceWriting=true;_presenceInFlightClosed=closed;_presenceLastAttempt=now;_presenceLastClosed=closed;
+    try{await db.collection('users').doc(user.uid).update({'lastSeen':FieldValue.serverTimestamp(),if(closed)'presenceClosedAt':FieldValue.serverTimestamp()});}
+    catch(_){MeowQuietLog.warning('presence','Meow: presença temporariamente indisponível.');}
+    finally{
+      _presenceWriting=false;_presenceInFlightClosed=null;
+      final next=_presencePending;_presencePending=null;
+      if(next!=null&&mounted&&FirebaseAuth.instance.currentUser?.uid==user.uid)unawaited(touchPresence(closed:next));
+    }
   }
   @override void didChangeAppLifecycleState(AppLifecycleState state){
     appActive=state==AppLifecycleState.resumed;
-    if(appActive){unawaited(touchPresence());unawaited(MeowCacheMaintenance.maybeClean());final elapsed=pausedAt==null?Duration.zero:DateTime.now().difference(pausedAt!);pausedAt=null;if(elapsed>const Duration(seconds:3))unawaited(db.enableNetwork());}
+    if(appActive){final wasPaused=pausedAt!=null;final elapsed=pausedAt==null?Duration.zero:DateTime.now().difference(pausedAt!);pausedAt=null;if(wasPaused){unawaited(touchPresence());unawaited(MeowCacheMaintenance.maybeClean());if(elapsed>const Duration(seconds:3))unawaited(db.enableNetwork());}}
     else if(state==AppLifecycleState.paused||state==AppLifecycleState.hidden||state==AppLifecycleState.detached){if(pausedAt==null){pausedAt=DateTime.now();unawaited(touchPresence(closed:true));}}
     syncNativeThread();
   }
@@ -1957,7 +2089,7 @@ class _MessageThreadState extends State<MessageThread> with RouteAware,WidgetsBi
   void typingChanged(String value){
     if(widget.readOnly||!widget.visible||!routeActive||!foreground||value.trim().isEmpty){unawaited(stopTyping());return;}
     final now=DateTime.now();
-    if(lastTyping==null||now.difference(lastTyping!).inMilliseconds>=1500){
+    if(lastTyping==null||now.difference(lastTyping!).inMilliseconds>=4000){
       lastTyping=now;
       unawaited(typingRef.set({'at':FieldValue.serverTimestamp()}).catchError((Object _){}));
     }
