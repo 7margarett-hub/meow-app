@@ -22,6 +22,7 @@ import 'package:firebase_core/firebase_core.dart';
 import 'package:firebase_messaging/firebase_messaging.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
+import 'package:flutter/scheduler.dart';
 import 'package:package_info_plus/package_info_plus.dart';
 import 'package:http/http.dart' as http;
 import 'package:image_picker/image_picker.dart';
@@ -34,6 +35,25 @@ const bg = Color(0xFF1A1A1E), panel = Color(0xFF242429), purple = Color(0xFF8B5C
 const meowComposerColor = Color(0xFF29292F);
 const double meowChatAvatarSize = 44;
 // The heartbeat and its local expiry must always use the same constants.
+// Detect sustained frame pressure rather than guessing device capability from a model name.
+class MeowGraphics {
+  static bool simplified=false;
+  static int _frames=0,_slow=0,_windows=0;
+  static void init(){SchedulerBinding.instance.addTimingsCallback(_timings);}
+  static void reduce(){simplified=true;}
+  static void _timings(List<ui.FrameTiming> frames){
+    if(simplified)return;
+    for(final f in frames){
+      _frames++;
+      if(f.buildDuration.inMicroseconds>20000||f.rasterDuration.inMicroseconds>20000)_slow++;
+      if(_frames>=60){
+        _windows=_slow>=18?_windows+1:0;_frames=0;_slow=0;
+        if(_windows>=2){reduce();return;}
+      }
+    }
+  }
+  static Duration duration(BuildContext c,int ms)=>MediaQuery.disableAnimationsOf(c)?Duration.zero:Duration(milliseconds:simplified?min(ms,120):ms);
+}
 const meowPresenceInterval = Duration(minutes:2);
 const meowPresenceExpiry = Duration(minutes:5);
 class MeowQuietLog {
@@ -97,6 +117,15 @@ String currentPresence(Map<String,dynamic>? d) {
   if(p=='invisible'||t is! Timestamp||(closed is Timestamp&&closed.compareTo(t)>=0)||DateTime.now().difference(t.toDate())>meowPresenceExpiry)return 'offline';
   return presenceLabels.containsKey(p)?p:'offline';
 }
+class MeowPresenceListClock {
+  Timer? _timer;
+  void cancel(){_timer?.cancel();_timer=null;}
+  void schedule(Iterable<Map<String,dynamic>> data,VoidCallback expired){
+    cancel();DateTime? next;
+    for(final d in data){if(currentPresence(d)=='offline')continue;final t=d['lastSeen'];if(t is! Timestamp)continue;final at=t.toDate().add(meowPresenceExpiry+const Duration(milliseconds:50));if(next==null||at.isBefore(next))next=at;}
+    if(next!=null){final wait=next.difference(DateTime.now());_timer=Timer(wait.isNegative?Duration.zero:wait,expired);}
+  }
+}
 Future<void> notifyMessage(String path) async {
   try {
     final r=await http.post(Uri.https(imageHost,'/functions/v1/meow-notificacoes'),headers:{...await authHeaders(),'Content-Type':'application/json'},body:jsonEncode({'messagePath':path})).timeout(const Duration(seconds:45));
@@ -130,7 +159,7 @@ class _MeowFeed<T> {
   Timer? _idleTimer;
   _MeowFeed(this.source);
   bool get idle => _clients.isEmpty;
-  void pause(){_idleTimer?.cancel();_idleTimer=null;_epoch++;final old=_subscription;_subscription=null;old?.cancel();}
+  void pause(){_idleTimer?.cancel();_idleTimer=null;_epoch++;final old=_subscription;_subscription=null;_last=null;_hasLast=false;old?.cancel();}
   void close(){pause();_last=null;_hasLast=false;for(final c in _clients.toList()){c.close();}_clients.clear();}
   void resume(){
     if(!MeowStreams.active||idle||_subscription!=null)return;
@@ -164,6 +193,27 @@ class MeowStreams {
   static final _documents=<Object,_MeowFeed<DocumentSnapshot<Map<String,dynamic>>>>{};
   static final _queries=<Object,_MeowFeed<QuerySnapshot<Map<String,dynamic>>>>{};
   static final _unread=<Object,_MeowFeed<MeowMessageDocs>>{};
+  static final _profileCache=<String,Map<String,dynamic>>{};
+  static final _docGets=<String,Future<DocumentSnapshot<Map<String,dynamic>>>>{};
+  static void _remember(DocumentSnapshot<Map<String,dynamic>> value,String owner){
+    if(owner.isEmpty||owner!=_uid||value.reference.parent.path!='users')return;
+    final key='$owner|${value.id}';final data=value.data();
+    if(data==null){if(!value.metadata.isFromCache)_profileCache.remove(key);return;}
+    _profileCache.remove(key);_profileCache[key]=data;
+    if(_profileCache.length>64)_profileCache.remove(_profileCache.keys.first);
+  }
+  // Coalesce overlapping one-shot reads, never use old snapshots as authorization.
+  static Future<DocumentSnapshot<Map<String,dynamic>>> getDocument(DocumentReference<Map<String,dynamic>> ref){
+    final owner=_uid,key='$owner|${ref.path}';final pending=_docGets[key];if(pending!=null)return pending;
+    final request=ref.get().then((value){_remember(value,owner);return value;});_docGets[key]=request;
+    return request.whenComplete((){if(identical(_docGets[key],request))_docGets.remove(key);});
+  }
+  static Future<Map<String,dynamic>> displayProfile(String uid)async{
+    final owner=_uid;final known=cachedProfile(uid);if(known!=null)return known;
+    final ref=db.collection('users').doc(uid);
+    try{final cached=await ref.get(const GetOptions(source:Source.cache));if(owner!=_uid)return {};if(cached.exists){_remember(cached,owner);return cached.data()??{};}}catch(_){}
+    final fresh=await getDocument(ref);return owner==_uid?fresh.data()??{}:{};
+  }
   static bool active=true;
   static Timer? _backgroundTimer;
   static String get _uid=>FirebaseAuth.instance.currentUser?.uid??'';
@@ -175,11 +225,13 @@ class MeowStreams {
     }
     entries[key]=feed;return feed.stream;
   }
-  static Stream<DocumentSnapshot<Map<String,dynamic>>> document(DocumentReference<Map<String,dynamic>> ref)=>
-    _get(_documents,(_uid,ref.path),()=>ref.snapshots());
+  static Stream<DocumentSnapshot<Map<String,dynamic>>> document(DocumentReference<Map<String,dynamic>> ref){
+    final owner=_uid;
+    return _get(_documents,(owner,ref.path),()=>ref.snapshots().map((value){_remember(value,owner);return value;}));
+  }
   static Stream<QuerySnapshot<Map<String,dynamic>>> query(Query<Map<String,dynamic>> ref,{bool metadata=false})=>
     _get(_queries,(_uid,ref,metadata),()=>ref.snapshots(includeMetadataChanges:metadata));
-  static Map<String,dynamic>? cachedProfile(String uid)=>_documents[(_uid,'users/$uid')]?._last?.data();
+  static Map<String,dynamic>? cachedProfile(String uid)=>_documents[(_uid,'users/$uid')]?._last?.data()??_profileCache['$_uid|$uid'];
   static Stream<MeowMessageDocs> unread(String thread,String uid,CollectionReference<Map<String,dynamic>> collection)=>
     _get(_unread,(_uid,uid,thread,collection.path),()=>_meowUnreadSource(thread,uid,collection));
   static void foreground(bool value){
@@ -203,7 +255,7 @@ class MeowStreams {
     for(final f in _unread.values.toList()){f.close();}
     for(final f in _documents.values.toList()){f.close();}
     for(final f in _queries.values.toList()){f.close();}
-    _unread.clear();_documents.clear();_queries.clear();
+    _unread.clear();_documents.clear();_queries.clear();_profileCache.clear();_docGets.clear();
   }
 }
 extension MeowDocumentStream on DocumentReference<Map<String,dynamic>> {
@@ -229,7 +281,7 @@ class PrivateMediaCache {
   static final _pending=<String,Future<Uint8List?>>{};
   static const diskMaxBytes=512*1024*1024;
   static const diskMaxEntries=2048;
-  static const diskTtl=Duration(hours:24);
+  static const diskTtl=Duration(days:7);
   static Future<void> _diskTail=Future<void>.value();
   static int _diskEpoch=0;
   static final _safeId=RegExp(r'^[A-Za-z0-9_-]{1,128}$');
@@ -347,8 +399,8 @@ class PrivateMediaCache {
 
   static final _generation=<String,int>{};
   static final _progress=<String,Set<ValueChanged<double?>>>{};
-  static const int maxBytes=48*1024*1024;
-  static const int maxEntries=256;
+  static const int maxBytes=24*1024*1024;
+  static const int maxEntries=160;
   static const Duration lifetime=Duration(minutes:5);
   static const Duration revisionLifetime=Duration(minutes:30);
   static const Duration attachmentLifetime=Duration(minutes:10);
@@ -362,7 +414,7 @@ class PrivateMediaCache {
   static Duration _lifetime(Uri url)=>url.path.endsWith('/meow-anexos')?attachmentLifetime:_image(url)&&url.queryParameters.containsKey('revision')?revisionLifetime:lifetime;
   static String _family(String key)=>key.split('&revision=').first;
   static bool _valid(Uri url,String key,int generation,int session)=>_session==session&&FirebaseAuth.instance.currentUser!=null&&_key(url)==key&&(_generation[key]??0)==generation;
-  static Future<void> _acquire(bool priority)async{if(_inFlight<4){_inFlight++;return;}final gate=Completer<void>();(priority?_priorityQueue:_queue).add(gate);await gate.future;}
+  static Future<void> _acquire(bool priority)async{if(_inFlight<3){_inFlight++;return;}final gate=Completer<void>();(priority?_priorityQueue:_queue).add(gate);await gate.future;}
   static void _release(){if(_priorityQueue.isNotEmpty&&(_queue.isEmpty||_priorityBurst<3)){_priorityBurst++;_priorityQueue.removeAt(0).complete();}else if(_queue.isNotEmpty){_priorityBurst=0;_queue.removeAt(0).complete();}else{_inFlight--;_priorityBurst=0;}}
   static void _report(String key,double? value){for(final listener in List<ValueChanged<double?>>.from(_progress[key]??{})){try{listener(value);}catch(_){}}}
   static Future<Uint8List?> get(Uri url,{ValueChanged<double?>? onProgress}) {
@@ -499,8 +551,9 @@ Future<Map<String, String>> authHeaders({bool forceRefresh=false}) async {
 }
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
-  PaintingBinding.instance.imageCache.maximumSize=180;
-  PaintingBinding.instance.imageCache.maximumSizeBytes=64*1024*1024;
+  MeowGraphics.init();
+  PaintingBinding.instance.imageCache.maximumSize=120;
+  PaintingBinding.instance.imageCache.maximumSizeBytes=32*1024*1024;
   meowAppLinks=AppLinks();
   const apiKey = String.fromEnvironment('FB_API_KEY');
   const appId = String.fromEnvironment('FB_APP_ID');
@@ -516,7 +569,6 @@ Future<void> main() async {
     projectId:projectId
 ));
     FirebaseMessaging.onBackgroundMessage(firebaseMessagingBackgroundHandler);
-    await Future<void>.delayed(const Duration(milliseconds: 900));
     runApp(const MeowApp());
 } catch (e) {
     runApp(MaterialApp(home: Scaffold(body: Center(child: Text('Erro ao iniciar: $e')))));
@@ -671,7 +723,14 @@ int meowPreviewPixels(double logical,double dpr){
   for(final n in const [64,128,256,512,768,1024,1536]){if(target<=n)return n;}
   return 1536;
 }
-bool meowStaticPreview(Uint8List bytes)=>bytes.length>=8&&((bytes[0]==0xff&&bytes[1]==0xd8)||(bytes[0]==0x89&&bytes[1]==0x50&&bytes[2]==0x4e&&bytes[3]==0x47&&!_meowAnimatedPng(bytes)));
+bool meowStaticPreview(Uint8List bytes)=>bytes.length>=8&&((bytes[0]==0xff&&bytes[1]==0xd8)||(bytes[0]==0x89&&bytes[1]==0x50&&bytes[2]==0x4e&&bytes[3]==0x47&&!_meowAnimatedPng(bytes))||_meowStaticWebp(bytes));
+bool _meowStaticWebp(Uint8List bytes){
+  if(bytes.length<21)return false;
+  final data=ByteData.sublistView(bytes);
+  if(data.getUint32(0)!=0x52494646||data.getUint32(8)!=0x57454250)return false;
+  final chunk=data.getUint32(12);
+  return chunk==0x56503820||chunk==0x5650384c||(chunk==0x56503858&&(bytes[20]&2)==0);
+}
 bool _meowAnimatedPng(Uint8List bytes){
   // APNG declares acTL before the first IDAT. Never change animated decoding.
   final data=ByteData.sublistView(bytes);var offset=8;
@@ -874,6 +933,19 @@ class _PresenceGlyphState extends State<_PresenceGlyph>{
   @override void dispose(){timer?.cancel();super.dispose();}
   @override Widget build(BuildContext c)=>Container(width:17,height:17,decoration:BoxDecoration(color:presenceColor(currentPresence(widget.data)),shape:BoxShape.circle,border:Border.all(color:bg,width:2)));
 }
+class MeowPresenceText extends StatefulWidget {
+ final Map<String,dynamic> data;final TextStyle style;final bool withDot;final String? preview;
+ const MeowPresenceText({super.key,required this.data,required this.style,this.withDot=false,this.preview});
+ @override State<MeowPresenceText> createState()=>_MeowPresenceTextState();
+}
+class _MeowPresenceTextState extends State<MeowPresenceText>{
+ final clock=MeowPresenceListClock();
+ void schedule()=>clock.schedule(widget.preview==null&&TickerMode.of(context)?[widget.data]:const <Map<String,dynamic>>[],(){if(mounted){setState((){});schedule();}});
+ @override void didChangeDependencies(){super.didChangeDependencies();schedule();}
+ @override void didUpdateWidget(covariant MeowPresenceText old){super.didUpdateWidget(old);schedule();}
+ @override void dispose(){clock.cancel();super.dispose();}
+ @override Widget build(BuildContext c){final p=widget.preview??currentPresence(widget.data);final text=Text(presenceLabels[p]??'Offline',style:widget.style,maxLines:1,overflow:TextOverflow.ellipsis);return widget.withDot?Row(mainAxisAlignment:MainAxisAlignment.center,children:[Icon(Icons.circle,size:9,color:presenceColor(p)),const SizedBox(width:6),text]):text;}
+}
 class ProfileAvatar extends StatelessWidget {
   final String uid;
   final double size;
@@ -916,21 +988,13 @@ class RelationshipListPage extends StatelessWidget {
   const RelationshipListPage({super.key, required this.uid, required this.kind});
   @override Widget build(BuildContext context) => Scaffold(
     appBar: AppBar(title: Text(kind=='followers'?'Seguidores':kind=='following'?'Seguindo':'Amigos')),
-    body: MeowStreamBuilder<QuerySnapshot<Map<String,dynamic>>>(
-      stream: db.collection('users').doc(uid).collection(kind=='friends'?'following':kind).meowSnapshots(),
+    body:kind=='friends'?MutualFriendsList(uid:uid):MeowStreamBuilder<QuerySnapshot<Map<String,dynamic>>>(
+      stream: db.collection('users').doc(uid).collection(kind).meowSnapshots(),
       builder: (context,s) {
         if(s.hasError)return Center(child:Text('Erro: ${s.error}'));
         if(!s.hasData)return const Center(child:CircularProgressIndicator());
         final docs=s.data!.docs;
-        if(kind=='friends')return MutualFriendsList(uid:uid);
-        if(kind!='friends')return ListView(children:[for(final d in docs) ListTile(
-          leading: ProfileAvatar(uid:d.id), title: UserDisplayName(uid:d.id),dense:false,visualDensity:VisualDensity.standard,contentPadding:const EdgeInsets.symmetric(horizontal:16,vertical:5),
-          onTap:()=>openProfile(context,d.id))]);
-        return ListView(children:[for(final d in docs) MeowStreamBuilder<DocumentSnapshot<Map<String,dynamic>>>(
-          stream:db.collection('users').doc(d.id).collection('following').doc(uid).meowSnapshots(),
-          builder:(context,other)=>other.data?.exists==true?ListTile(
-            leading:ProfileAvatar(uid:d.id),title:UserDisplayName(uid:d.id),
-            onTap:()=>openProfile(context,d.id)):const SizedBox.shrink())]);
+        return ListView.builder(itemCount:docs.length,itemBuilder:(c,i){final d=docs[i];return ListTile(key:ValueKey(d.id),leading:ProfileAvatar(uid:d.id),title:UserDisplayName(uid:d.id),dense:false,visualDensity:VisualDensity.standard,contentPadding:const EdgeInsets.symmetric(horizontal:16,vertical:5),onTap:()=>openProfile(c,d.id));});
       }));
 }
 class UserDisplayName extends StatelessWidget {
@@ -950,35 +1014,26 @@ class FollowButton extends StatelessWidget {
       style:FilledButton.styleFrom(backgroundColor:Theme.of(context).colorScheme.primary,foregroundColor:Theme.of(context).colorScheme.onPrimary,padding:const EdgeInsets.symmetric(horizontal:8)),
       child:FittedBox(fit:BoxFit.scaleDown,child:Text(s.data?.exists==true?'Deixar de seguir':'Seguir',maxLines:1)))));
 }
-class MeowMutualChecks {
- static final _cached=Expando<Future<List<String>>>('meowMutual');
- static final _empty=Future<List<String>>.value(<String>[]);
- static Future<List<String>> ids(String uid,QuerySnapshot<Map<String,dynamic>>? snapshot){
-   if(snapshot==null)return _empty;
-   return _cached[snapshot]??=Future.wait(snapshot.docs.map((d)=>db.collection('users').doc(d.id).collection('following').doc(uid).get())).then((checks)=>checks.where((d)=>d.exists).map((d)=>d.reference.parent.parent!.id).toList());
- }
+// UI only: toggleFollow updates following and followers in one atomic batch.
+// Never use this denormalized view as a substitute for Firestore authorization.
+List<String> meowMutualIds(QuerySnapshot<Map<String,dynamic>> following,QuerySnapshot<Map<String,dynamic>> followers){
+  final incoming=followers.docs.map((d)=>d.id).toSet();
+  return following.docs.map((d)=>d.id).where(incoming.contains).toList();
+}
+class MeowMutualView extends StatelessWidget {
+ final String uid;final Widget Function(BuildContext,List<String>?) builder;final Widget? error;
+ const MeowMutualView({super.key,required this.uid,required this.builder,this.error});
+ @override Widget build(BuildContext c)=>MeowStreamBuilder<QuerySnapshot<Map<String,dynamic>>>(stream:db.collection('users').doc(uid).collection('following').meowSnapshots(),builder:(c,a)=>MeowStreamBuilder<QuerySnapshot<Map<String,dynamic>>>(stream:db.collection('users').doc(uid).collection('followers').meowSnapshots(),builder:(c,b)=>(a.hasError||b.hasError)&&error!=null?error!:builder(c,a.hasError||b.hasError||!a.hasData||!b.hasData?null:meowMutualIds(a.data!,b.data!))));
 }
 class RelationshipCounters extends StatelessWidget {
   final String uid;
   const RelationshipCounters({super.key,required this.uid});
   @override Widget build(BuildContext context)=>Row(children:[
-    for(final kind in ['followers','following','friends']) ...[if(kind!='followers')Container(width:1,height:30,color:Theme.of(context).colorScheme.onSurface.withOpacity(.24)),Expanded(child:MeowStreamBuilder<QuerySnapshot<Map<String,dynamic>>>(
-      stream:db.collection('users').doc(uid).collection(kind=='friends'?'following':kind).meowSnapshots(),
-      builder:(context,s){
-        if(kind=='friends')return FutureBuilder<List<String>>(future: MeowMutualChecks.ids(uid,s.data),builder:(context,c)=>_counter(context,kind,c.data?.length??0));
-        return _counter(context,kind,s.data?.docs.length??0);
-      }))]]);
+    for(final kind in ['followers','following','friends']) ...[if(kind!='followers')Container(width:1,height:30,color:Theme.of(context).colorScheme.onSurface.withOpacity(.24)),Expanded(child:kind=='friends'?MeowMutualView(uid:uid,builder:(c,ids)=>_counter(c,kind,ids?.length??0)):MeowStreamBuilder<QuerySnapshot<Map<String,dynamic>>>(
+      stream:db.collection('users').doc(uid).collection(kind).meowSnapshots(),builder:(c,s)=>_counter(c,kind,s.data?.docs.length??0)))]]);
   Widget _counter(BuildContext c,String kind,int count)=>TextButton(
     onPressed:()=>Navigator.push(c,MaterialPageRoute(builder:(_)=>RelationshipListPage(uid:uid,kind:kind))),
-    child:Column(children:[Text('$count',style:const TextStyle(fontWeight:FontWeight.bold)),
-      Text(kind=='followers'?'Seguidores':kind=='following'?'Seguindo':'Amigos',style:const TextStyle(fontSize:11))]));
-  Future<int> _mutualCount(String uid,List<QueryDocumentSnapshot<Map<String,dynamic>>> docs)async{
-    var count=0;
-    for(final d in docs){
-      if((await db.collection('users').doc(d.id).collection('following').doc(uid).get()).exists)count++;
-    }
-    return count;
-  }
+    child:Column(children:[Text('$count',style:const TextStyle(fontWeight:FontWeight.bold)),Text(kind=='followers'?'Seguidores':kind=='following'?'Seguindo':'Amigos',style:const TextStyle(fontSize:11))]));
 }
 
 class MeowIdLabel extends StatelessWidget {
@@ -1000,7 +1055,7 @@ const meowBadgeDefinitions=[
  MeowBadgeDefinition('beta_tester','Testador Beta','Participou dos testes da versão Beta.',Icons.science_outlined,Color(0xFF60A5FA)),
  MeowBadgeDefinition('bug_hunter','Caçador de Bugs','Contribuiu identificando problemas no Meow.',Icons.bug_report_outlined,Color(0xFF4ADE80)),
 ];
-Widget meowBadgeArt(MeowBadgeDefinition badge,{double size=38})=>Image.asset('assets/badges/${badge.id}.png',width:size,height:size,fit:BoxFit.contain);
+Widget meowBadgeArt(MeowBadgeDefinition badge,{double size=20})=>Image.asset('assets/badges/${badge.id}.png',width:size,height:size,fit:BoxFit.contain);
 Set<String> meowBadges(Map<String,dynamic> data){
  final raw=data['badges'];
  return raw is List?raw.whereType<String>().where((id)=>meowBadgeDefinitions.any((b)=>b.id==id)).toSet():<String>{};
@@ -1024,8 +1079,8 @@ class _MeowProfileBadgesState extends State<MeowProfileBadges> {
  @override void dispose(){dismiss();super.dispose();}
  @override Widget build(BuildContext c){
    final ids=meowBadges(widget.data);if(ids.isEmpty)return const SizedBox.shrink();
-   return Center(child:Container(margin:const EdgeInsets.symmetric(vertical:6),padding:const EdgeInsets.symmetric(horizontal:6),decoration:BoxDecoration(color:widget.background,borderRadius:BorderRadius.circular(18)),child:Wrap(alignment:WrapAlignment.center,crossAxisAlignment:WrapCrossAlignment.center,spacing:2,children:[
-     for(final badge in meowBadgeDefinitions)if(ids.contains(badge.id))IconButton(tooltip:badge.title,constraints:const BoxConstraints(minWidth:44,minHeight:44),padding:const EdgeInsets.all(2),icon:meowBadgeArt(badge),onPressed:()=>show(badge))
+   return Center(child:Container(margin:const EdgeInsets.symmetric(vertical:6),padding:const EdgeInsets.symmetric(horizontal:3),decoration:BoxDecoration(color:const Color(0xE619191F),borderRadius:BorderRadius.circular(12)),child:Wrap(alignment:WrapAlignment.center,crossAxisAlignment:WrapCrossAlignment.center,spacing:0,children:[
+     for(final badge in meowBadgeDefinitions)if(ids.contains(badge.id))IconButton(tooltip:badge.title,constraints:const BoxConstraints(minWidth:36,minHeight:36),padding:const EdgeInsets.all(5),visualDensity:VisualDensity.compact,icon:meowBadgeArt(badge),onPressed:()=>show(badge))
    ])));
  }
 }
@@ -1137,7 +1192,7 @@ class ProfilePage extends StatelessWidget {
           Padding(padding:const EdgeInsets.symmetric(horizontal:12),child:Text(userLabel(d),textAlign:TextAlign.center,maxLines:1,overflow:TextOverflow.ellipsis,style:TextStyle(fontSize:25,fontWeight:FontWeight.bold,color:ink))),
           if((d['pronouns']?.toString()??'').isNotEmpty)Text(d['pronouns'].toString(),textAlign:TextAlign.center,style:TextStyle(color:ink.withOpacity(.8),fontSize:12)),
           MeowProfileBadges(data:d,background:cardColor,ink:ink),
-          Row(mainAxisAlignment:MainAxisAlignment.center,children:[Icon(Icons.circle,size:9,color:presenceColor(presence)),const SizedBox(width:6),Text(presenceLabels[presence]??'Offline',style:TextStyle(color:ink.withOpacity(.75)))]),
+          MeowPresenceText(data:d,style:TextStyle(color:ink.withOpacity(.75)),withDot:true,preview:draft==null?null:presence),
           ]);
         }),
         Padding(padding:const EdgeInsets.all(16),child:Column(crossAxisAlignment:CrossAxisAlignment.stretch,children:[
@@ -1195,7 +1250,7 @@ class MeowCacheMaintenance {
  static const key='meow_last_cache_cleanup_091';static bool busy=false;
  static Future<DateTime?> last()async{final p=await SharedPreferences.getInstance();final n=p.getInt(key);return n==null?null:DateTime.fromMillisecondsSinceEpoch(n);}
  static Future<void> maybeClean()async{try{final p=await last();if(p==null||DateTime.now().difference(p)>=const Duration(hours:12))await clean(automatic:true);}catch(e){MeowQuietLog.warning('cache-clean','Meow: falha temporária na limpeza do cache.');}}
- static Future<void> clean({bool automatic=false})async{if(busy)return;busy=true;try{if(automatic){PrivateMediaCache.pruneExpired();await PrivateMediaCache.pruneDisk();}else{PrivateMediaCache.purgeCompleted();await PrivateMediaCache.purgeDisk();}await MeowVideoCache.clear();final prefs=await SharedPreferences.getInstance();await prefs.setInt(key,DateTime.now().millisecondsSinceEpoch);}finally{busy=false;}}
+ static Future<void> clean({bool automatic=false})async{if(busy)return;busy=true;try{if(automatic){PrivateMediaCache.pruneExpired();await PrivateMediaCache.pruneDisk();}else{PrivateMediaCache.purgeCompleted();await PrivateMediaCache.purgeDisk();}if(automatic){await MeowVideoCache.pruneExpired();}else{await MeowVideoCache.clear();}final prefs=await SharedPreferences.getInstance();await prefs.setInt(key,DateTime.now().millisecondsSinceEpoch);}finally{busy=false;}}
 }
 class MeowStoragePage extends StatefulWidget{const MeowStoragePage({super.key});@override State<MeowStoragePage> createState()=>_MeowStoragePageState();}
 class _MeowStoragePageState extends State<MeowStoragePage>{
@@ -1535,6 +1590,11 @@ class _SocialHomeState extends State<SocialHome> with WidgetsBindingObserver {
     else if(state==AppLifecycleState.paused||state==AppLifecycleState.hidden||state==AppLifecycleState.detached){if(pausedAt==null){MeowStreams.foreground(false);pausedAt=DateTime.now();unawaited(touchPresence(closed:true));}}
     syncNativeThread();
   }
+  @override void didHaveMemoryPressure(){
+    PaintingBinding.instance.imageCache.clear();
+    PrivateMediaCache.purgeCompleted();
+    MeowGraphics.reduce();
+  }
   Future<void> initNotifications()async{
     try{
       final fcm=FirebaseMessaging.instance;final registeredUid=myUid;
@@ -1596,11 +1656,11 @@ class _SocialHomeState extends State<SocialHome> with WidgetsBindingObserver {
     if(seenNotifications.length>300)seenNotifications.remove(seenNotifications.first);
     if(activeThread.value==threadFromPath(path))return;
     try{
-      final snap=await db.doc(path).get();if(!snap.exists||!mounted)return;
+      final snap=await MeowStreams.getDocument(db.doc(path));if(!snap.exists||!mounted||message.data['recipientId']!=FirebaseAuth.instance.currentUser?.uid)return;
       final d=snap.data()!;final sender=d['authorId']?.toString()??'';
-      final u=MeowStreams.cachedProfile(sender)??(await db.collection('users').doc(sender).get()).data()??{};
+      final u=await MeowStreams.displayProfile(sender);
       final text=(d['text']?.toString()??'').trim();
-      if(!mounted||activeThread.value==threadFromPath(path))return;
+      if(!mounted||message.data['recipientId']!=FirebaseAuth.instance.currentUser?.uid||activeThread.value==threadFromPath(path))return;
       dismissNotification();
       overlayThread=threadFromPath(path);
       notificationOverlay=OverlayEntry(builder:(c)=>Positioned(top:MediaQuery.paddingOf(c).top+8,left:12,right:12,child:MeowNotificationBanner(key:ValueKey(path),sender:sender,title:userLabel(u),subtitle:message.data['kind']=='reply'?'Respondeu à sua mensagem':message.data['kind']=='mention'?'Mencionou você':path.startsWith('dms/')?'Mensagem privada':'Mensagem no servidor',preview:text.isEmpty?(message.data['notificationBody']?.toString()??'Nova mensagem'):text,onDismiss:dismissNotification,onTap:(){dismissNotification();openNotification(message);} )));
@@ -1614,7 +1674,7 @@ class _SocialHomeState extends State<SocialHome> with WidgetsBindingObserver {
     final now=DateTime.now();if(lastOpenedNotification==path&&lastOpenedAt!=null&&now.difference(lastOpenedAt!)<const Duration(seconds:2))return;
     lastOpenedNotification=path;lastOpenedAt=now;
     try{
-      final snap=await db.doc(path).get();if(!snap.exists||!mounted)return;
+      final snap=await MeowStreams.getDocument(db.doc(path));if(!snap.exists||!mounted||message.data['recipientId']!=FirebaseAuth.instance.currentUser?.uid)return;
       final parts=path.split('/');final nav=meowNavigator.currentState;if(nav==null)return;
       if(parts.first=='dms'){
         final dm=(await db.collection('dms').doc(parts[1]).get()).data();final others=List<String>.from(dm?['members']??[]).where((x)=>x!=myUid);
@@ -1854,7 +1914,7 @@ class _DmListPageState extends State<DmListPage> {
    final row=_MeowDmRow(d.id,others.first);rows[d.id]=row;void changed(){if(mounted&&listening&&identical(rows[d.id],row))setState((){});}
    row.subs.add(d.reference.collection('messages').orderBy('createdAt',descending:true).limit(1).meowSnapshots().listen((m){row.latest=m.docs.isEmpty?null:m.docs.first.data();row.messagesReady=true;changed();},onError:(Object e){row.latest=null;row.messagesReady=true;changed();}));
    row.subs.add(db.collection('dmRequests').doc(d.id).meowSnapshots().listen((r){row.request=r.data();row.requestReady=true;changed();},onError:(Object e){row.requestReady=false;changed();}));
-   row.subs.add(db.collection('users').doc(row.other).meowSnapshots().listen((u){row.profile=u.data()??{};changed();},onError:(Object _){}));
+   row.subs.add(db.collection('users').doc(row.other).meowSnapshots().listen((u){final next=u.data()??{};final prev=row.profile;row.profile=next;if(userLabel(prev)!=userLabel(next)||meowSerial(prev)!=meowSerial(next))changed();},onError:(Object _){}));
   }
   setState((){loaded=true;error=null;});
  }
@@ -1864,7 +1924,7 @@ class _DmListPageState extends State<DmListPage> {
   const h=72.0;
   return Column(children:[ListTile(title:const Text('Mensagens privadas',style:TextStyle(fontSize:22,fontWeight:FontWeight.bold)),trailing:Stack(children:[IconButton(tooltip:'Solicitações',onPressed:()=>Navigator.push(c,MaterialPageRoute(builder:(_)=>DmRequestsPage(uid:widget.uid))),icon:const Icon(Icons.mail_outline)),Positioned(right:5,top:5,child:DmRequestsDot(uid:widget.uid))])),
   Padding(padding:const EdgeInsets.symmetric(horizontal:12),child:TextField(decoration:const InputDecoration(hintText:'Buscar por nome ou ID',prefixIcon:Icon(Icons.search)),onChanged:(v)=>setState(()=>query=v.trim().toLowerCase()))),
-  Expanded(child:error!=null?Center(child:Text(error!)):!loaded?const Center(child:CircularProgressIndicator()):visible.isEmpty?const Center(child:Text('Nenhuma conversa.')):SingleChildScrollView(child:SizedBox(height:h*visible.length,child:Stack(clipBehavior:Clip.hardEdge,children:[for(var i=0;i<visible.length;i++)AnimatedPositioned(key:ValueKey(visible[i].id),duration:const Duration(milliseconds:240),curve:Curves.easeOutCubic,top:i*h,left:0,right:0,height:h,child:Builder(builder:(c){final r=visible[i];return ListTile(leading:ProfileAvatar(uid:r.other),title:Text(userLabel(r.profile)),subtitle:_MeowDmTypingPreview(id:r.id,uid:widget.uid,other:r.other,latest:r.latest!),trailing:ThreadUnreadDot(threadId:'dm:${r.id}',uid:widget.uid,collection:db.collection('dms').doc(r.id).collection('messages')),onTap:()=>Navigator.push(c,CupertinoPageRoute<void>(builder:(_)=>DmChatPage(id:r.id,other:r.other,uid:widget.uid))));}))]))))]);
+  Expanded(child:error!=null?Center(child:Text(error!)):!loaded?const Center(child:CircularProgressIndicator()):visible.isEmpty?const Center(child:Text('Nenhuma conversa.')):SingleChildScrollView(child:SizedBox(height:h*visible.length,child:Stack(clipBehavior:Clip.hardEdge,children:[for(var i=0;i<visible.length;i++)AnimatedPositioned(key:ValueKey(visible[i].id),duration:MeowGraphics.duration(c,240),curve:Curves.easeOutCubic,top:i*h,left:0,right:0,height:h,child:Builder(builder:(c){final r=visible[i];return ListTile(leading:ProfileAvatar(uid:r.other),title:Text(userLabel(r.profile)),subtitle:_MeowDmTypingPreview(id:r.id,uid:widget.uid,other:r.other,latest:r.latest!),trailing:ThreadUnreadDot(threadId:'dm:${r.id}',uid:widget.uid,collection:db.collection('dms').doc(r.id).collection('messages')),onTap:()=>Navigator.push(c,CupertinoPageRoute<void>(builder:(_)=>DmChatPage(id:r.id,other:r.other,uid:widget.uid))));}))]))))]);
  }
 }
 class _MeowDmRow {
@@ -1907,8 +1967,9 @@ Stream<MeowMessageDocs> _meowUnreadSource(String thread,String uid,CollectionRef
     StreamSubscription<QuerySnapshot<Map<String,dynamic>>>? messages;
     StreamSubscription<QuerySnapshot<Map<String,dynamic>>>? receipt;
     bool closed=false,ready=false;int epoch=0;Timestamp? seen;MeowMessageDocs last=[];
+    MeowMessageDocs visibleUnread()=>last.where((d){final at=d.data()['createdAt'];return seen==null||(at is Timestamp&&at.compareTo(seen!)>0);}).toList();
     void stopMessages(){epoch++;messages?.cancel();messages=null;}
-    void publish(MeowMessageDocs docs){if(!closed){last=docs;client.add(docs);}}
+    void publish(MeowMessageDocs docs){if(!closed){last=docs;client.add(visibleUnread());}}
     void fail(Object error,StackTrace stack){if(closed)return;publish([]);client.addError(error,stack);}
     client.onCancel=(){closed=true;stopMessages();receipt?.cancel();};
     final receiptId=receiptRef(thread,uid).id;
@@ -1920,14 +1981,19 @@ Stream<MeowMessageDocs> _meowUnreadSource(String thread,String uid,CollectionRef
       if(own?.metadata.hasPendingWrites==true||(own==null&&r.metadata.isFromCache))return;
       final value=own?.data()['at'];final next=value is Timestamp?value:null;
       if(ready&&seen==next&&messages!=null)return;
-      ready=true;seen=next;stopMessages();
-      if(next!=null){publish(last.where((d){final at=d.data()['createdAt'];return at is Timestamp&&at.compareTo(next)>0;}).toList());}else{publish([]);}
+      final previous=seen;
+      final forward=ready&&messages!=null&&next!=null&&(previous==null||next.compareTo(previous)>=0);
+      ready=true;seen=next;
+      // Descending limit(100) already contains every newer matching document.
+      // Keep the existing window when the receipt advances; do not re-read it.
+      if(forward){client.add(visibleUnread());return;}
+      stopMessages();publish([]);
       Query<Map<String,dynamic>> query=collection.orderBy('createdAt',descending:true);
       if(next!=null)query=query.where('createdAt',isGreaterThan:next);
       final generation=epoch;
-      messages=query.limit(100).snapshots().listen((snapshot){
+      messages=query.limit(100).meowSnapshots().listen((snapshot){
         if(!closed&&generation==epoch&&FirebaseAuth.instance.currentUser?.uid==uid)publish(snapshot.docs);
-      },onError:(Object e,StackTrace st){if(generation==epoch)fail(e,st);});
+      },onError:(Object e,StackTrace st){if(generation==epoch){stopMessages();ready=false;fail(e,st);}});
     },onError:(Object e,StackTrace st){ready=false;stopMessages();fail(e,st);});
   },isBroadcast:true);
 }
@@ -1949,14 +2015,14 @@ class MessageThread extends StatefulWidget {
   dynamic>> collection;
   final String uid,
   threadId;
-  final String? serverId,initialMessageId; final bool visible,readOnly;
+  final String? serverId,initialMessageId; final bool visible,readOnly,directDmSend;
   final VoidCallback? onNavigateRight;
   const MessageThread({
     super.key,
     required this.collection,
     required this.uid,
     required this.threadId,
-    this.serverId,this.initialMessageId,this.visible=true,this.readOnly=false,this.onNavigateRight
+    this.serverId,this.initialMessageId,this.visible=true,this.readOnly=false,this.directDmSend=false,this.onNavigateRight
 }
 );
   @override State<MessageThread> createState()=>_MessageThreadState();
@@ -1966,6 +2032,10 @@ class _MeowHistoryPage {
   final Query<Map<String,dynamic>> query;
   final QueryDocumentSnapshot<Map<String,dynamic>> lastBoundary;
   MeowMessageDocs docs;
+  MeowMessageDocs bounded(MeowMessageDocs values){
+    final edge=lastBoundary.data()['createdAt'];if(edge is! Timestamp)return values;
+    return values.where((d){final t=d.data()['createdAt'];if(t is! Timestamp)return false;final cmp=t.compareTo(edge);return cmp>0||(cmp==0&&d.id.compareTo(lastBoundary.id)>=0);}).toList();
+  }
   StreamSubscription<QuerySnapshot<Map<String,dynamic>>>? sub;
   int epoch=0;
   _MeowHistoryPage(this.query,this.lastBoundary,this.docs);
@@ -1975,6 +2045,7 @@ class _MessageThreadState extends State<MessageThread> with RouteAware,WidgetsBi
   final itemScroll=ItemScrollController();
   final itemPositions=ItemPositionsListener.create();
   List<QueryDocumentSnapshot<Map<String,dynamic>>> historyDocs=[];
+  MeowMessageDocs historyPreview=[];
   final historyPages=<_MeowHistoryPage>[];
   bool historyHeadFixed=false;
   bool loadingHistory=false,historyEnded=false,historyWaiting=false;
@@ -1982,7 +2053,7 @@ class _MessageThreadState extends State<MessageThread> with RouteAware,WidgetsBi
   Timer? flashTimer,historyTimer;
   String? expectedOldest;
   int historyEpoch=0;
-  QueryDocumentSnapshot<Map<String,dynamic>>? historyStart;
+  DocumentSnapshot<Map<String,dynamic>>? historyStart;
   Query<Map<String,dynamic>> get historyQuery=>widget.collection.orderBy('createdAt',descending:true);
   Query<Map<String,dynamic>> get windowQuery=>historyStart==null?historyQuery:historyQuery.startAtDocument(historyStart!);
   bool jumped=false,routeActive=true,foreground=true,anchored=false;
@@ -1996,7 +2067,7 @@ class _MessageThreadState extends State<MessageThread> with RouteAware,WidgetsBi
   Set<String> memberIds=<String>{};
   bool memberRebuildQueued=false;
   @override void initState(){super.initState();WidgetsBinding.instance.addObserver(this);messages=historyQuery.limit(50).meowSnapshots(metadata:true);itemPositions.itemPositions.addListener(maybeLoadHistory);if(widget.visible)startMembers();if(widget.initialMessageId!=null)loadTarget();}
-  void clearHistoryPages(){for(final page in historyPages){page.stop();}historyPages.clear();historyHeadFixed=false;}
+  void clearHistoryPages(){for(final page in historyPages){page.stop();}historyPages.clear();historyPreview=[];historyHeadFixed=false;}
   void suspendHistoryPages(){for(final page in historyPages){page.stop();}}
   void syncHistoryPages(){
     if(!mounted||!widget.visible||!foreground||!routeActive){suspendHistoryPages();return;}
@@ -2010,7 +2081,7 @@ class _MessageThreadState extends State<MessageThread> with RouteAware,WidgetsBi
       page.sub=page.query.meowSnapshots(metadata:true).listen((snapshot){
         if(!mounted||currentHistory!=historyEpoch||e!=page.epoch)return;
         if(snapshot.metadata.isFromCache)return; // preserve known page until server reconciliation
-        setState((){page.docs=snapshot.docs;cachedMessagePane=null;});
+        setState((){page.docs=page.bounded(snapshot.docs);cachedMessagePane=null;});
       },onError:(Object error){
         if(!mounted||currentHistory!=historyEpoch||e!=page.epoch)return;
         if(error is FirebaseException&&error.code=='permission-denied'){setState((){page.docs=[];cachedMessagePane=null;});}
@@ -2032,20 +2103,29 @@ class _MessageThreadState extends State<MessageThread> with RouteAware,WidgetsBi
     final cursor=historyPages.isEmpty?historyDocs.last:historyPages.last.lastBoundary, epoch=historyEpoch;
     setState((){loadingHistory=true;historyError=null;cachedMessagePane=null;});
     try{
-      final page=await historyQuery.startAfterDocument(cursor).limit(50).get(const GetOptions(source:Source.server)).timeout(const Duration(seconds:15));
+      final query=historyQuery.startAfterDocument(cursor).limit(50);
+      final confirmed=Completer<QuerySnapshot<Map<String,dynamic>>>();
+      final subscription=query.meowSnapshots(metadata:true).listen((snapshot){
+        if(!mounted||epoch!=historyEpoch)return;
+        if(snapshot.metadata.isFromCache){
+          if(!confirmed.isCompleted)setState((){historyPreview=snapshot.docs;cachedMessagePane=null;});
+        }else if(!confirmed.isCompleted){confirmed.complete(snapshot);}
+      },onError:(Object error,StackTrace stack){if(!confirmed.isCompleted)confirmed.completeError(error,stack);},onDone:(){if(!confirmed.isCompleted)confirmed.completeError(StateError('Histórico desconectado.'));});
+      late QuerySnapshot<Map<String,dynamic>> page;
+      try{page=await confirmed.future.timeout(const Duration(seconds:15));}finally{await subscription.cancel();}
       if(!mounted||epoch!=historyEpoch)return;
       setState((){
-        historyEnded=page.docs.length<50;
+        historyPreview=[];historyEnded=page.docs.length<50;
         if(page.docs.isNotEmpty){
           // Freeze only the original live window once; following pages are disjoint.
           // Document cursors include document identity, even for identical timestamps.
           if(!historyHeadFixed){historyHeadFixed=true;messages=windowQuery.endAtDocument(cursor).meowSnapshots(metadata:true);}
-          historyPages.add(_MeowHistoryPage(historyQuery.startAfterDocument(cursor).endAtDocument(page.docs.last),page.docs.last,page.docs));
+          historyPages.add(_MeowHistoryPage(query,page.docs.last,page.docs));
         }
         loadingHistory=false;cachedMessagePane=null;
       });
       WidgetsBinding.instance.addPostFrameCallback((_){if(mounted&&epoch==historyEpoch)syncHistoryPages();});
-    }catch(e){if(mounted&&epoch==historyEpoch)setState((){loadingHistory=false;historyError='Não foi possível carregar mensagens antigas.';cachedMessagePane=null;});}
+    }catch(e){if(mounted&&epoch==historyEpoch)setState((){if(e is FirebaseException&&e.code=='permission-denied')historyPreview=[];loadingHistory=false;historyError='Não foi possível sincronizar mensagens antigas.';cachedMessagePane=null;});}
   }
   void resetHistory(){
     historyEpoch++;clearHistoryPages();flashTimer?.cancel();historyTimer?.cancel();expectedOldest=null;
@@ -2076,15 +2156,13 @@ class _MessageThreadState extends State<MessageThread> with RouteAware,WidgetsBi
     final epoch=historyEpoch;
     try{
       final id=widget.initialMessageId;if(id==null)return;
-      final target=await widget.collection.doc(id).get();
+      final target=await MeowStreams.getDocument(widget.collection.doc(id));
       if(!mounted||epoch!=historyEpoch||!target.exists||target.data()?['createdAt'] is! Timestamp)return;
-      final recent=await historyQuery.limit(50).get();
+      final recent=await historyQuery.limit(50).meowSnapshots(metadata:true).where((snapshot)=>!snapshot.metadata.isFromCache).timeout(const Duration(seconds:15)).first;
       if(!mounted||epoch!=historyEpoch)return;
       if(!recent.docs.any((d)=>d.id==id)){
-        // Fetch the exact target by snapshot, then the surrounding older page.
-        final page=await historyQuery.startAtDocument(target).limit(50).get();
-        if(!mounted||epoch!=historyEpoch||page.docs.isEmpty)return;
-        setState((){historyEpoch++;clearHistoryPages();historyTimer?.cancel();expectedOldest=null;anchored=true;jumped=false;historyEnded=false;loadingHistory=false;historyWaiting=false;historyError=null;historyDocs=[];cachedMessagePane=null;historyStart=page.docs.first;messages=windowQuery.limit(50).meowSnapshots(metadata:true);});
+        // The exact target is already a document cursor; let the live window fetch once.
+        setState((){historyEpoch++;clearHistoryPages();historyTimer?.cancel();expectedOldest=null;anchored=true;jumped=false;historyEnded=false;loadingHistory=false;historyWaiting=false;historyError=null;historyDocs=[];cachedMessagePane=null;historyStart=target;messages=windowQuery.limit(50).meowSnapshots(metadata:true);});
       }
     }catch(e){if(mounted)notice(context,'Não foi possível localizar a mensagem.');}
   }
@@ -2172,12 +2250,12 @@ class _MessageThreadState extends State<MessageThread> with RouteAware,WidgetsBi
   void typingChanged(String value){
     if(widget.readOnly||!widget.visible||!routeActive||!foreground||value.trim().isEmpty){unawaited(stopTyping());return;}
     final now=DateTime.now();
-    if(lastTyping==null||now.difference(lastTyping!).inMilliseconds>=4000){
+    if(lastTyping==null||now.difference(lastTyping!).inMilliseconds>=5000){
       lastTyping=now;
       unawaited(typingRef.set({'at':FieldValue.serverTimestamp()}).catchError((Object _){}));
     }
     typingTimer?.cancel();
-    typingTimer=Timer(const Duration(seconds:3),()=>unawaited(stopTyping()));
+    typingTimer=Timer(const Duration(seconds:5),()=>unawaited(stopTyping()));
   }
 
   String? replyId,
@@ -2216,7 +2294,7 @@ class _MessageThreadState extends State<MessageThread> with RouteAware,WidgetsBi
     if(widget.readOnly||(text.isEmpty&&attachments.isEmpty&&expression==null)||sending)return false;
     setState(()=>sending=true);
     try{
-      final u=people[widget.uid]??MeowStreams.cachedProfile(widget.uid)??(await db.collection('users').doc(widget.uid).get()).data()??<String,dynamic>{};
+      final u=people[widget.uid]??await MeowStreams.displayProfile(widget.uid);
       final data=<String,
       dynamic>{
         'text':text,
@@ -2239,6 +2317,9 @@ class _MessageThreadState extends State<MessageThread> with RouteAware,WidgetsBi
       final sent=widget.collection.doc();
       Future<void> writeMessage() async {
         if(widget.serverId==null){
+          if(widget.directDmSend){
+            try{await sent.set(data);return;}on FirebaseException catch(e){if(e.code!='permission-denied')rethrow;}
+          }
           final dm=widget.collection.parent!;
           final request=db.collection('dmRequests').doc(dm.id);
           await db.runTransaction((tx)async{
@@ -2301,22 +2382,31 @@ class _MessageThreadState extends State<MessageThread> with RouteAware,WidgetsBi
 }
   bool uploading=false;double? uploadProgress;
   final pendingAttachments=<MeowPendingAttachment>[];
-  Future<void> attach()async{
+  bool galleryOpen=false,galleryExpanded=false;
+  void closeGallery(){if(mounted&&galleryOpen)setState((){galleryOpen=false;galleryExpanded=false;});}
+  void attach(){
     if(uploading||sending||widget.readOnly)return;
+    if(galleryOpen){closeGallery();return;}
+    if(pendingAttachments.length>=5){notice(context,'Até 5 arquivos por mensagem.');return;}
+    inputFocus.unfocus();
+    setState((){galleryOpen=true;galleryExpanded=false;});
+  }
+  Future<void> addGalleryFiles(List<files.XFile> selected)async{
+    closeGallery();
     try{
-      final remaining=5-pendingAttachments.length;if(remaining<=0){notice(context,'Até 5 arquivos por mensagem.');return;}
-      final selected=await showModalBottomSheet<List<files.XFile>>(context:context,isScrollControlled:true,showDragHandle:true,backgroundColor:panel,builder:(_)=>MeowAttachmentPicker(maxCount:remaining));
-      if(selected==null)return;
-      if(!mounted)return;
       final added=<MeowPendingAttachment>[];
       for(final file in selected){
-        if(pendingAttachments.length+added.length>=5){notice(context,'Até 5 arquivos por mensagem.');break;}
+        if(pendingAttachments.length+added.length>=5)break;
         final length=await file.length();if(!mounted)return;
         if(length<1||length>attachmentLimit){notice(context,'${file.name}: limite de ${fileSizeLabel(attachmentLimit)} por arquivo.');continue;}
         added.add(MeowPendingAttachment(file,length));
       }
       if(mounted)setState(()=>pendingAttachments.addAll(added));
     }catch(e){if(mounted)notice(context,'Não foi possível selecionar arquivo: $e');}
+  }
+  void dragGallery(double delta){
+    if(delta< -18&&!galleryExpanded)setState(()=>galleryExpanded=true);
+    else if(delta>18){if(galleryExpanded){setState(()=>galleryExpanded=false);}else{closeGallery();}}
   }
   Future<Map<String,dynamic>> uploadOne(MeowPendingAttachment entry,int index,int total)async{
       final file=entry.file;final length=entry.length;
@@ -2472,7 +2562,8 @@ class _MessageThreadState extends State<MessageThread> with RouteAware,WidgetsBi
         if(!s.hasData)return const Center(child:CircularProgressIndicator());
         final head=s.data!.docs;
         final ids=<String>{};
-        final docs=<QueryDocumentSnapshot<Map<String,dynamic>>>[for(final d in head)if(ids.add(d.id))d,for(final page in historyPages)for(final d in page.docs)if(ids.add(d.id))d];
+        final confirmedDocs=<QueryDocumentSnapshot<Map<String,dynamic>>>[for(final d in head)if(ids.add(d.id))d,for(final page in historyPages)for(final d in page.docs)if(ids.add(d.id))d];
+        final docs=<QueryDocumentSnapshot<Map<String,dynamic>>>[...confirmedDocs,for(final d in historyPreview)if(ids.add(d.id))d];
         if(s.connectionState==ConnectionState.active){
           final previous=historyDocs;
           if(previous.isNotEmpty&&docs.isNotEmpty&&previous.first.id!=docs.first.id&&itemScroll.isAttached){
@@ -2484,7 +2575,7 @@ class _MessageThreadState extends State<MessageThread> with RouteAware,WidgetsBi
               if(index>=0&&index!=anchor.index)WidgetsBinding.instance.addPostFrameCallback((_){if(mounted&&itemScroll.isAttached)itemScroll.jumpTo(index:index,alignment:anchor.itemLeadingEdge);});
             }
           }
-          historyDocs=docs;
+          historyDocs=confirmedDocs;
           WidgetsBinding.instance.addPostFrameCallback((_){if(mounted)syncHistoryPages();});
           if(!s.data!.metadata.isFromCache&&(expectedOldest==null||docs.any((d)=>d.id==expectedOldest))){historyWaiting=false;expectedOldest=null;historyTimer?.cancel();if(!historyHeadFixed&&head.length<50)historyEnded=true;}
         }
@@ -2501,7 +2592,7 @@ class _MessageThreadState extends State<MessageThread> with RouteAware,WidgetsBi
           return ScrollablePositionedList.builder(key:PageStorageKey<String>(widget.threadId),itemScrollController:itemScroll,itemPositionsListener:itemPositions,reverse:true,padding:const EdgeInsets.all(12),itemCount:docs.length+1,itemBuilder:(c,
         i
 ){
-          if(i==docs.length)return Center(child:Padding(padding:const EdgeInsets.symmetric(vertical:8),child:loadingHistory||historyWaiting?const SizedBox(width:20,height:20,child:CircularProgressIndicator(strokeWidth:2)):historyError!=null?TextButton(onPressed:loadOlder,child:Text('$historyError Tentar novamente')):historyEnded?const Text('Início da conversa',style:TextStyle(color:Colors.white54,fontSize:12)):TextButton(onPressed:loadOlder,child:const Text('Carregar mensagens anteriores'))));
+          if(i==docs.length)return Center(child:Padding(padding:const EdgeInsets.symmetric(vertical:8),child:loadingHistory||historyWaiting?(historyPreview.isNotEmpty?const Text('Histórico em cache · sincronizando…',style:TextStyle(color:Colors.white54,fontSize:12)):const SizedBox(width:20,height:20,child:CircularProgressIndicator(strokeWidth:2))):historyError!=null?TextButton(onPressed:loadOlder,child:Text('$historyError Tentar novamente')):historyEnded?const Text('Início da conversa',style:TextStyle(color:Colors.white54,fontSize:12)):TextButton(onPressed:loadOlder,child:const Text('Carregar mensagens anteriores'))));
           final doc=docs[i],
           d=doc.data();
           final author=d['authorId']?.toString()??'';
@@ -2526,7 +2617,7 @@ class _MessageThreadState extends State<MessageThread> with RouteAware,WidgetsBi
             if(d['expression'] is Map)ExpressionImage(data:Map<String,dynamic>.from(d['expression'] as Map),message:doc.reference.path,size:(d['expression'] as Map)['kind']=='emoji'&&(d['text']?.toString()??'').isNotEmpty?26.0:null),
           ];
           final tailContents=<Widget>[
-            if(!widget.readOnly)ReactionBar(key:ValueKey(doc.id),ref:doc.reference,uid:widget.uid,positions:itemPositions.itemPositions,index:i,active:widget.visible&&routeActive&&foreground),
+            if(!widget.readOnly&&i<confirmedDocs.length)ReactionBar(key:ValueKey(doc.id),ref:doc.reference,uid:widget.uid,positions:itemPositions.itemPositions,index:i,active:widget.visible&&routeActive&&foreground),
             if(d['editedAt']!=null)const Text('(editada)',style:TextStyle(fontSize:11,color:Colors.white54)),
           ];
           final messageContents=<Widget>[...textContents,...mediaContents,...tailContents];
@@ -2557,7 +2648,7 @@ class _MessageThreadState extends State<MessageThread> with RouteAware,WidgetsBi
 }
 )
 );
-    @override Widget build(BuildContext c)=>Column(children:[if(anchored)TextButton(onPressed:resetHistory,child:const Text('Voltar às mensagens recentes')),messageArea(), if(uploading)LinearProgressIndicator(value:uploadProgress),ValueListenableBuilder<bool>(valueListenable:typingActive,builder:(c,active,_)=>active?TypingLabel(collection:widget.collection.parent!.collection('typing'),uid:widget.uid):const SizedBox.shrink()), if(!widget.readOnly&&replyId!=null)ListTile(dense:true, title:Text('Respondendo a $replyAuthor: $replyText', maxLines:1,
+    Widget buildChat(BuildContext c)=>Column(children:[if(anchored)TextButton(onPressed:resetHistory,child:const Text('Voltar às mensagens recentes')),messageArea(), if(uploading)LinearProgressIndicator(value:uploadProgress),ValueListenableBuilder<bool>(valueListenable:typingActive,builder:(c,active,_)=>active?TypingLabel(collection:widget.collection.parent!.collection('typing'),uid:widget.uid):const SizedBox.shrink()), if(!widget.readOnly&&replyId!=null)ListTile(dense:true, title:Text('Respondendo a $replyAuthor: $replyText', maxLines:1,
   overflow:TextOverflow.ellipsis
 ), trailing:IconButton(icon:const Icon(Icons.close), onPressed:()=>setState((){
     replyId=null;
@@ -2565,10 +2656,25 @@ class _MessageThreadState extends State<MessageThread> with RouteAware,WidgetsBi
     replyAuthor=null;replyAuthorId=null;
 }
 ))), if(!widget.readOnly&&pendingAttachments.isNotEmpty)attachmentTray(),if(!widget.readOnly)SafeArea(top:false, child:Padding(padding:const EdgeInsets.all(8), child:Row(children:[IconButton(tooltip:'Anexar arquivo',
-  onPressed:(sending||uploading)?null:attach, icon:Icon(uploading?Icons.hourglass_top:Icons.add_circle_outline)
-), Expanded(child:TextField(controller:input,focusNode:inputFocus, maxLength:2000, maxLines:4, minLines:1, decoration:InputDecoration(hintText:'Mensagem',counterText:'',border:OutlineInputBorder(borderRadius:BorderRadius.circular(24))), onChanged:typingChanged,onEditingComplete:(){if(!uploading&&!sending)sendQueued();})), IconButton(tooltip:'Emojis e figurinhas',icon:const Icon(Icons.emoji_emotions_outlined),onPressed:(sending||uploading)?null:()async{final v=await pickExpression(context);if(!mounted||v==null)return;if(v is String){input.text+=v;typingChanged(input.text);}else if(v is Map<String,dynamic>){await sendQueued(expression:v);}}), IconButton(onPressed:(sending||uploading)?null:()=>sendQueued(), icon:const Icon(Icons.send,
+  onPressed:(sending||uploading)?null:attach, icon:Icon(uploading?Icons.hourglass_top:galleryOpen?Icons.close:Icons.add_circle_outline)
+), Expanded(child:TextField(controller:input,focusNode:inputFocus,onTap:closeGallery, maxLength:2000, maxLines:4, minLines:1, decoration:InputDecoration(hintText:'Mensagem',counterText:'',border:OutlineInputBorder(borderRadius:BorderRadius.circular(24))), onChanged:typingChanged,onEditingComplete:(){if(!uploading&&!sending)sendQueued();})), IconButton(tooltip:'Emojis e figurinhas',icon:const Icon(Icons.emoji_emotions_outlined),onPressed:(sending||uploading)?null:()async{final v=await pickExpression(context);if(!mounted||v==null)return;if(v is String){input.text+=v;typingChanged(input.text);}else if(v is Map<String,dynamic>){await sendQueued(expression:v);}}), IconButton(onPressed:(sending||uploading)?null:()=>sendQueued(), icon:const Icon(Icons.send,
   color:purple
 ))])))]);
+  @override Widget build(BuildContext c)=>LayoutBuilder(builder:(c,b){
+    final show=galleryOpen&&!widget.readOnly&&widget.visible;
+    final height=b.maxHeight;
+    // Initial panel consumes layout space, not a modal overlay. Expanded panel overlays it.
+    final collapsed=show?(height*.44).clamp(0.0,max(0.0,height-130)).toDouble():0.0;
+    final expanded=height;
+    final effectiveExpanded=galleryExpanded||collapsed<132;
+    final panelHeight=effectiveExpanded?expanded:collapsed;
+    final duration=MeowGraphics.duration(c,180);
+    return Stack(children:[
+      Positioned.fill(child:Column(children:[Expanded(child:buildChat(c)),SizedBox(height:collapsed)])),
+      if(show&&effectiveExpanded)Positioned.fill(child:GestureDetector(onTap:closeGallery,child:const ColoredBox(color:Colors.black38))),
+      if(show)AnimatedPositioned(key:const ValueKey('meow-attachment-panel'),duration:duration,curve:Curves.easeOutCubic,left:0,right:0,bottom:0,height:panelHeight,child:Material(color:panel,borderRadius:const BorderRadius.vertical(top:Radius.circular(20)),clipBehavior:Clip.antiAlias,child:MeowAttachmentPicker(maxCount:5-pendingAttachments.length,expanded:effectiveExpanded,onDrag:dragGallery,onClose:closeGallery,onSelected:addGalleryFiles))),
+    ]);
+  });
 }
 
 List<Map<String,dynamic>> meowAttachments(Map<String,dynamic> data){
@@ -2722,6 +2828,7 @@ class MeowVideoCache {
   if(!_entries.values.any((e)=>e.file.path==file.path&&_fresh(e)))await _delete(file);
   await _prune();
  }
+ static Future<void> pruneExpired()=>_prune();
  static Future<int> bytes()async{var size=0;try{final dir=await directory();await for(final e in dir.list(followLinks:false)){if(e is File)size+=await e.length();}}catch(_){}return size;}
  static Future<void> clear()async{
   _epoch++;_owner=null;_entries.clear();_pending.clear();
@@ -2811,10 +2918,21 @@ class MutualFriendsList extends StatefulWidget {
  @override State<MutualFriendsList> createState()=>_MutualFriendsListState();
 }
 class _MutualFriendsListState extends State<MutualFriendsList>{
- StreamSubscription<QuerySnapshot<Map<String,dynamic>>>? following;final mutualSubs=<String,StreamSubscription<DocumentSnapshot<Map<String,dynamic>>>>{};final profileSubs=<String,StreamSubscription<DocumentSnapshot<Map<String,dynamic>>>>{};final profiles=<String,Map<String,dynamic>>{};Timer? timer;bool loaded=false;
- @override void initState(){super.initState();following=db.collection('users').doc(widget.uid).collection('following').meowSnapshots().listen((s){if(!mounted)return;final ids=s.docs.map((d)=>d.id).toSet();for(final id in mutualSubs.keys.toList()){if(!ids.contains(id)){mutualSubs.remove(id)?.cancel();profileSubs.remove(id)?.cancel();profiles.remove(id);}}for(final id in ids){mutualSubs.putIfAbsent(id,()=>db.collection('users').doc(id).collection('following').doc(widget.uid).meowSnapshots().listen((m){if(!mounted||!mutualSubs.containsKey(id))return;if(m.exists){profiles.putIfAbsent(id,()=>{});profileSubs.putIfAbsent(id,()=>db.collection('users').doc(id).meowSnapshots().listen((u){if(mounted&&profileSubs.containsKey(id))setState(()=>profiles[id]=u.data()??{});}));}else{profileSubs.remove(id)?.cancel();profiles.remove(id);}setState((){});}));}setState(()=>loaded=true);},onError:(Object _){if(mounted)setState(()=>loaded=true);});timer=Timer.periodic(const Duration(seconds:5),(_){if(mounted)setState((){});});}
- @override void dispose(){following?.cancel();timer?.cancel();for(final s in mutualSubs.values){s.cancel();}for(final s in profileSubs.values){s.cancel();}super.dispose();}
- @override Widget build(BuildContext c){if(!loaded)return const Center(child:CircularProgressIndicator());if(profiles.isEmpty)return const Center(child:Text('Nenhum amigo ainda.'));final entries=profiles.entries.toList()..sort((a,b){final offA=currentPresence(a.value)=='offline';final offB=currentPresence(b.value)=='offline';if(offA!=offB)return offA?1:-1;return userLabel(a.value).compareTo(userLabel(b.value));});return ListView(children:[for(final e in entries)ListTile(leading:ProfileAvatar(uid:e.key),title:Text(userLabel(e.value)),dense:false,visualDensity:VisualDensity.standard,contentPadding:const EdgeInsets.symmetric(horizontal:16,vertical:5),onTap:()=>openProfile(c,e.key))]);}
+ @override Widget build(BuildContext c)=>MeowMutualView(uid:widget.uid,error:const Center(child:Text('Não foi possível carregar amigos.')),builder:(c,ids)=>ids==null?const Center(child:CircularProgressIndicator()):ids.isEmpty?const Center(child:Text('Nenhum amigo ainda.')):_MeowFriendRows(ids:ids));
+}
+class _MeowFriendRows extends StatefulWidget{
+ final List<String> ids;const _MeowFriendRows({required this.ids});
+ @override State<_MeowFriendRows> createState()=>_MeowFriendRowsState();
+}
+class _MeowFriendRowsState extends State<_MeowFriendRows>{
+ final profiles=<String,Map<String,dynamic>>{};final subs=<String,StreamSubscription<DocumentSnapshot<Map<String,dynamic>>>>{};
+ final clock=MeowPresenceListClock();
+ void sync(){final wanted=TickerMode.of(context)?widget.ids.toSet():<String>{};for(final id in subs.keys.toList()){if(!wanted.contains(id)){subs.remove(id)?.cancel();profiles.remove(id);}}for(final id in wanted){profiles.putIfAbsent(id,()=>{});subs.putIfAbsent(id,()=>db.collection('users').doc(id).meowSnapshots().listen((u){if(!mounted||!subs.containsKey(id))return;final next=u.data()??{};final prev=profiles[id]??{};final changed=userLabel(prev)!=userLabel(next)||currentPresence(prev)!=currentPresence(next);profiles[id]=next;reschedule();if(changed)setState((){});},onError:(Object _){}));}reschedule();}
+ void reschedule()=>clock.schedule(TickerMode.of(context)?profiles.values:const <Map<String,dynamic>>[],(){if(mounted){setState((){});reschedule();}});
+ @override void didChangeDependencies(){super.didChangeDependencies();sync();}
+ @override void didUpdateWidget(covariant _MeowFriendRows old){super.didUpdateWidget(old);if(old.ids.length!=widget.ids.length||!old.ids.toSet().containsAll(widget.ids))sync();}
+ @override void dispose(){clock.cancel();for(final sub in subs.values){sub.cancel();}super.dispose();}
+ @override Widget build(BuildContext c){final entries=profiles.entries.toList()..sort((a,b){final offA=currentPresence(a.value)=='offline';final offB=currentPresence(b.value)=='offline';if(offA!=offB)return offA?1:-1;return userLabel(a.value).compareTo(userLabel(b.value));});return ListView.builder(itemCount:entries.length,itemBuilder:(c,i){final e=entries[i];return ListTile(key:ValueKey(e.key),leading:ProfileAvatar(uid:e.key),title:Text(userLabel(e.value)),dense:false,visualDensity:VisualDensity.standard,contentPadding:const EdgeInsets.symmetric(horizontal:16,vertical:5),onTap:()=>openProfile(c,e.key));});}
 }
 
 String formatMeowTime(DateTime date) {
@@ -3071,13 +3189,15 @@ class DmRequestsPage extends StatelessWidget {
 class DmPermissionGate extends StatelessWidget {
  final String id,uid,other;final String? initialMessageId;
  const DmPermissionGate({super.key,required this.id,required this.uid,required this.other,this.initialMessageId});
- Widget chat({bool readOnly=false})=>MessageThread(key:ValueKey(id),collection:db.collection('dms').doc(id).collection('messages'),uid:uid,threadId:'dm:$id',initialMessageId:initialMessageId,readOnly:readOnly);
+ Widget chat({bool readOnly=false,bool direct=false})=>MessageThread(key:ValueKey(id),collection:db.collection('dms').doc(id).collection('messages'),uid:uid,threadId:'dm:$id',initialMessageId:initialMessageId,readOnly:readOnly,directDmSend:direct);
  @override Widget build(BuildContext c)=>MeowStreamBuilder<DocumentSnapshot<Map<String,dynamic>>>(stream:db.collection('dmRequests').doc(id).meowSnapshots(),builder:(c,request){
    if(request.hasError)return const Center(child:Text('Conversa indisponível.'));
    if(!request.hasData)return const Center(child:CircularProgressIndicator());
    final data=request.data!.data();final status=data?['status'];
    // Accepted and not-yet-requested conversations never depend on mutual following for opening.
-   if(status=='accepted'||(!request.data!.exists))return chat();
+   if(status=='accepted')return chat(direct:true);
+   if(!request.data!.exists)return chat();
+   if(status=='pending'&&data?['from']==uid)return chat(direct:true);
    // Preserve the original precedence: mutual following overrides declined/pending restrictions.
    return MeowStreamBuilder<DocumentSnapshot<Map<String,dynamic>>>(stream:db.collection('users').doc(uid).collection('following').doc(other).meowSnapshots(),builder:(c,mine){
      if(mine.hasError)return const Center(child:Text('Não foi possível verificar a amizade.'));
@@ -3085,13 +3205,13 @@ class DmPermissionGate extends StatelessWidget {
      Widget nonMutual(){
        if(status=='declined')return const Center(child:Text('Solicitação recusada.'));
        if(status=='pending'&&data?['to']==uid)return Column(children:[Expanded(child:chat(readOnly:true)),SafeArea(top:false,child:Padding(padding:const EdgeInsets.all(12),child:Column(children:[const Text('Aceite para responder a esta conversa.'),const SizedBox(height:8),Row(children:[Expanded(child:OutlinedButton(onPressed:()async{try{await request.data!.reference.update({'status':'declined'});if(c.mounted)Navigator.maybePop(c);}catch(e){if(c.mounted)notice(c,e);}},child:const Text('Recusar'))),const SizedBox(width:8),Expanded(child:FilledButton(onPressed:()async{try{await request.data!.reference.update({'status':'accepted'});}catch(e){if(c.mounted)notice(c,e);}},child:const Text('Aceitar')))])])))]);
-       return chat();
+       return chat(direct:status=='pending'&&data?['from']==uid);
      }
      if(!mine.data!.exists)return nonMutual();
      return MeowStreamBuilder<DocumentSnapshot<Map<String,dynamic>>>(stream:db.collection('users').doc(other).collection('following').doc(uid).meowSnapshots(),builder:(c,theirs){
        if(theirs.hasError)return const Center(child:Text('Não foi possível verificar a amizade.'));
        if(!theirs.hasData)return const Center(child:CircularProgressIndicator());
-       return theirs.data!.exists?chat():nonMutual();
+       return theirs.data!.exists?chat(direct:true):nonMutual();
      });
    });
  });
@@ -3401,13 +3521,21 @@ class ExpressionSettings extends StatelessWidget{
 }
 String reactionKey(Map<String,dynamic> d){final e=d['expression'];return e is Map?'custom:${e['serverId']}:${e['id']}':'emoji:${d['emoji']}';}
 Future<void> addReaction(BuildContext c,DocumentReference<Map<String,dynamic>> ref,String uid)async{final selected=await pickExpression(c,reactionOnly:true);if(selected==null||!c.mounted)return;try{final data=<String,dynamic>{'at':FieldValue.serverTimestamp(),if(selected is String)'emoji':selected,if(selected is Map<String,dynamic>)'expression':selected};final own=ref.collection('reactions').doc(uid);final old=(await own.get()).data();if(old!=null&&reactionKey(old)==reactionKey(data)){await own.delete();}else{await own.set(data);}}catch(e){if(c.mounted)notice(c,e);}}
-class ReactionBar extends StatelessWidget{
+class ReactionBar extends StatefulWidget{
  final DocumentReference<Map<String,dynamic>> ref;final String uid;final ValueListenable<Iterable<ItemPosition>> positions;final int index;final bool active;
  const ReactionBar({super.key,required this.ref,required this.uid,required this.positions,required this.index,required this.active});
- @override Widget build(BuildContext c)=>ValueListenableBuilder<Iterable<ItemPosition>>(valueListenable:positions,builder:(c,visible,_){
-   final wanted=active&&TickerMode.of(c)&&visible.any((p)=>p.index==index&&p.itemTrailingEdge>0&&p.itemLeadingEdge<1);
-   return MeowStreamBuilder<QuerySnapshot<Map<String,dynamic>>>(stream:wanted?ref.collection('reactions').meowSnapshots():null,builder:(c,s){final groups=<String,List<QueryDocumentSnapshot<Map<String,dynamic>>>>{};for(final d in s.data?.docs??[]){groups.putIfAbsent(reactionKey(d.data()),()=>[]).add(d);}if(groups.isEmpty)return const SizedBox.shrink();return Padding(padding:const EdgeInsets.only(top:4),child:Wrap(spacing:5,runSpacing:4,children:[for(final g in groups.values)Builder(builder:(c){final data=g.first.data();final mine=g.any((d)=>d.id==uid);return InkWell(borderRadius:BorderRadius.circular(7),onTap:()async{try{final own=ref.collection('reactions').doc(uid);if(mine){await own.delete();}else{await own.set({'at':FieldValue.serverTimestamp(),if(data['expression'] is Map)'expression':data['expression'] else 'emoji':data['emoji']});}}catch(e){if(c.mounted)notice(c,e);}},child:Container(padding:const EdgeInsets.symmetric(horizontal:7,vertical:3),decoration:BoxDecoration(color:mine?purple.withOpacity(.22):panel,borderRadius:BorderRadius.circular(7),border:Border.all(color:mine?purple:Colors.white12)),child:Row(mainAxisSize:MainAxisSize.min,children:[if(data['expression'] is Map)ExpressionImage(data:Map<String,dynamic>.from(data['expression']),message:ref.path,reaction:g.first.id,size:20)else Text(data['emoji']?.toString()??'',style:const TextStyle(fontSize:20)),const SizedBox(width:4),Text('${g.length}',style:const TextStyle(fontSize:12))])));})]));});
- });
+ @override State<ReactionBar> createState()=>_ReactionBarState();
+}
+class _ReactionBarState extends State<ReactionBar>{
+ bool wanted=false;
+ DocumentReference<Map<String,dynamic>> get ref=>widget.ref;String get uid=>widget.uid;
+ bool visible()=>widget.active&&TickerMode.of(context)&&widget.positions.value.any((p)=>p.index==widget.index&&p.itemTrailingEdge>0&&p.itemLeadingEdge<1);
+ void changed(){if(!mounted)return;final next=visible();if(next!=wanted)setState(()=>wanted=next);}
+ @override void initState(){super.initState();widget.positions.addListener(changed);}
+ @override void didChangeDependencies(){super.didChangeDependencies();wanted=visible();}
+ @override void didUpdateWidget(covariant ReactionBar old){super.didUpdateWidget(old);if(old.positions!=widget.positions){old.positions.removeListener(changed);widget.positions.addListener(changed);}wanted=visible();}
+ @override void dispose(){widget.positions.removeListener(changed);super.dispose();}
+ @override Widget build(BuildContext c)=>MeowStreamBuilder<QuerySnapshot<Map<String,dynamic>>>(stream:wanted?ref.collection('reactions').meowSnapshots():null,builder:(c,s){final groups=<String,List<QueryDocumentSnapshot<Map<String,dynamic>>>>{};for(final d in s.data?.docs??[]){groups.putIfAbsent(reactionKey(d.data()),()=>[]).add(d);}if(groups.isEmpty)return const SizedBox.shrink();return Padding(padding:const EdgeInsets.only(top:4),child:Wrap(spacing:5,runSpacing:4,children:[for(final g in groups.values)Builder(builder:(c){final data=g.first.data();final mine=g.any((d)=>d.id==uid);return InkWell(borderRadius:BorderRadius.circular(7),onTap:()async{try{final own=ref.collection('reactions').doc(uid);if(mine){await own.delete();}else{await own.set({'at':FieldValue.serverTimestamp(),if(data['expression'] is Map)'expression':data['expression'] else 'emoji':data['emoji']});}}catch(e){if(c.mounted)notice(c,e);}},child:Container(padding:const EdgeInsets.symmetric(horizontal:7,vertical:3),decoration:BoxDecoration(color:mine?purple.withOpacity(.22):panel,borderRadius:BorderRadius.circular(7),border:Border.all(color:mine?purple:Colors.white12)),child:Row(mainAxisSize:MainAxisSize.min,children:[if(data['expression'] is Map)ExpressionImage(data:Map<String,dynamic>.from(data['expression']),message:ref.path,reaction:g.first.id,size:20)else Text(data['emoji']?.toString()??'',style:const TextStyle(fontSize:20)),const SizedBox(width:4),Text('${g.length}',style:const TextStyle(fontSize:12))])));})]));});
 }
 
 bool validMessagePath(String p)=>RegExp(r'^(dms/[\w-]+|servers/[\w-]+/channels/[\w-]+)/messages/[\w-]+$').hasMatch(p);
@@ -3455,15 +3583,16 @@ class ServerMembers extends StatefulWidget {
  @override State<ServerMembers> createState()=>_ServerMembersState();
 }
 class _ServerMembersState extends State<ServerMembers>{
- final users=<String,Map<String,dynamic>>{};final subs=<String,StreamSubscription<DocumentSnapshot<Map<String,dynamic>>>>{};StreamSubscription<DocumentSnapshot<Map<String,dynamic>>>? serverSub;Timer? timer;
- @override void initState(){super.initState();serverSub=db.collection('servers').doc(widget.server).meowSnapshots().listen((s){if(!mounted)return;final ids=List<String>.from(s.data()?['members']??[]).toSet();for(final id in subs.keys.toList()){if(!ids.contains(id)){subs.remove(id)?.cancel();users.remove(id);}}for(final id in ids){users.putIfAbsent(id,()=>{});subs.putIfAbsent(id,()=>db.collection('users').doc(id).meowSnapshots().listen((u){if(mounted)setState(()=>users[id]=u.data()??{});}));}setState((){});});timer=Timer.periodic(const Duration(seconds:5),(_){if(mounted)setState((){});});}
- @override void dispose(){timer?.cancel();serverSub?.cancel();for(final s in subs.values){s.cancel();}super.dispose();}
+ final users=<String,Map<String,dynamic>>{};final subs=<String,StreamSubscription<DocumentSnapshot<Map<String,dynamic>>>>{};StreamSubscription<DocumentSnapshot<Map<String,dynamic>>>? serverSub;final clock=MeowPresenceListClock();
+ void reschedule()=>clock.schedule(TickerMode.of(context)?users.values:const <Map<String,dynamic>>[],(){if(mounted){setState((){});reschedule();}});
+ @override void didChangeDependencies(){super.didChangeDependencies();reschedule();}
+ @override void initState(){super.initState();serverSub=db.collection('servers').doc(widget.server).meowSnapshots().listen((s){if(!mounted)return;final ids=List<String>.from(s.data()?['members']??[]).toSet();for(final id in subs.keys.toList()){if(!ids.contains(id)){subs.remove(id)?.cancel();users.remove(id);}}for(final id in ids){users.putIfAbsent(id,()=>{});subs.putIfAbsent(id,()=>db.collection('users').doc(id).meowSnapshots().listen((u){if(mounted&&subs.containsKey(id)){final next=u.data()??{};final prev=users[id]??{};users[id]=next;reschedule();if(userLabel(prev)!=userLabel(next)||currentPresence(prev)!=currentPresence(next))setState((){});}}));}reschedule();setState((){});});}
+ @override void dispose(){clock.cancel();serverSub?.cancel();for(final s in subs.values){s.cancel();}super.dispose();}
  @override Widget build(BuildContext c){final online=users.entries.where((e)=>currentPresence(e.value)!='offline').toList()..sort((a,b)=>userLabel(a.value).compareTo(userLabel(b.value)));final offline=users.entries.where((e)=>currentPresence(e.value)=='offline').toList()..sort((a,b)=>userLabel(a.value).compareTo(userLabel(b.value)));return SafeArea(child:Column(children:[ListTile(title:const Text('Membros',style:TextStyle(fontSize:20,fontWeight:FontWeight.bold)),trailing:IconButton(onPressed:()=>Navigator.pop(c),icon:const Icon(Icons.close))),Expanded(child:ListView(children:[for(final group in [online,offline])...[Padding(padding:const EdgeInsets.all(12),child:Text('${identical(group,online)?'ONLINE':'OFFLINE'} — ${group.length}',style:const TextStyle(fontSize:12,color:Colors.white70))),for(final e in group)ListTile(leading:ProfileAvatar(uid:e.key),title:Text(userLabel(e.value)),dense:false,visualDensity:VisualDensity.standard,contentPadding:const EdgeInsets.symmetric(horizontal:16,vertical:5),onTap:()=>openProfile(c,e.key))]]))]));}
 }
 class FriendsPreview extends StatelessWidget {
  final String uid;final Color background,ink;const FriendsPreview({super.key,required this.uid,required this.background,required this.ink});
- Future<List<String>> mutual(List<QueryDocumentSnapshot<Map<String,dynamic>>> docs)async{final checks=await Future.wait(docs.map((d)=>db.collection('users').doc(d.id).collection('following').doc(uid).get()));return checks.where((d)=>d.exists).map((d)=>d.reference.parent.parent!.id).toList();}
- @override Widget build(BuildContext c)=>MeowStreamBuilder<QuerySnapshot<Map<String,dynamic>>>(stream:db.collection('users').doc(uid).collection('following').meowSnapshots(),builder:(c,s)=>FutureBuilder<List<String>>(future:MeowMutualChecks.ids(uid,s.data),builder:(c,f){final ids=f.data??[];final preview=ids.take(6).toList();return InkWell(borderRadius:BorderRadius.circular(14),onTap:()=>Navigator.push(c,MaterialPageRoute(builder:(_)=>uid==myUid?FriendsPage(uid:uid):RelationshipListPage(uid:uid,kind:'friends'))),child:Container(padding:const EdgeInsets.all(12),decoration:BoxDecoration(color:background,borderRadius:BorderRadius.circular(14)),child:Row(children:[Expanded(child:Column(crossAxisAlignment:CrossAxisAlignment.start,children:[Text('Amigos (${ids.length})',style:TextStyle(fontWeight:FontWeight.bold,color:ink)),if(preview.isNotEmpty)...[const SizedBox(height:8),SizedBox(height:35,width:35.0+(preview.length-1)*25.0,child:Stack(children:[for(var i=0;i<preview.length;i++)Positioned(left:i*25.0,child:PrivateImage(scope:'profile',id:preview[i],slot:'avatar',size:35))]))]])),Icon(Icons.chevron_right,color:ink)])));}));
+ @override Widget build(BuildContext c)=>MeowMutualView(uid:uid,builder:(c,values){final ids=values??[];final preview=ids.take(6).toList();return InkWell(borderRadius:BorderRadius.circular(14),onTap:()=>Navigator.push(c,MaterialPageRoute(builder:(_)=>uid==myUid?FriendsPage(uid:uid):RelationshipListPage(uid:uid,kind:'friends'))),child:Container(padding:const EdgeInsets.all(12),decoration:BoxDecoration(color:background,borderRadius:BorderRadius.circular(14)),child:Row(children:[Expanded(child:Column(crossAxisAlignment:CrossAxisAlignment.start,children:[Text('Amigos (${ids.length})',style:TextStyle(fontWeight:FontWeight.bold,color:ink)),if(preview.isNotEmpty)...[const SizedBox(height:8),SizedBox(height:35,width:35.0+(preview.length-1)*25.0,child:Stack(children:[for(var i=0;i<preview.length;i++)Positioned(left:i*25.0,child:PrivateImage(scope:'profile',id:preview[i],slot:'avatar',size:35))]))]])),Icon(Icons.chevron_right,color:ink)])));});
 }
 class MeowTabs extends StatefulWidget {
  final int index;final List<Widget> children;const MeowTabs({super.key,required this.index,required this.children});
@@ -3473,7 +3602,7 @@ class _MeowTabsState extends State<MeowTabs> with SingleTickerProviderStateMixin
  late AnimationController controller;int direction=1;
  final visited=<int>{};final paneSizes=<int,Size>{};final paneMedia=<int,MediaQueryData>{};
  @override void initState(){super.initState();visited.add(widget.index);controller=AnimationController(vsync:this,duration:const Duration(milliseconds:200),value:1);}
- @override void didUpdateWidget(covariant MeowTabs old){super.didUpdateWidget(old);if(old.index!=widget.index){visited.add(widget.index);direction=widget.index>old.index?1:-1;controller.forward(from:0);}}
+ @override void didUpdateWidget(covariant MeowTabs old){super.didUpdateWidget(old);if(old.index!=widget.index){visited.add(widget.index);direction=widget.index>old.index?1:-1;controller.duration=MeowGraphics.duration(context,200);if(controller.duration==Duration.zero){controller.value=1;}else{controller.forward(from:0);}}}
  @override void dispose(){controller.dispose();super.dispose();}
  @override Widget build(BuildContext c)=>LayoutBuilder(builder:(c,b){
    final size=b.biggest;final media=MediaQuery.of(c);
@@ -3485,7 +3614,7 @@ class _MeowTabsState extends State<MeowTabs> with SingleTickerProviderStateMixin
    return Positioned(key:ValueKey(i),left:0,top:0,width:selected?size.width:previous.width,height:selected?size.height:previous.height,
      child:Offstage(offstage:!selected,child:TickerMode(enabled:selected,child:ExcludeFocus(excluding:!selected,
        child:MediaQuery(data:selected?media:(paneMedia[i]??media),child:AnimatedBuilder(animation:controller,
-       builder:(c,child){final v=selected?Curves.easeOutCubic.transform(controller.value):1.0;return Transform.translate(offset:Offset(direction*(1-v)*22,0),child:Opacity(opacity:.75+.25*v,child:child));},
+       builder:(c,child){final v=selected?Curves.easeOutCubic.transform(controller.value):1.0;return Transform.translate(offset:Offset(direction*(1-v)*22,0),child:MeowGraphics.simplified||MediaQuery.disableAnimationsOf(c)?child:Opacity(opacity:.75+.25*v,child:child));},
        child:RepaintBoundary(child:widget.children[i])))))));
  }
 }
@@ -3498,12 +3627,12 @@ class _ChannelSlideState extends State<ChannelSlide> with SingleTickerProviderSt
  bool dragging=false,chatMounted=false;Size? listSize,chatSize;MediaQueryData? listMedia,chatMedia;
  @override void initState(){super.initState();chatMounted=!widget.open;controller=AnimationController(vsync:this,duration:const Duration(milliseconds:210),value:widget.open?1:0)..addStatusListener(status);}
  void status(AnimationStatus value){if(mounted&&(value==AnimationStatus.dismissed||value==AnimationStatus.completed))setState((){});}
- @override void didUpdateWidget(covariant ChannelSlide old){super.didUpdateWidget(old);if(old.open!=widget.open){if(!widget.open)chatMounted=true;controller.animateTo(widget.open?1:0,curve:Curves.easeOutCubic);}}
+ @override void didUpdateWidget(covariant ChannelSlide old){super.didUpdateWidget(old);if(old.open!=widget.open){if(!widget.open)chatMounted=true;controller.animateTo(widget.open?1:0,duration:MeowGraphics.duration(context,210),curve:Curves.easeOutCubic);}}
  @override void dispose(){controller.removeStatusListener(status);controller.dispose();super.dispose();}
  void start(DragStartDetails d){FocusManager.instance.primaryFocus?.unfocus();controller.stop();setState((){dragging=true;chatMounted=true;});}
  void update(DragUpdateDetails d,double width){if(width>0)controller.value=(controller.value+(d.primaryDelta??0)/width).clamp(0.0,1.0).toDouble();}
- void end(DragEndDetails d){final v=d.primaryVelocity??0;final open=v>350?true:v< -350?false:controller.value>.5;setState(()=>dragging=false);widget.onChange(open);controller.animateTo(open?1:0,curve:Curves.easeOutCubic);}
- void cancel(){setState(()=>dragging=false);controller.animateTo(widget.open?1:0,curve:Curves.easeOutCubic);}
+ void end(DragEndDetails d){final v=d.primaryVelocity??0;final open=v>350?true:v< -350?false:controller.value>.5;setState(()=>dragging=false);widget.onChange(open);controller.animateTo(open?1:0,duration:MeowGraphics.duration(context,210),curve:Curves.easeOutCubic);}
+ void cancel(){setState(()=>dragging=false);controller.animateTo(widget.open?1:0,duration:MeowGraphics.duration(context,210),curve:Curves.easeOutCubic);}
  Widget gesture(Widget child,double width,{bool edge=false})=>GestureDetector(behavior:edge?HitTestBehavior.translucent:HitTestBehavior.deferToChild,onHorizontalDragStart:start,onHorizontalDragUpdate:(d)=>update(d,width),onHorizontalDragEnd:end,onHorizontalDragCancel:cancel,child:child);
  @override Widget build(BuildContext c)=>LayoutBuilder(builder:(c,b){
    final size=b.biggest;final media=MediaQuery.of(c);
@@ -3562,7 +3691,7 @@ class _ReplySwipeState extends State<ReplySwipe>{
    onHorizontalDragCancel:()=>setState(reset),
    child:Stack(alignment:Alignment.centerRight,children:[
      if(x< -5)Padding(padding:const EdgeInsets.only(right:8),child:Icon(Icons.reply,color:x<=-55?purple:Colors.white54)),
-     AnimatedContainer(duration:dragging?Duration.zero:const Duration(milliseconds:160),transform:Matrix4.translationValues(x,0,0),child:widget.child),
+     AnimatedContainer(duration:dragging?Duration.zero:MeowGraphics.duration(c,160),transform:Matrix4.translationValues(x,0,0),child:widget.child),
    ]));
 }
 // Discord-style display formatting. Original text is retained for edits, copies and Firestore.
@@ -3775,8 +3904,8 @@ class MeowAccountHeader extends StatelessWidget {
  final String uid;final VoidCallback? onTap;final bool showPresence;
  const MeowAccountHeader({super.key,required this.uid,this.onTap,this.showPresence=false});
  @override Widget build(BuildContext c)=>InkWell(onTap:onTap,child:MeowStreamBuilder<DocumentSnapshot<Map<String,dynamic>>>(stream:db.collection('users').doc(uid).meowSnapshots(),builder:(c,s){
-  final d=s.data?.data()??{};final presence=currentPresence(d);
-  return Row(children:[Stack(clipBehavior:Clip.none,children:[PrivateImage(scope:'profile',id:uid,slot:'avatar',size:38),Positioned(bottom:0,right:0,child:PresenceDot(uid:uid))]),const SizedBox(width:10),Expanded(child:Column(crossAxisAlignment:CrossAxisAlignment.start,mainAxisSize:MainAxisSize.min,children:[Text(userLabel(d),maxLines:1,overflow:TextOverflow.ellipsis,style:const TextStyle(fontSize:16,fontWeight:FontWeight.bold)),if(showPresence)Text(presenceLabels[presence]??'Offline',style:const TextStyle(fontSize:12,color:Colors.white54),maxLines:1,overflow:TextOverflow.ellipsis)]))]);
+  final d=s.data?.data()??{};
+  return Row(children:[Stack(clipBehavior:Clip.none,children:[PrivateImage(scope:'profile',id:uid,slot:'avatar',size:38),Positioned(bottom:0,right:0,child:PresenceDot(uid:uid))]),const SizedBox(width:10),Expanded(child:Column(crossAxisAlignment:CrossAxisAlignment.start,mainAxisSize:MainAxisSize.min,children:[Text(userLabel(d),maxLines:1,overflow:TextOverflow.ellipsis,style:const TextStyle(fontSize:16,fontWeight:FontWeight.bold)),if(showPresence)MeowPresenceText(data:d,style:const TextStyle(fontSize:12,color:Colors.white54))]))]);
  }));
 }
 class MeowAccountDrawer extends StatelessWidget {
@@ -3900,11 +4029,12 @@ class MeowOnlineCount extends StatefulWidget {
  @override State<MeowOnlineCount> createState()=>_MeowOnlineCountState();
 }
 class _MeowOnlineCountState extends State<MeowOnlineCount>{
- final users=<String,Map<String,dynamic>>{};final subs=<String,StreamSubscription<DocumentSnapshot<Map<String,dynamic>>>>{};Timer? timer;
- void sync(){final visible=TickerMode.of(context);final ids=visible?widget.ids.toSet():<String>{};for(final id in subs.keys.toList()){if(!ids.contains(id)){subs.remove(id)?.cancel();users.remove(id);}}for(final id in ids){subs.putIfAbsent(id,()=>db.collection('users').doc(id).meowSnapshots().listen((d){if(mounted&&subs.containsKey(id))setState(()=>users[id]=d.data()??{});},onError:(Object _){}));}timer?.cancel();timer=visible?Timer.periodic(const Duration(seconds:5),(_){if(mounted)setState((){});}):null;}
+ final users=<String,Map<String,dynamic>>{};final subs=<String,StreamSubscription<DocumentSnapshot<Map<String,dynamic>>>>{};final clock=MeowPresenceListClock();
+ void reschedule()=>clock.schedule(TickerMode.of(context)?users.values:const <Map<String,dynamic>>[],(){if(mounted){setState((){});reschedule();}});
+ void sync(){final ids=TickerMode.of(context)?widget.ids.toSet():<String>{};for(final id in subs.keys.toList()){if(!ids.contains(id)){subs.remove(id)?.cancel();users.remove(id);}}for(final id in ids){subs.putIfAbsent(id,()=>db.collection('users').doc(id).meowSnapshots().listen((d){if(!mounted||!subs.containsKey(id))return;final next=d.data()??{};final changed=(currentPresence(users[id])=='offline')!=(currentPresence(next)=='offline');users[id]=next;reschedule();if(changed)setState((){});},onError:(Object _){}));}reschedule();}
  @override void didChangeDependencies(){super.didChangeDependencies();sync();}
  @override void didUpdateWidget(covariant MeowOnlineCount old){super.didUpdateWidget(old);if(old.ids.length!=widget.ids.length||!old.ids.toSet().containsAll(widget.ids))sync();}
- @override void dispose(){timer?.cancel();for(final s in subs.values){s.cancel();}super.dispose();}
+ @override void dispose(){clock.cancel();for(final s in subs.values){s.cancel();}super.dispose();}
  @override Widget build(BuildContext c){final n=users.values.where((d)=>currentPresence(d)!='offline').length;return Row(mainAxisSize:MainAxisSize.min,children:[const Icon(Icons.circle,size:9,color:Colors.green),const SizedBox(width:6),Text('$n online',style:const TextStyle(fontSize:12,color:Colors.white54))]);}
 }
 
@@ -4052,25 +4182,36 @@ class _MeowWelcomeSettingsState extends State<MeowWelcomeSettings>{
 // permission before requesting it, and never prompt repeatedly after denial.
 // The native picker remains available without broad photo access.
 class MeowAttachmentPicker extends StatefulWidget {
- final int maxCount;const MeowAttachmentPicker({super.key,required this.maxCount});
+ final int maxCount;final bool expanded;final ValueChanged<double> onDrag;final VoidCallback onClose;final Future<void> Function(List<files.XFile>) onSelected;
+ const MeowAttachmentPicker({super.key,required this.maxCount,required this.expanded,required this.onDrag,required this.onClose,required this.onSelected});
  @override State<MeowAttachmentPicker> createState()=>_MeowAttachmentPickerState();
 }
-class _MeowAttachmentPickerState extends State<MeowAttachmentPicker>{
+class _MeowAttachmentPickerState extends State<MeowAttachmentPicker> with WidgetsBindingObserver {
  final items=<gallery.AssetEntity>[];
+ final ids=<String>{};
  final selected=<String,gallery.AssetEntity>{};
  final thumbs=<String,Future<Uint8List?>>{};
+ final thumbQueue=<Completer<bool>>[];int thumbnailRunning=0;
+ Future<bool> acquireThumb()async{if(thumbnailRunning<3){thumbnailRunning++;return true;}if(thumbQueue.length>=48)thumbQueue.removeAt(0).complete(false);final gate=Completer<bool>();thumbQueue.add(gate);return gate.future;}
+ void releaseThumb(){if(thumbQueue.isNotEmpty){thumbQueue.removeAt(0).complete(true);}else{thumbnailRunning--;}}
+ Future<Uint8List?> makeThumb(gallery.AssetEntity a)async{if(!(await acquireThumb()))return null;try{if(!mounted||!thumbs.containsKey(a.id))return null;return await a.thumbnailDataWithSize(const gallery.ThumbnailSize(144,144),quality:75);}catch(_){return null;}finally{releaseThumb();}}
+ final scroll=ScrollController();
  gallery.AssetPathEntity? album;
- bool busy=false,opened=false,more=true;String? error;int page=0;
- static const _galleryAskedKey='meow.gallery.permissionAsked.v1';
+ bool busy=false,paging=false,opened=false,more=true,limited=false,externalPicker=false;String? error;int page=0;double drag=0;
+ static const _galleryAskedKey='meow.gallery.permissionAsked.v2';
+ static const pageSize=48;
+ static const option=gallery.PermissionRequestOption(androidPermission:gallery.AndroidPermission(type:gallery.RequestType.common,mediaLocation:false));
  @override void initState(){
-  super.initState();
+  super.initState();WidgetsBinding.instance.addObserver(this);scroll.addListener(onScroll);
   WidgetsBinding.instance.addPostFrameCallback((_) {if(mounted)unawaited(openGallery(automatic:true));});
  }
+ @override void dispose(){WidgetsBinding.instance.removeObserver(this);scroll.dispose();thumbs.clear();for(final gate in thumbQueue){gate.complete(false);}thumbQueue.clear();super.dispose();}
+ @override void didChangeAppLifecycleState(AppLifecycleState state){if(state==AppLifecycleState.resumed&&!busy&&!externalPicker)unawaited(openGallery(automatic:true));}
  bool hasGalleryAccess(gallery.PermissionState state)=>state==gallery.PermissionState.authorized||state==gallery.PermissionState.limited;
+ void onScroll(){if(scroll.hasClients&&scroll.position.extentAfter<450&&!busy&&more)unawaited(next());}
  Future<void> openGallery({bool automatic=false})async{
   if(!mounted||busy)return;setState((){busy=true;error=null;});
   try{
-   const option=gallery.PermissionRequestOption();
    var permission=await gallery.PhotoManager.getPermissionState(requestOption:option);
    if(!mounted)return;
    if(!hasGalleryAccess(permission)){
@@ -4080,15 +4221,27 @@ class _MeowAttachmentPickerState extends State<MeowAttachmentPicker>{
      permission=await gallery.PhotoManager.requestPermissionExtend(requestOption:option);if(!mounted)return;
     }
    }
-   if(!hasGalleryAccess(permission)){setState(()=>error='Sem acesso à galeria. Permita nas configurações ou use o seletor do celular.');return;}
-   final albums=await gallery.PhotoManager.getAssetPathList(onlyAll:true,type:gallery.RequestType.common);if(!mounted)return;
-   setState((){opened=true;items.clear();selected.clear();thumbs.clear();page=0;album=albums.isEmpty?null:albums.first;more=album!=null;});if(album!=null)await fetchPage();
+   if(!hasGalleryAccess(permission)){setState((){opened=false;items.clear();ids.clear();selected.clear();thumbs.clear();error='Sem acesso à galeria. Use Galeria ou permita o acesso.';});return;}
+   final albums=await gallery.PhotoManager.getAssetPathList(onlyAll:true,type:gallery.RequestType.common,filterOption:gallery.FilterOptionGroup(orders:[const gallery.OrderOption(type:gallery.OrderOptionType.createDate,asc:false)]));if(!mounted)return;
+   setState((){limited=permission==gallery.PermissionState.limited;opened=true;items.clear();ids.clear();selected.clear();thumbs.clear();page=0;album=albums.isEmpty?null:albums.first;more=album!=null;});if(album!=null)await fetchPage();
   }catch(_){if(mounted)setState(()=>error='Não foi possível abrir a galeria.');}finally{if(mounted)setState(()=>busy=false);}
  }
- Future<void> fetchPage()async{final path=album;if(path==null||!more)return;final result=await path.getAssetListPaged(page:page,size:60);if(!mounted)return;setState((){items.addAll(result.where((a)=>!items.any((b)=>b.id==a.id)));page++;more=result.length==60;});}
- Future<void> next()async{if(busy||!more)return;setState(()=>busy=true);try{await fetchPage();}catch(_){if(mounted)setState(()=>error='Falha ao carregar mais mídias.');}finally{if(mounted)setState(()=>busy=false);}}
- Future<void> native(bool documents)async{if(busy)return;setState(()=>busy=true);try{final result=documents?await files.openFiles():await ImagePicker().pickMultipleMedia(requestFullMetadata:false);if(mounted&&result.isNotEmpty)Navigator.pop(context,result.take(widget.maxCount).toList());}catch(_){if(mounted)setState(()=>error='Não foi possível abrir o seletor.');}finally{if(mounted)setState(()=>busy=false);}}
- Future<void> confirm()async{if(busy||selected.isEmpty)return;setState(()=>busy=true);try{final result=<files.XFile>[];for(final asset in selected.values){final f=await asset.originFile;if(f!=null)result.add(files.XFile(f.path));}if(!mounted)return;if(result.length!=selected.length){setState(()=>error='Alguma mídia não está disponível. Tente o seletor do celular.');return;}Navigator.pop(context,result);}catch(_){if(mounted)setState(()=>error='Não foi possível preparar os anexos.');}finally{if(mounted)setState(()=>busy=false);}}
- Future<Uint8List?> thumb(gallery.AssetEntity a){if(thumbs.length>=120&&!thumbs.containsKey(a.id))thumbs.remove(thumbs.keys.first);return thumbs.putIfAbsent(a.id,()=>a.thumbnailDataWithSize(const gallery.ThumbnailSize(160,160)));}
- @override Widget build(BuildContext c)=>SafeArea(child:SizedBox(height:MediaQuery.sizeOf(c).height*.68,child:Column(children:[Padding(padding:const EdgeInsets.symmetric(horizontal:16),child:Row(children:[const Expanded(child:Text('Adicionar anexos',style:TextStyle(fontSize:18,fontWeight:FontWeight.bold))),Text('${selected.length}/${widget.maxCount}')])),if(busy)const LinearProgressIndicator(),if(error!=null)Padding(padding:const EdgeInsets.all(8),child:Text(error!,style:const TextStyle(color:Colors.orangeAccent))),Expanded(child:!opened?Center(child:busy?const CircularProgressIndicator():FilledButton.icon(onPressed:()=>openGallery(),icon:const Icon(Icons.photo_library_outlined),label:const Text('Permitir acesso à galeria'))):items.isEmpty?Center(child:busy?const CircularProgressIndicator():const Text('Nenhuma mídia disponível.')):GridView.builder(padding:const EdgeInsets.all(8),gridDelegate:const SliverGridDelegateWithFixedCrossAxisCount(crossAxisCount:4,crossAxisSpacing:4,mainAxisSpacing:4),itemCount:items.length+(more?1:0),itemBuilder:(c,i){if(i==items.length)return IconButton(onPressed:busy?null:next,icon:const Icon(Icons.expand_more),tooltip:'Carregar mais');final a=items[i];final checked=selected.containsKey(a.id);return InkWell(onTap:busy?null:(){setState((){if(checked){selected.remove(a.id);}else if(selected.length<widget.maxCount){selected[a.id]=a;}});},child:Stack(fit:StackFit.expand,children:[FutureBuilder<Uint8List?>(future:thumb(a),builder:(c,s)=>s.data==null?const ColoredBox(color:meowComposerColor,child:Icon(Icons.image_outlined)):Image.memory(s.data!,fit:BoxFit.cover,cacheWidth:160,gaplessPlayback:true)),if(a.type==gallery.AssetType.video)const Positioned(left:4,bottom:4,child:Icon(Icons.play_circle_fill,color:Colors.white,size:20)),if(checked)Container(decoration:BoxDecoration(border:Border.all(color:purple,width:3),color:Colors.black26)),Positioned(top:3,right:3,child:Icon(checked?Icons.check_circle:Icons.radio_button_unchecked,color:checked?purple:Colors.white,size:23))]));})),const Divider(height:1),Padding(padding:const EdgeInsets.all(8),child:Row(children:[Expanded(child:TextButton.icon(onPressed:busy?null:()=>native(false),icon:const Icon(Icons.photo_outlined),label:const Text('Galeria'))),Expanded(child:TextButton.icon(onPressed:busy?null:()=>native(true),icon:const Icon(Icons.attach_file),label:const Text('Arquivos'))),FilledButton(onPressed:busy||selected.isEmpty?null:confirm,child:const Text('Adicionar'))])),Text('Até ${fileSizeLabel(attachmentLimit)} por arquivo',style:const TextStyle(fontSize:12,color:Colors.white54)),const SizedBox(height:6)])));
+ Future<void> fetchPage()async{final path=album;if(path==null||!more)return;final result=await path.getAssetListPaged(page:page,size:pageSize);if(!mounted)return;setState((){items.addAll(result.where((a)=>ids.add(a.id)));page++;more=result.length==pageSize;});}
+ Future<void> next()async{if(busy||!more)return;setState((){busy=true;paging=true;});try{await fetchPage();}catch(_){if(mounted)setState(()=>error='Falha ao carregar mais mídias.');}finally{if(mounted)setState((){busy=false;paging=false;});}}
+ Future<void> native(bool documents)async{if(busy)return;setState(()=>busy=true);externalPicker=true;try{final result=documents?await files.openFiles():await ImagePicker().pickMultipleMedia(requestFullMetadata:false);if(mounted&&result.isNotEmpty)await widget.onSelected(result.take(widget.maxCount).toList());}catch(_){if(mounted)setState(()=>error='Não foi possível abrir o seletor.');}finally{externalPicker=false;if(mounted)setState(()=>busy=false);}}
+ Future<void> confirm()async{if(busy||selected.isEmpty)return;setState(()=>busy=true);try{final result=<files.XFile>[];for(final asset in selected.values){final f=await asset.originFile;if(!mounted)return;if(f!=null)result.add(files.XFile(f.path));}if(!mounted)return;if(result.length!=selected.length){setState(()=>error='Alguma mídia não está disponível. Tente o seletor do celular.');return;}await widget.onSelected(result);}catch(_){if(mounted)setState(()=>error='Não foi possível preparar os anexos.');}finally{if(mounted)setState(()=>busy=false);}}
+ Future<Uint8List?> thumb(gallery.AssetEntity a){final hit=thumbs.remove(a.id);if(hit!=null){thumbs[a.id]=hit;return hit;}if(thumbs.length>=48)thumbs.remove(thumbs.keys.first);return thumbs.putIfAbsent(a.id,()=>makeThumb(a));}
+ String duration(int seconds){final h=seconds~/3600,m=seconds~/60%60,sec=(seconds%60).toString().padLeft(2,'0');return h>0?'$h:${m.toString().padLeft(2,'0')}:$sec':'$m:$sec';}
+ @override Widget build(BuildContext c)=>SafeArea(top:false,child:LayoutBuilder(builder:(c,b)=>Column(children:[
+  GestureDetector(behavior:HitTestBehavior.opaque,onVerticalDragStart:(_)=>drag=0,onVerticalDragUpdate:(d)=>drag+=d.delta.dy,onVerticalDragEnd:(d){final velocity=d.primaryVelocity??0;widget.onDrag(drag.abs()>18?drag:velocity/12);},child:Semantics(button:true,label:widget.expanded?'Reduzir galeria':'Expandir galeria',child:InkWell(onTap:()=>widget.onDrag(widget.expanded?30:-30),child:SizedBox(height:24,width:double.infinity,child:Center(child:Container(width:34,height:4,decoration:BoxDecoration(color:Colors.white38,borderRadius:BorderRadius.circular(3)))))))),
+  Padding(padding:const EdgeInsets.symmetric(horizontal:12),child:Row(children:[const Expanded(child:Text('Adicionar anexos',style:TextStyle(fontSize:14,fontWeight:FontWeight.w600))),Text('${selected.length}/${widget.maxCount}'),IconButton(visualDensity:VisualDensity.compact,tooltip:'Fechar',onPressed:widget.onClose,icon:const Icon(Icons.close,size:19))])),
+  if(busy)const LinearProgressIndicator(minHeight:2),
+  if(limited&&b.maxHeight>220)TextButton(onPressed:busy?null:()=>gallery.PhotoManager.openSetting(),child:const Text('Acesso limitado — gerenciar permissões')),
+  if(error!=null&&b.maxHeight>220)Padding(padding:const EdgeInsets.symmetric(horizontal:8),child:Text(error!,maxLines:2,overflow:TextOverflow.ellipsis,style:const TextStyle(color:Colors.orangeAccent,fontSize:11))),
+  Expanded(child:!opened?Center(child:busy?const CircularProgressIndicator():TextButton.icon(onPressed:()=>openGallery(),icon:const Icon(Icons.photo_library_outlined),label:const Text('Permitir acesso à galeria'))):items.isEmpty?Center(child:busy?const CircularProgressIndicator():const Text('Nenhuma mídia disponível.')):GridView.builder(controller:scroll,cacheExtent:80,padding:const EdgeInsets.all(6),gridDelegate:const SliverGridDelegateWithFixedCrossAxisCount(crossAxisCount:4,crossAxisSpacing:4,mainAxisSpacing:4),itemCount:items.length+(more?1:0),itemBuilder:(c,i){
+   if(i==items.length){if(!busy)WidgetsBinding.instance.addPostFrameCallback((_){if(mounted&&!busy&&more)unawaited(next());});return Center(child:busy?const SizedBox(width:20,height:20,child:CircularProgressIndicator(strokeWidth:2)):IconButton(onPressed:next,icon:const Icon(Icons.expand_more),tooltip:'Carregar mais'));}
+   final a=items[i];final checked=selected.containsKey(a.id);
+   return InkWell(key:ValueKey(a.id),onTap:busy&&!paging?null:(){setState((){if(checked){selected.remove(a.id);}else if(selected.length<widget.maxCount){selected[a.id]=a;}});},child:ClipRRect(borderRadius:BorderRadius.circular(4),child:Stack(fit:StackFit.expand,children:[FutureBuilder<Uint8List?>(future:thumb(a),builder:(c,s)=>s.data==null?ColoredBox(color:meowComposerColor,child:Icon(a.type==gallery.AssetType.video?Icons.videocam_outlined:Icons.image_outlined)):Image.memory(s.data!,fit:BoxFit.cover,cacheWidth:144,gaplessPlayback:true)),if(a.type==gallery.AssetType.video)Positioned(left:3,bottom:3,child:Container(padding:const EdgeInsets.symmetric(horizontal:3,vertical:2),decoration:BoxDecoration(color:Colors.black54,borderRadius:BorderRadius.circular(4)),child:Row(mainAxisSize:MainAxisSize.min,children:[const Icon(Icons.play_arrow,color:Colors.white,size:14),Text(duration(a.duration),style:const TextStyle(color:Colors.white,fontSize:11))]))),if(checked)Container(decoration:BoxDecoration(border:Border.all(color:purple,width:2),color:Colors.black26)),Positioned(top:3,right:3,child:Icon(checked?Icons.check_circle:Icons.radio_button_unchecked,color:checked?purple:Colors.white,size:20))])));
+  })),const Divider(height:1),Padding(padding:const EdgeInsets.symmetric(horizontal:5,vertical:3),child:Row(children:[Expanded(child:TextButton.icon(onPressed:busy?null:()=>native(false),icon:const Icon(Icons.photo_outlined,size:17),label:const Text('Galeria'))),Expanded(child:TextButton.icon(onPressed:busy?null:()=>native(true),icon:const Icon(Icons.attach_file,size:17),label:const Text('Arquivos'))),FilledButton(onPressed:busy||selected.isEmpty?null:confirm,child:const Text('Adicionar'))])),if(widget.expanded&&b.maxHeight>240)Text('Até ${fileSizeLabel(attachmentLimit)} por arquivo',style:const TextStyle(fontSize:12,color:Colors.white54)),
+ ])));
 }
