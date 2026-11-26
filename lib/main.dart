@@ -113,19 +113,21 @@ class _MeowFeed<T> {
   T? _last;
   bool _hasLast = false;
   int _epoch = 0;
+  Timer? _idleTimer;
   _MeowFeed(this.source);
+  void close(){_idleTimer?.cancel();_idleTimer=null;_epoch++;final old=_subscription;_subscription=null;_last=null;_hasLast=false;old?.cancel();for(final c in _clients.toList()){c.close();}_clients.clear();}
   bool get idle => _clients.isEmpty;
   late final Stream<T> stream = Stream<T>.multi((client) {
+    _idleTimer?.cancel();_idleTimer=null;
     _clients.add(client);
-    client.onCancel = () async {
+    client.onCancel = () {
       _clients.remove(client);
       if (_clients.isEmpty) {
-        _epoch++;
-        final old = _subscription;
-        _subscription = null;
-        _last = null;
-        _hasLast = false;
-        await old?.cancel();
+        _idleTimer?.cancel();
+        _idleTimer=Timer(const Duration(seconds:5),(){
+          if(_clients.isNotEmpty)return;
+          _epoch++;final old=_subscription;_subscription=null;_last=null;_hasLast=false;old?.cancel();
+        });
       }
     };
     if (_hasLast) client.add(_last as T);
@@ -159,7 +161,7 @@ class MeowStreams {
     if (feed == null) {
       if (entries.length >= 512) {
         final idle = entries.entries.where((e) => e.value.idle).take(64).map((e) => e.key).toList();
-        for (final k in idle) { entries.remove(k); }
+        for (final k in idle) { entries.remove(k)?.close(); }
       }
       feed = _MeowFeed<T>(source);
     }
@@ -170,7 +172,7 @@ class MeowStreams {
     _get(_documents, (_uid,ref.path), () => ref.snapshots());
   static Stream<QuerySnapshot<Map<String,dynamic>>> query(Query<Map<String,dynamic>> ref) =>
     _get(_queries, (_uid,ref), () => ref.snapshots());
-  static void clear() { _documents.clear(); _queries.clear(); }
+  static void clear() { for(final f in _documents.values){f.close();}for(final f in _queries.values){f.close();}_documents.clear(); _queries.clear(); }
 }
 extension MeowDocumentStream on DocumentReference<Map<String,dynamic>> {
   Stream<DocumentSnapshot<Map<String,dynamic>>> meowSnapshots() => MeowStreams.document(this);
@@ -194,6 +196,29 @@ class PrivateMediaCache {
   static final _pending=<String,Future<Uint8List?>>{};
   static final _completed=<String,({Uint8List bytes,DateTime time,Future<Uint8List?> future})>{};
   static final _missing=<String,DateTime>{};
+  static final _failed=<String,DateTime>{};
+  static DateTime? _imageBlockedUntil;
+  static int _quotaStreak=0;
+  static Duration? retryDelay(Uri url){
+    if(!_image(url)||_owner!=FirebaseAuth.instance.currentUser?.uid)return null;
+    final now=DateTime.now();final local=_failed[_key(url)];if(local==null)return null;
+    final global=_imageBlockedUntil;final until=global!=null&&global.isAfter(local)?global:local;
+    final remaining=until.difference(now);
+    return (remaining.isNegative?Duration.zero:remaining)+Duration(milliseconds:500+(_key(url).hashCode.abs()%4000));
+  }
+  static bool _blocked(Uri url)=>_image(url)&&_imageBlockedUntil?.isAfter(DateTime.now())==true;
+  static void _failImage(String key,{Duration delay=const Duration(seconds:60)}){
+    if(_failed.length>=maxEntries&&!_failed.containsKey(key))_failed.remove(_failed.keys.first);
+    _failed[key]=DateTime.now().add(delay);
+  }
+  static Uint8List? _stale(Uri url,String key){
+    if(!_image(url))return null;final entry=_completed[key];if(entry==null)return null;
+    if(url.queryParameters['scope']=='server'&&DateTime.now().difference(entry.time)>const Duration(minutes:10))return null;
+    return entry.bytes;
+  }
+  static void _forget(String key){final old=_completed.remove(key);if(old!=null)_usedBytes-=old.bytes.lengthInBytes;_failed.remove(key);}
+  static Duration _serverDelay(String? raw){final seconds=int.tryParse(raw??'')??120;return Duration(seconds:seconds.clamp(120,3600).toInt());}
+
   static final _generation=<String,int>{};
   static final _progress=<String,Set<ValueChanged<double?>>>{};
   static const int maxBytes=48*1024*1024;
@@ -220,7 +245,14 @@ class PrivateMediaCache {
     if(_owner!=uid){clear();_owner=uid;}
     final key=_key(url);final now=DateTime.now();
     final entry=_completed.remove(key);
-    if(entry!=null){if(now.difference(entry.time)<_lifetime(url)){_completed[key]=entry;if(onProgress!=null)onProgress(1);return entry.future;}_usedBytes-=entry.bytes.lengthInBytes;}
+    if(entry!=null){
+      if(now.difference(entry.time)<_lifetime(url)){_completed[key]=entry;if(onProgress!=null)onProgress(1);return entry.future;}
+      if(_image(url)&&(url.queryParameters['scope']!='server'||now.difference(entry.time)<const Duration(minutes:10))){_completed[key]=entry;}else{_usedBytes-=entry.bytes.lengthInBytes;}
+    }
+    if(_blocked(url)||(_image(url)&&_failed[key]?.isAfter(now)==true)){
+      if(_blocked(url))_failImage(key);
+      return Future<Uint8List?>.value(_stale(url,key));
+    }
     final missing=_missing[key];if(missing!=null){if(now.difference(missing)<missingLifetime)return Future<Uint8List?>.value(null);_missing.remove(key);}
     Future<Uint8List?> observe(Future<Uint8List?> future){if(onProgress==null)return future;final listeners=_progress.putIfAbsent(key,()=> <ValueChanged<double?>>{});listeners.add(onProgress);return future.whenComplete((){listeners.remove(onProgress);if(listeners.isEmpty&&identical(_progress[key],listeners))_progress.remove(key);});}
     final existing=_pending[key];if(existing!=null)return observe(existing);
@@ -231,19 +263,20 @@ class PrivateMediaCache {
     return observe(task);
   }
   static void _store(String key,Uint8List bytes){
-    _missing.remove(key);final old=_completed.remove(key);if(old!=null)_usedBytes-=old.bytes.lengthInBytes;
+    _missing.remove(key);_failed.remove(key);final old=_completed.remove(key);if(old!=null)_usedBytes-=old.bytes.lengthInBytes;
     if(bytes.isEmpty||bytes.lengthInBytes>maxBytes)return;
     while(_completed.isNotEmpty&&(_usedBytes+bytes.lengthInBytes>maxBytes||_completed.length>=maxEntries)){_usedBytes-=_completed.remove(_completed.keys.first)!.bytes.lengthInBytes;}
     _completed[key]=(bytes:bytes,time:DateTime.now(),future:Future<Uint8List?>.value(bytes));_usedBytes+=bytes.lengthInBytes;
   }
   static Future<Uint8List?> _download(Uri url,String key,int generation,int session)async{
+    var refreshToken=false;
     for(var attempt=0;attempt<2;attempt++){
       if(!_valid(url,key,generation,session))return null;
-      // Use an individual client for each large attachment, so its timeout cannot
-      // disturb profile requests. Small image requests share the session pool.
+      // Check again after acquiring the queue: queued requests must respect backoff.
+      if(_blocked(url)){_failImage(key);return _stale(url,key);}
       final pooled=_image(url);final client=pooled?(_client??=http.Client()):http.Client();
       try{
-        final headers=await authHeaders();if(!_valid(url,key,generation,session))return null;
+        final headers=await authHeaders(forceRefresh:attempt>0&&refreshToken);if(!_valid(url,key,generation,session))return null;
         final request=http.Request('GET',url)..headers.addAll(headers)..followRedirects=false;
         final response=await client.send(request).timeout(const Duration(seconds:20));
         if(!_valid(url,key,generation,session)){await response.stream.listen((_){}).cancel();return null;}
@@ -253,14 +286,32 @@ class PrivateMediaCache {
           final builder=BytesBuilder(copy:false);var received=0;var report=DateTime.fromMillisecondsSinceEpoch(0);
           _report(key,total!=null&&total>0?0:null);
           await for(final chunk in response.stream.timeout(const Duration(seconds:20))){if(!_valid(url,key,generation,session))return null;received+=chunk.length;if(received>limit)throw const FormatException('Mídia acima do limite.');builder.add(chunk);final now=DateTime.now();if(now.difference(report)>=const Duration(milliseconds:120)){report=now;_report(key,total!=null&&total>0?(received/total).clamp(0.0,1.0).toDouble():null);}}
-          if(received==0||!_valid(url,key,generation,session))return null;final bytes=builder.takeBytes();_store(key,bytes);_report(key,1);return bytes;
+          if(!_valid(url,key,generation,session))return null;if(received==0){if(pooled){_failImage(key);return _stale(url,key);}return null;}final bytes=builder.takeBytes();if(pooled&&!_blocked(url))_quotaStreak=0;_store(key,bytes);_report(key,1);return bytes;
         }
         // Drain error bodies before reusing the connection.
         await response.stream.drain<void>().timeout(const Duration(seconds:5));
         if(!_valid(url,key,generation,session))return null;
-        if(response.statusCode==404&&_image(url)){if(_missing.length>=maxEntries)_missing.remove(_missing.keys.first);_missing[key]=DateTime.now();return null;}
+        if(_image(url)){
+          if(response.statusCode==401&&attempt==0){refreshToken=true;continue;}
+          if(response.statusCode==404){_forget(key);if(_missing.length>=maxEntries)_missing.remove(_missing.keys.first);_missing[key]=DateTime.now();return null;}
+          if(response.statusCode==429||response.statusCode==503){
+            final now=DateTime.now();
+            if(_imageBlockedUntil==null||!_imageBlockedUntil!.isAfter(now))_quotaStreak=min(_quotaStreak+1,4);
+            final wait=_serverDelay(response.headers['retry-after']);
+            final progressive=Duration(seconds:120*(1<<max(0,_quotaStreak-1)));
+            final until=now.add(wait>progressive?wait:progressive);
+            if(_imageBlockedUntil==null||until.isAfter(_imageBlockedUntil!))_imageBlockedUntil=until;
+            _failImage(key);return _stale(url,key);
+          }
+          if(response.statusCode>=500||response.statusCode==408){_failImage(key);return _stale(url,key);}
+          _forget(key);return null;
+        }
         if(response.statusCode!=429&&response.statusCode<500)return null;
-      }catch(e){debugPrint('Meow media: falha no download (${url.path}): $e');if(pooled&&identical(_client,client)){_client=null;client.close();}}
+      }catch(e){
+        debugPrint('Meow media: falha no download (${url.path}): $e');
+        // Do not close the shared client while other images are downloading.
+        if(pooled&&_valid(url,key,generation,session)){_failImage(key);return _stale(url,key);}
+      }
       finally{if(!pooled)client.close();}
       if(attempt==0)await Future<void>.delayed(const Duration(milliseconds:400));
     }
@@ -268,15 +319,15 @@ class PrivateMediaCache {
   }
   static void invalidate(Uri url){
     final key=_key(url);final family=_family(key);
-    final keys=<String>{key,..._completed.keys,..._pending.keys,..._missing.keys}.where((k)=>_family(k)==family).toList();
-    for(final k in keys){_generation[k]=(_generation[k]??0)+1;final old=_completed.remove(k);if(old!=null)_usedBytes-=old.bytes.lengthInBytes;_pending.remove(k);_missing.remove(k);}
+    final keys=<String>{key,..._completed.keys,..._pending.keys,..._missing.keys,..._failed.keys}.where((k)=>_family(k)==family).toList();
+    for(final k in keys){_generation[k]=(_generation[k]??0)+1;final old=_completed.remove(k);if(old!=null)_usedBytes-=old.bytes.lengthInBytes;_pending.remove(k);_missing.remove(k);_failed.remove(k);}
   }
   static void pruneExpired(){
-    final now=DateTime.now();for(final k in _completed.keys.toList()){final uri=Uri.tryParse(k.substring(k.indexOf('|')+1));final entry=_completed[k]!;if(uri==null||now.difference(entry.time)>=_lifetime(uri)){_completed.remove(k);_usedBytes-=entry.bytes.lengthInBytes;}}
+    final now=DateTime.now();for(final k in _completed.keys.toList()){final uri=Uri.tryParse(k.substring(k.indexOf('|')+1));final entry=_completed[k]!;if(uri==null||(!_image(uri)&&now.difference(entry.time)>=_lifetime(uri))||(uri.queryParameters['scope']=='server'&&now.difference(entry.time)>=const Duration(minutes:10))){_completed.remove(k);_usedBytes-=entry.bytes.lengthInBytes;}}
     _missing.removeWhere((_,time)=>now.difference(time)>=missingLifetime);
   }
   static void purgeCompleted(){_completed.clear();_missing.clear();_usedBytes=0;PaintingBinding.instance.imageCache.clear();}
-  static void clear(){_session++;_owner=null;_client?.close();_client=null;_generation.clear();_progress.clear();_completed.clear();_missing.clear();_pending.clear();_usedBytes=0;PaintingBinding.instance.imageCache.clear();PaintingBinding.instance.imageCache.clearLiveImages();}
+  static void clear(){_session++;_owner=null;_client?.close();_client=null;_generation.clear();_progress.clear();_completed.clear();_missing.clear();_failed.clear();_imageBlockedUntil=null;_quotaStreak=0;_pending.clear();_usedBytes=0;PaintingBinding.instance.imageCache.clear();PaintingBinding.instance.imageCache.clearLiveImages();}
 }
 
 String get myUid => FirebaseAuth.instance.currentUser!.uid;
@@ -298,8 +349,8 @@ Uri attachmentUrl(String id) => Uri.https(imageHost, '/functions/v1/meow-anexos'
   'id':id
 }
 );
-Future<Map<String, String>> authHeaders() async {
-  final token = await FirebaseAuth.instance.currentUser?.getIdToken();
+Future<Map<String, String>> authHeaders({bool forceRefresh=false}) async {
+  final token = await FirebaseAuth.instance.currentUser?.getIdToken(forceRefresh);
   if (token == null) throw Exception('Entre novamente no Meow.');
   return {
     'Authorization':'Bearer $token'
@@ -522,22 +573,35 @@ class _PrivateImageState extends State<PrivateImage>{
   Future<Uint8List?>? future;
   StreamSubscription<DocumentSnapshot<Map<String,dynamic>>>? revisionSub;
   String revision='';int revisionEpoch=0;bool revisionKnown=false,profileExists=false;
+  Timer? retryTimer;int fetchEpoch=0;Uint8List? lastImage;String? lastOwner;
+  bool visible=true;
+  void cancelRetry(){retryTimer?.cancel();retryTimer=null;}
+  void scheduleRetry(Uri url){cancelRetry();final delay=PrivateMediaCache.retryDelay(url);if(delay==null||!visible)return;retryTimer=Timer(delay,(){if(mounted&&visible&&revisionUrl==url){final lifecycle=WidgetsBinding.instance.lifecycleState;if(lifecycle!=null&&lifecycle!=AppLifecycleState.resumed){retryTimer=Timer(const Duration(seconds:30),(){if(mounted)scheduleRetry(url);});return;}setState(()=>future=fetch());}});}
   Uri get revisionUrl=>revision.isEmpty?widget.url:widget.url.replace(queryParameters:{...widget.url.queryParameters,'revision':revision});
-  Future<Uint8List?> fetch()=>PrivateMediaCache.get(revisionUrl);
+  Future<Uint8List?> fetch()async{
+    cancelRetry();final url=revisionUrl;final epoch=++fetchEpoch;final owner=FirebaseAuth.instance.currentUser?.uid;
+    if(lastOwner!=owner){lastImage=null;lastOwner=owner;}
+    final data=await PrivateMediaCache.get(url);
+    if(!mounted||epoch!=fetchEpoch||owner!=FirebaseAuth.instance.currentUser?.uid)return null;
+    final retry=PrivateMediaCache.retryDelay(url);
+    if(data!=null)lastImage=data;else if(retry==null)lastImage=null;
+    scheduleRetry(url);return data??(retry!=null?lastImage:null);
+  }
   void watchRevision(){
     if(widget.scope!='profile'||!TickerMode.of(context)){if(revisionSub!=null){revisionEpoch++;revisionSub?.cancel();revisionSub=null;}return;}
     if(revisionSub!=null)return;final epoch=++revisionEpoch;
     revisionSub=db.collection('users').doc(widget.id).meowSnapshots().listen((snap){
       if(!mounted||epoch!=revisionEpoch)return;
+      if(!snap.exists&&snap.metadata.isFromCache)return;
       final next=snap.data()?['${widget.slot}Revision']?.toString()??'';
-      if(!revisionKnown||next!=revision||snap.exists!=profileExists){setState((){revisionKnown=true;profileExists=snap.exists;revision=next;future=snap.exists?fetch():Future<Uint8List?>.value(null);});}
-    },onError:(Object _){if(mounted&&epoch==revisionEpoch&&!revisionKnown)setState(()=>future=Future<Uint8List?>.value(null));});
+      if(!revisionKnown||next!=revision||snap.exists!=profileExists){setState((){revisionKnown=true;profileExists=snap.exists;revision=next;if(snap.exists){future=fetch();}else{cancelRetry();fetchEpoch++;lastImage=null;future=Future<Uint8List?>.value(null);}});}
+    },onError:(Object _){if(mounted&&epoch==revisionEpoch&&!revisionKnown&&future==null)setState(()=>future=fetch());});
   }
-  @override void didChangeDependencies(){super.didChangeDependencies();watchRevision();}
+  @override void didChangeDependencies(){super.didChangeDependencies();visible=TickerMode.of(context);if(!visible){cancelRetry();}watchRevision();if(visible&&future!=null&&PrivateMediaCache.retryDelay(revisionUrl)!=null)scheduleRetry(revisionUrl);}
   void refresh(){if(mounted&&changedImage.value==widget.url&&(widget.scope!='profile'||revisionKnown))setState(()=>future=fetch());}
   @override void initState(){super.initState();if(widget.scope!='profile')future=fetch();changedImage.addListener(refresh);}
-  @override void didUpdateWidget(covariant PrivateImage old){super.didUpdateWidget(old);if(old.url!=widget.url){revisionEpoch++;revisionSub?.cancel();revisionSub=null;revision='';revisionKnown=false;profileExists=false;future=widget.scope=='profile'?null:fetch();watchRevision();}}
-  @override void dispose(){revisionEpoch++;revisionSub?.cancel();changedImage.removeListener(refresh);super.dispose();}
+  @override void didUpdateWidget(covariant PrivateImage old){super.didUpdateWidget(old);if(old.url!=widget.url){cancelRetry();fetchEpoch++;lastImage=null;lastOwner=null;revisionEpoch++;revisionSub?.cancel();revisionSub=null;revision='';revisionKnown=false;profileExists=false;future=widget.scope=='profile'?null:fetch();watchRevision();}}
+  @override void dispose(){cancelRetry();fetchEpoch++;revisionEpoch++;revisionSub?.cancel();changedImage.removeListener(refresh);super.dispose();}
   @override Widget build(BuildContext c){
     final banner=widget.slot=='banner';final statusIcon=widget.slot.startsWith('status');
     return SizedBox(width:widget.width??(banner?double.infinity:widget.size),height:widget.size,child:ClipRRect(borderRadius:widget.borderRadius??BorderRadius.circular(banner?8:widget.size),child:FutureBuilder<Uint8List?>(key:ValueKey(widget.url),future:future,builder:(c,s){
@@ -1838,7 +1902,8 @@ class _MessageThreadState extends State<MessageThread> with RouteAware,WidgetsBi
   @override void didUpdateWidget(covariant MessageThread old){super.didUpdateWidget(old);if(old.visible!=widget.visible){updateActive();lastMarkedMessage=null;cachedMessagePane=null;}}
   void updateActive(){typingActive.value=widget.visible&&routeActive&&foreground;if(typingActive.value){activeThread.value=widget.threadId;startMembers();}else{if(activeThread.value==widget.threadId)activeThread.value=null;suspendMembers();if(lastTyping!=null)unawaited(stopTyping());}}
   @override void didPush(){routeActive=true;updateActive();} @override void didPopNext(){routeActive=true;updateActive();if(mounted)setState((){lastMarkedMessage=null;cachedMessagePane=null;});} @override void didPushNext(){routeActive=false;updateActive();} @override void didPop(){routeActive=false;updateActive();}
-  @override void didChangeAppLifecycleState(AppLifecycleState state){foreground=state==AppLifecycleState.resumed;updateActive();if(foreground&&mounted){setState((){lastMarkedMessage=null;cachedMessagePane=null;});if(widget.visible&&routeActive&&!anchored)unawaited(historyQuery.limit(50).get(const GetOptions(source:Source.server)).then<void>((_){}).catchError((Object _){}));}}
+  @override void didChangeAppLifecycleState(AppLifecycleState state){foreground=state==AppLifecycleState.resumed;updateActive();if(foreground&&mounted){setState((){lastMarkedMessage=null;cachedMessagePane=null;});// Active Firestore listener already resumes on foreground.
+    }}
   void replyTo(QueryDocumentSnapshot<Map<String,dynamic>> doc){final d=doc.data();setState((){replyId=doc.id;replyText=d['text']?.toString()??'';replyAuthor=d['author']?.toString()??'Usuário';replyAuthorId=d['authorId']?.toString();});}
   String? get mentionQuery=>RegExp(r'(?:^|\s)@([^\s@]*)$').firstMatch(input.text)?.group(1)?.toLowerCase();
   void selectMention(String name){final match=RegExp(r'@([^\s@]*)$').firstMatch(input.text);if(match==null)return;input.text=input.text.replaceRange(match.start,match.end,'@$name ');input.selection=TextSelection.collapsed(offset:input.text.length);typingChanged(input.text);}
@@ -2806,14 +2871,18 @@ class ProfileBackground extends StatefulWidget {
 class _ProfileBackgroundState extends State<ProfileBackground>{
  Future<Uint8List?>? future;String revision='';int epoch=0;bool known=false,profileExists=false;
  StreamSubscription<DocumentSnapshot<Map<String,dynamic>>>? sub;
+ Timer? retryTimer;int fetchEpoch=0;bool visible=true;Uint8List? lastImage;String? lastOwner;
+ void cancelRetry(){retryTimer?.cancel();retryTimer=null;}
+ void scheduleRetry(Uri target){cancelRetry();final delay=PrivateMediaCache.retryDelay(target);if(delay==null||!visible)return;retryTimer=Timer(delay,(){if(mounted&&visible&&versionUrl==target){final lifecycle=WidgetsBinding.instance.lifecycleState;if(lifecycle!=null&&lifecycle!=AppLifecycleState.resumed){retryTimer=Timer(const Duration(seconds:30),(){if(mounted)scheduleRetry(target);});return;}setState(()=>future=fetch());}});}
+ Future<Uint8List?> fetch()async{cancelRetry();final target=versionUrl;final generation=++fetchEpoch;final owner=FirebaseAuth.instance.currentUser?.uid;if(lastOwner!=owner){lastImage=null;lastOwner=owner;}final bytes=await PrivateMediaCache.get(target);if(!mounted||generation!=fetchEpoch||owner!=FirebaseAuth.instance.currentUser?.uid)return null;final retry=PrivateMediaCache.retryDelay(target);if(bytes!=null)lastImage=bytes;else if(retry==null)lastImage=null;scheduleRetry(target);return bytes??(retry!=null?lastImage:null);}
  Uri get url=>mediaUrl('profile',widget.uid,'background');
  Uri get versionUrl=>revision.isEmpty?url:url.replace(queryParameters:{...url.queryParameters,'revision':revision});
- void refresh(){if(mounted&&known&&changedImage.value==url)setState(()=>future=PrivateMediaCache.get(versionUrl));}
- void watch(){if(!TickerMode.of(context)){if(sub!=null){epoch++;sub?.cancel();sub=null;}return;}if(sub!=null)return;final generation=++epoch;sub=db.collection('users').doc(widget.uid).meowSnapshots().listen((snap){if(!mounted||generation!=epoch)return;final next=snap.data()?['backgroundRevision']?.toString()??'';if(!known||next!=revision||snap.exists!=profileExists)setState((){known=true;profileExists=snap.exists;revision=next;future=snap.exists?PrivateMediaCache.get(versionUrl):Future<Uint8List?>.value(null);});},onError:(Object _){});}
+ void refresh(){if(mounted&&known&&changedImage.value==url)setState(()=>future=fetch());}
+ void watch(){if(!TickerMode.of(context)){if(sub!=null){epoch++;sub?.cancel();sub=null;}return;}if(sub!=null)return;final generation=++epoch;sub=db.collection('users').doc(widget.uid).meowSnapshots().listen((snap){if(!mounted||generation!=epoch)return;if(!snap.exists&&snap.metadata.isFromCache)return;final next=snap.data()?['backgroundRevision']?.toString()??'';if(!known||next!=revision||snap.exists!=profileExists)setState((){known=true;profileExists=snap.exists;revision=next;if(snap.exists){future=fetch();}else{cancelRetry();fetchEpoch++;lastImage=null;future=Future<Uint8List?>.value(null);}});},onError:(Object _){if(mounted&&generation==epoch&&!known&&future==null)setState(()=>future=fetch());});}
  @override void initState(){super.initState();changedImage.addListener(refresh);}
- @override void didChangeDependencies(){super.didChangeDependencies();watch();}
- @override void didUpdateWidget(covariant ProfileBackground old){super.didUpdateWidget(old);if(old.uid!=widget.uid){epoch++;sub?.cancel();sub=null;revision='';known=false;profileExists=false;future=null;watch();}}
- @override void dispose(){epoch++;sub?.cancel();changedImage.removeListener(refresh);super.dispose();}
+ @override void didChangeDependencies(){super.didChangeDependencies();visible=TickerMode.of(context);if(!visible)cancelRetry();watch();if(visible&&future!=null&&PrivateMediaCache.retryDelay(versionUrl)!=null)scheduleRetry(versionUrl);}
+ @override void didUpdateWidget(covariant ProfileBackground old){super.didUpdateWidget(old);if(old.uid!=widget.uid){cancelRetry();fetchEpoch++;lastImage=null;lastOwner=null;epoch++;sub?.cancel();sub=null;revision='';known=false;profileExists=false;future=null;watch();}}
+ @override void dispose(){cancelRetry();fetchEpoch++;epoch++;sub?.cancel();changedImage.removeListener(refresh);super.dispose();}
  @override Widget build(BuildContext c)=>FutureBuilder<Uint8List?>(key:ValueKey(url),future:future,builder:(c,s)=>s.data==null?const SizedBox.shrink():Stack(fit:StackFit.expand,children:[meowPreview(c,s.data!,width:0,height:0,fit:BoxFit.cover,errorBuilder:(c,e,st)=>const SizedBox.shrink()),const ColoredBox(color:Color(0x99000000))]));
 }
 class TypingLabel extends StatefulWidget {
